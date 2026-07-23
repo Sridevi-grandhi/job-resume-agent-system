@@ -13,7 +13,7 @@ def get_mock_jobs(preference):
     encoded_title = quote_plus(job_title)
     encoded_location = quote_plus(location)
 
-    real_job_links = [
+    job_links = [
         {
             "title": f"{job_title} Jobs on LinkedIn",
             "company": "LinkedIn Jobs",
@@ -21,8 +21,8 @@ def get_mock_jobs(preference):
             "work_mode": work_mode,
             "job_type": job_type,
             "description": (
-                f"Search real {job_title} openings on LinkedIn Jobs based on your "
-                f"preferred location, work mode, and skills."
+                f"Search {job_title} openings on LinkedIn based on your "
+                f"preferred location and skills."
             ),
             "skills_required": skills,
             "source": "LinkedIn Jobs",
@@ -38,7 +38,7 @@ def get_mock_jobs(preference):
             "work_mode": work_mode,
             "job_type": job_type,
             "description": (
-                f"Search real {job_title} openings on Indeed using your selected "
+                f"Search {job_title} openings on Indeed using your selected "
                 f"job title, location, and skills."
             ),
             "skills_required": skills,
@@ -55,7 +55,7 @@ def get_mock_jobs(preference):
             "work_mode": work_mode,
             "job_type": job_type,
             "description": (
-                f"Search real technology-focused {job_title} jobs on Dice."
+                f"Search technology-focused {job_title} jobs on Dice."
             ),
             "skills_required": skills,
             "source": "Dice",
@@ -71,7 +71,7 @@ def get_mock_jobs(preference):
             "work_mode": work_mode,
             "job_type": job_type,
             "description": (
-                f"Search real {job_title} jobs through Google Jobs search."
+                f"Search {job_title} jobs through Google Jobs search."
             ),
             "skills_required": skills,
             "source": "Google Jobs",
@@ -87,7 +87,7 @@ def get_mock_jobs(preference):
             "work_mode": work_mode,
             "job_type": job_type,
             "description": (
-                f"Search real {job_title} openings on ZipRecruiter."
+                f"Search {job_title} openings on ZipRecruiter."
             ),
             "skills_required": skills,
             "source": "ZipRecruiter",
@@ -98,4 +98,4 @@ def get_mock_jobs(preference):
         }
     ]
 
-    return real_job_links
+    return job_links

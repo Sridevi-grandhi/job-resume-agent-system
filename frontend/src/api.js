@@ -116,18 +116,25 @@ export async function getLatestResume(userId) {
 }
 
 
-/*
-  IMPORTANT:
-  This function now uses the NEW Real Job Search Agent.
-
-  Backend endpoint:
-  POST /api/jobs/search-real/{user_id}
-
-  Old mock endpoint was:
-  POST /api/jobs/search/{user_id}
-*/
+// Existing Job Search Agent
+// Uses LinkedIn, Indeed, Dice, Google Jobs, ZipRecruiter search links
 export async function searchJobs(userId) {
-  const response = await fetch(`${API_BASE_URL}/api/jobs/search-real/${userId}`, {
+  const response = await fetch(`${API_BASE_URL}/api/jobs/search/${userId}`, {
+    method: "POST"
+  });
+
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+
+// Updated Job Search Agent
+// Uses Remotive API real jobs
+export async function searchUpdatedJobs(userId) {
+  const response = await fetch(`${API_BASE_URL}/api/jobs/search-updated/${userId}`, {
     method: "POST"
   });
 
