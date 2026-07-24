@@ -10,6 +10,7 @@ import {
   uploadResume,
   getLatestResume,
   searchJobs,
+  searchUpdatedJobs,
   getJobs,
   calculateMatches,
   getMatches,
@@ -75,11 +76,11 @@ function App() {
   const [jobMessage, setJobMessage] = useState("");
   const [jobs, setJobs] = useState([]);
 
-  const [matchMessage, setMatchMessage] = useState("");
-  const [matches, setMatches] = useState([]);
-
   const [optimizedMessage, setOptimizedMessage] = useState("");
   const [optimizedResumes, setOptimizedResumes] = useState([]);
+
+  const [matchMessage, setMatchMessage] = useState("");
+  const [matches, setMatches] = useState([]);
 
   const [emailMessage, setEmailMessage] = useState("");
   const [emailLogs, setEmailLogs] = useState([]);
@@ -202,54 +203,17 @@ function App() {
     setJobMessage("");
     setJobs([]);
 
-    setMatchMessage("");
-    setMatches([]);
-
     setOptimizedMessage("");
     setOptimizedResumes([]);
+
+    setMatchMessage("");
+    setMatches([]);
 
     setEmailMessage("");
     setEmailLogs([]);
 
     setWorkflowMessage("");
     setWorkflowResult(null);
-  }
-
-
-  function validatePreferences() {
-    if (!preferences.job_title.trim()) {
-      return "Please enter job title.";
-    }
-
-    if (!preferences.location.trim()) {
-      return "Please enter location.";
-    }
-
-    if (!preferences.experience.trim()) {
-      return "Please enter experience.";
-    }
-
-    if (!preferences.work_mode.trim()) {
-      return "Please select work mode.";
-    }
-
-    if (!preferences.job_type.trim()) {
-      return "Please select job type.";
-    }
-
-    if (!preferences.skills.trim()) {
-      return "Please enter skills.";
-    }
-
-    if (!preferences.schedule_time.trim()) {
-      return "Please enter schedule time.";
-    }
-
-    if (!preferences.timezone.trim()) {
-      return "Please enter timezone.";
-    }
-
-    return "";
   }
 
 
@@ -262,7 +226,7 @@ function App() {
     });
 
     setPreferencesSaved(false);
-    setPreferenceMessage("Preferences changed. Latest values will be saved automatically when you search jobs or run workflow.");
+    setPreferenceMessage("Please click Save Preferences after making changes.");
   }
 
 
@@ -272,13 +236,6 @@ function App() {
     try {
       if (!userId) {
         setPreferenceMessage("Please login first.");
-        return;
-      }
-
-      const validationError = validatePreferences();
-
-      if (validationError) {
-        setPreferenceMessage(validationError);
         return;
       }
 
@@ -318,8 +275,10 @@ function App() {
         timezone: data.timezone || "America/Chicago"
       });
 
-      setPreferencesSaved(true);
-      setPreferenceMessage("Preferences loaded successfully.");
+      setPreferencesSaved(false);
+      setPreferenceMessage(
+        "Preferences loaded. Please click Save Preferences before searching jobs."
+      );
     } catch (error) {
       setPreferences(getEmptyPreferences());
       setPreferencesSaved(false);
@@ -382,31 +341,39 @@ function App() {
         return;
       }
 
-      const validationError = validatePreferences();
-
-      if (validationError) {
-        setJobMessage(validationError);
+      if (!preferencesSaved) {
+        setJobMessage("Please save preferences first before searching jobs.");
         return;
       }
-
-      setJobMessage("Saving latest preferences...");
-
-      await saveUserPreferences({
-        ...preferences,
-        user_id: Number(userId)
-      });
-
-      setPreferencesSaved(true);
-
-      setJobMessage("Searching jobs based on latest preferences...");
 
       const data = await searchJobs(userId);
 
       setJobMessage(data.message || "Jobs searched successfully.");
-
       await handleLoadJobs();
     } catch (error) {
-      setJobMessage(error.message || "Failed to search jobs.");
+      setJobMessage(error.message);
+    }
+  }
+
+
+  async function handleSearchUpdatedJobs() {
+    try {
+      if (!userId) {
+        setJobMessage("Please login first.");
+        return;
+      }
+
+      if (!preferencesSaved) {
+        setJobMessage("Please save preferences first before searching updated jobs.");
+        return;
+      }
+
+      const data = await searchUpdatedJobs(userId);
+
+      setJobMessage(data.message || "Updated jobs searched successfully.");
+      await handleLoadJobs();
+    } catch (error) {
+      setJobMessage(error.message);
     }
   }
 
@@ -425,41 +392,6 @@ function App() {
     } catch (error) {
       setJobs([]);
       setJobMessage(error.message);
-    }
-  }
-
-
-  async function handleCalculateMatches() {
-    try {
-      if (!userId) {
-        setMatchMessage("Please login first.");
-        return;
-      }
-
-      const data = await calculateMatches(userId);
-
-      setMatchMessage(data.message || "Matches calculated successfully.");
-      await handleLoadMatches();
-    } catch (error) {
-      setMatchMessage(error.message);
-    }
-  }
-
-
-  async function handleLoadMatches() {
-    try {
-      if (!userId) {
-        setMatchMessage("Please login first.");
-        return;
-      }
-
-      const data = await getMatches(userId);
-
-      setMatches(Array.isArray(data) ? data : data.matches || []);
-      setMatchMessage("Matches loaded successfully.");
-    } catch (error) {
-      setMatches([]);
-      setMatchMessage(error.message);
     }
   }
 
@@ -498,6 +430,41 @@ function App() {
     } catch (error) {
       setOptimizedResumes([]);
       setOptimizedMessage(error.message);
+    }
+  }
+
+
+  async function handleCalculateMatches() {
+    try {
+      if (!userId) {
+        setMatchMessage("Please login first.");
+        return;
+      }
+
+      const data = await calculateMatches(userId);
+
+      setMatchMessage(data.message || "Matches calculated successfully.");
+      await handleLoadMatches();
+    } catch (error) {
+      setMatchMessage(error.message);
+    }
+  }
+
+
+  async function handleLoadMatches() {
+    try {
+      if (!userId) {
+        setMatchMessage("Please login first.");
+        return;
+      }
+
+      const data = await getMatches(userId);
+
+      setMatches(Array.isArray(data) ? data : data.matches || []);
+      setMatchMessage("Matches loaded successfully.");
+    } catch (error) {
+      setMatches([]);
+      setMatchMessage(error.message);
     }
   }
 
@@ -544,23 +511,10 @@ function App() {
         return;
       }
 
-      const validationError = validatePreferences();
-
-      if (validationError) {
-        setWorkflowMessage(validationError);
+      if (!preferencesSaved) {
+        setWorkflowMessage("Please save preferences first before running full workflow.");
         return;
       }
-
-      setWorkflowMessage("Saving latest preferences...");
-
-      await saveUserPreferences({
-        ...preferences,
-        user_id: Number(userId)
-      });
-
-      setPreferencesSaved(true);
-
-      setWorkflowMessage("Running full workflow with latest preferences...");
 
       const data = await runFullWorkflow(userId);
 
@@ -568,11 +522,11 @@ function App() {
       setWorkflowMessage(data.message || "Full workflow completed successfully.");
 
       await handleLoadJobs();
-      await handleLoadMatches();
       await handleLoadOptimizedResumes();
+      await handleLoadMatches();
       await handleLoadEmailLogs();
     } catch (error) {
-      setWorkflowMessage(error.message || "Failed to run full workflow.");
+      setWorkflowMessage(error.message);
     }
   }
 
@@ -620,6 +574,7 @@ function App() {
 
                 <div className="button-row">
                   <button type="submit">Login</button>
+
                   <button
                     type="button"
                     onClick={() => {
@@ -668,6 +623,7 @@ function App() {
 
                 <div className="button-row">
                   <button type="submit">Signup</button>
+
                   <button
                     type="button"
                     onClick={() => {
@@ -714,9 +670,8 @@ function App() {
         <section className="card full-width">
           <h2>1. Job Preferences</h2>
           <p>
-            Fill this form. If you change the job title, location, or skills,
-            the latest preferences will be saved automatically when you click
-            Search Jobs or Run Full Workflow.
+            New users will not have saved preferences. Fill this form and click
+            Save Preferences before searching jobs or running the workflow.
           </p>
 
           <form className="form" onSubmit={handleSavePreferences}>
@@ -818,6 +773,7 @@ function App() {
 
             <div className="button-row">
               <button type="submit">Save Preferences</button>
+
               <button type="button" onClick={handleLoadPreferences}>
                 Load Saved Preferences
               </button>
@@ -861,13 +817,16 @@ function App() {
           {latestResume && (
             <div className="result-box">
               <h3>Latest Resume</h3>
+
               <p>
                 <strong>File:</strong>{" "}
                 {latestResume.file_name || latestResume.original_file_name}
               </p>
+
               <p>
                 <strong>Type:</strong> {latestResume.file_type}
               </p>
+
               <pre>
                 {latestResume.text_preview || latestResume.parsed_text}
               </pre>
@@ -878,13 +837,17 @@ function App() {
         <section className="card">
           <h2>3. Job Search Agent</h2>
           <p>
-            Click Search Jobs. The app will save the latest preferences first,
-            then search jobs.
+            Use Search Jobs for the existing job-link agent. Use Search Updated
+            Jobs for the Remotive API real-job agent.
           </p>
 
           <div className="button-row">
             <button type="button" onClick={handleSearchJobs}>
               Search Jobs
+            </button>
+
+            <button type="button" onClick={handleSearchUpdatedJobs}>
+              Search Updated Jobs
             </button>
 
             <button type="button" onClick={handleLoadJobs}>
@@ -901,16 +864,34 @@ function App() {
               {jobs.map((job) => (
                 <div className="job-item" key={job.id}>
                   <h4>{job.title}</h4>
-                  <p><strong>Company:</strong> {job.company}</p>
-                  <p><strong>Location:</strong> {job.location}</p>
-                  <p><strong>Work Mode:</strong> {job.work_mode}</p>
-                  <p><strong>Job Type:</strong> {job.job_type}</p>
-                  <p><strong>Skills:</strong> {job.skills_required}</p>
-                  <p><strong>Description:</strong> {job.description}</p>
 
-                  {job.source && (
-                    <p><strong>Source:</strong> {job.source}</p>
-                  )}
+                  <p>
+                    <strong>Company:</strong> {job.company}
+                  </p>
+
+                  <p>
+                    <strong>Location:</strong> {job.location}
+                  </p>
+
+                  <p>
+                    <strong>Work Mode:</strong> {job.work_mode}
+                  </p>
+
+                  <p>
+                    <strong>Job Type:</strong> {job.job_type}
+                  </p>
+
+                  <p>
+                    <strong>Source:</strong> {job.source}
+                  </p>
+
+                  <p>
+                    <strong>Skills:</strong> {job.skills_required}
+                  </p>
+
+                  <p>
+                    <strong>Description:</strong> {job.description}
+                  </p>
 
                   {job.job_url && (
                     <p>
@@ -934,8 +915,43 @@ function App() {
         </section>
 
         <section className="card">
-          <h2>4. Matching Percentage Agent</h2>
-          <p>Calculate resume and job match percentage.</p>
+          <h2>4. Resume Optimization Agent</h2>
+          <p>
+            First optimize your resume for a selected job, then calculate the match percentage.
+          </p>
+
+          <button type="button" onClick={handleLoadOptimizedResumes}>
+            Load Optimized Resumes
+          </button>
+
+          {optimizedMessage && (
+            <div className="message">{optimizedMessage}</div>
+          )}
+
+          {optimizedResumes.length > 0 && (
+            <div className="result-box">
+              <h3>Optimized Resumes</h3>
+
+              {optimizedResumes.map((resume) => (
+                <div className="job-item" key={resume.id}>
+                  <p>
+                    <strong>Job ID:</strong> {resume.job_id}
+                  </p>
+
+                  <pre>{resume.optimized_text}</pre>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section className="card">
+          <h2>5. Matching Percentage Agent</h2>
+          <p>
+            Calculate match percentage after jobs are searched and resume is optimized.
+            Results show the job title, company, source, URL, matched keywords,
+            missing keywords, and recommendation.
+          </p>
 
           <div className="button-row">
             <button type="button" onClick={handleCalculateMatches}>
@@ -955,37 +971,48 @@ function App() {
 
               {matches.map((match) => (
                 <div className="job-item" key={match.id}>
-                  <p><strong>Job ID:</strong> {match.job_id}</p>
-                  <p><strong>Match:</strong> {match.match_percentage}%</p>
-                  <p><strong>Matched Keywords:</strong> {match.matched_keywords}</p>
-                  <p><strong>Missing Keywords:</strong> {match.missing_keywords}</p>
-                  <p><strong>Recommendation:</strong> {match.recommendation}</p>
-                </div>
-              ))}
-            </div>
-          )}
-        </section>
+                  <h4>{match.job_title}</h4>
 
-        <section className="card">
-          <h2>5. Resume Optimization Agent</h2>
-          <p>View optimized resumes generated for each job.</p>
+                  <p>
+                    <strong>Company:</strong> {match.company}
+                  </p>
 
-          <button type="button" onClick={handleLoadOptimizedResumes}>
-            Load Optimized Resumes
-          </button>
+                  <p>
+                    <strong>Location:</strong> {match.location}
+                  </p>
 
-          {optimizedMessage && (
-            <div className="message">{optimizedMessage}</div>
-          )}
+                  <p>
+                    <strong>Source:</strong> {match.source}
+                  </p>
 
-          {optimizedResumes.length > 0 && (
-            <div className="result-box">
-              <h3>Optimized Resumes</h3>
+                  <p>
+                    <strong>Job ID:</strong> {match.job_id}
+                  </p>
 
-              {optimizedResumes.map((resume) => (
-                <div className="job-item" key={resume.id}>
-                  <p><strong>Job ID:</strong> {resume.job_id}</p>
-                  <pre>{resume.optimized_text}</pre>
+                  <p>
+                    <strong>Match:</strong> {match.match_percentage}%
+                  </p>
+
+                  <p>
+                    <strong>Matched Keywords:</strong> {match.matched_keywords}
+                  </p>
+
+                  <p>
+                    <strong>Missing Keywords:</strong> {match.missing_keywords}
+                  </p>
+
+                  <p>
+                    <strong>Recommendation:</strong> {match.recommendation}
+                  </p>
+
+                  {match.job_url && (
+                    <p>
+                      <strong>Job URL:</strong>{" "}
+                      <a href={match.job_url} target="_blank" rel="noreferrer">
+                        {match.job_url}
+                      </a>
+                    </p>
+                  )}
                 </div>
               ))}
             </div>
@@ -1014,9 +1041,18 @@ function App() {
 
               {emailLogs.map((email) => (
                 <div className="job-item" key={email.id}>
-                  <p><strong>To:</strong> {email.recipient_email}</p>
-                  <p><strong>Subject:</strong> {email.subject}</p>
-                  <p><strong>Status:</strong> {email.status}</p>
+                  <p>
+                    <strong>To:</strong> {email.recipient_email}
+                  </p>
+
+                  <p>
+                    <strong>Subject:</strong> {email.subject}
+                  </p>
+
+                  <p>
+                    <strong>Status:</strong> {email.status}
+                  </p>
+
                   <pre>{email.body}</pre>
                 </div>
               ))}
@@ -1028,7 +1064,7 @@ function App() {
           <h2>7. Full Workflow</h2>
           <p>
             Runs Job Search, Resume Optimization, Matching, and Email Summary.
-            The app will save the latest preferences first.
+            You must save preferences before running this.
           </p>
 
           <button type="button" onClick={handleRunFullWorkflow}>

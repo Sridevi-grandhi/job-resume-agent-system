@@ -106,7 +106,7 @@ def normalize_remotive_job(job, preference):
     }
 
 
-def get_real_jobs_from_remotive(preference, max_jobs: int = 10):
+def get_updated_jobs_from_remotive(preference, max_jobs: int = 10):
     all_jobs = []
     seen_urls = set()
 

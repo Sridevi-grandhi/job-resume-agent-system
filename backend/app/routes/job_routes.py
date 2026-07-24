@@ -9,13 +9,34 @@ from app.models.match_model import MatchScore
 from app.models.optimized_resume_model import OptimizedResume
 
 from app.agents.job_search_agent import get_mock_jobs
-from app.agents.real_job_search_agent import get_real_jobs_from_remotive
+from app.agents.updated_job_search_agent import get_updated_jobs_from_remotive
 
 
 router = APIRouter(
     prefix="/api/jobs",
     tags=["Jobs"]
 )
+
+
+def get_user_and_preferences(user_id: int, db: Session):
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    preference = (
+        db.query(UserPreference)
+        .filter(UserPreference.user_id == user_id)
+        .first()
+    )
+
+    if not preference:
+        raise HTTPException(
+            status_code=404,
+            detail="Please save preferences before searching jobs"
+        )
+
+    return user, preference
 
 
 def delete_old_jobs_for_user(user_id: int, db: Session):
@@ -63,29 +84,8 @@ def save_jobs_to_database(user_id: int, jobs_data, db: Session):
     return created_jobs
 
 
-def get_user_and_preferences(user_id: int, db: Session):
-    user = db.query(User).filter(User.id == user_id).first()
-
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    preference = (
-        db.query(UserPreference)
-        .filter(UserPreference.user_id == user_id)
-        .first()
-    )
-
-    if not preference:
-        raise HTTPException(
-            status_code=404,
-            detail="Please save preferences before searching jobs"
-        )
-
-    return user, preference
-
-
 @router.post("/search/{user_id}")
-def search_mock_jobs_for_user(
+def search_jobs_with_existing_agent(
     user_id: int,
     db: Session = Depends(get_db)
 ):
@@ -98,15 +98,15 @@ def search_mock_jobs_for_user(
     created_jobs = save_jobs_to_database(user_id, jobs_data, db)
 
     return {
-        "message": "Mock jobs generated successfully",
-        "agent_used": "Mock Job Search Agent",
+        "message": "Jobs generated using existing Job Search Agent",
+        "agent_used": "Existing Job Search Agent - LinkedIn, Indeed, Dice, Google Jobs, ZipRecruiter links",
         "jobs_created": len(created_jobs),
         "jobs": created_jobs
     }
 
 
-@router.post("/search-real/{user_id}")
-def search_real_jobs_for_user(
+@router.post("/search-updated/{user_id}")
+def search_jobs_with_updated_agent(
     user_id: int,
     db: Session = Depends(get_db)
 ):
@@ -114,12 +114,12 @@ def search_real_jobs_for_user(
 
     delete_old_jobs_for_user(user_id, db)
 
-    jobs_data = get_real_jobs_from_remotive(preference, max_jobs=10)
+    jobs_data = get_updated_jobs_from_remotive(preference, max_jobs=10)
 
     if not jobs_data:
         return {
             "message": "No real jobs found from Remotive API. Try a broader title like QA Automation Engineer, Software Engineer in Test, or Java Developer.",
-            "agent_used": "Real Job Search Agent - Remotive API",
+            "agent_used": "Updated Job Search Agent - Remotive API",
             "jobs_created": 0,
             "jobs": []
         }
@@ -127,8 +127,8 @@ def search_real_jobs_for_user(
     created_jobs = save_jobs_to_database(user_id, jobs_data, db)
 
     return {
-        "message": "Real jobs fetched from Remotive API and saved successfully",
-        "agent_used": "Real Job Search Agent - Remotive API",
+        "message": "Real jobs fetched using Updated Job Search Agent and saved successfully",
+        "agent_used": "Updated Job Search Agent - Remotive API",
         "jobs_created": len(created_jobs),
         "jobs": created_jobs
     }
