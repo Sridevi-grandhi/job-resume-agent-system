@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -16,6 +17,18 @@ router = APIRouter(
     prefix="/api/jobs",
     tags=["Jobs"]
 )
+
+
+class SelectedJobRequest(BaseModel):
+    title: str
+    company: str
+    location: str
+    work_mode: str = "Remote"
+    job_type: str = "Full-time"
+    description: str
+    skills_required: str
+    source: str = "User Selected Job"
+    job_url: str | None = None
 
 
 def get_user_and_preferences(user_id: int, db: Session):
@@ -39,11 +52,33 @@ def get_user_and_preferences(user_id: int, db: Session):
     return user, preference
 
 
-def delete_old_jobs_for_user(user_id: int, db: Session):
-    db.query(MatchScore).filter(MatchScore.user_id == user_id).delete()
-    db.query(OptimizedResume).filter(OptimizedResume.user_id == user_id).delete()
-    db.query(Job).filter(Job.user_id == user_id).delete()
-    db.commit()
+def delete_old_auto_jobs_for_user(user_id: int, db: Session):
+    auto_jobs = (
+        db.query(Job)
+        .filter(Job.user_id == user_id)
+        .filter(Job.source != "User Selected Job")
+        .all()
+    )
+
+    auto_job_ids = [job.id for job in auto_jobs]
+
+    if auto_job_ids:
+        db.query(MatchScore).filter(
+            MatchScore.user_id == user_id,
+            MatchScore.job_id.in_(auto_job_ids)
+        ).delete(synchronize_session=False)
+
+        db.query(OptimizedResume).filter(
+            OptimizedResume.user_id == user_id,
+            OptimizedResume.job_id.in_(auto_job_ids)
+        ).delete(synchronize_session=False)
+
+        db.query(Job).filter(
+            Job.user_id == user_id,
+            Job.id.in_(auto_job_ids)
+        ).delete(synchronize_session=False)
+
+        db.commit()
 
 
 def save_jobs_to_database(user_id: int, jobs_data, db: Session):
@@ -91,7 +126,7 @@ def search_jobs_with_existing_agent(
 ):
     user, preference = get_user_and_preferences(user_id, db)
 
-    delete_old_jobs_for_user(user_id, db)
+    delete_old_auto_jobs_for_user(user_id, db)
 
     jobs_data = get_mock_jobs(preference)
 
@@ -112,7 +147,7 @@ def search_jobs_with_updated_agent(
 ):
     user, preference = get_user_and_preferences(user_id, db)
 
-    delete_old_jobs_for_user(user_id, db)
+    delete_old_auto_jobs_for_user(user_id, db)
 
     jobs_data = get_updated_jobs_from_remotive(preference, max_jobs=10)
 
@@ -131,6 +166,52 @@ def search_jobs_with_updated_agent(
         "agent_used": "Updated Job Search Agent - Remotive API",
         "jobs_created": len(created_jobs),
         "jobs": created_jobs
+    }
+
+
+@router.post("/selected/{user_id}")
+def add_selected_job(
+    user_id: int,
+    selected_job: SelectedJobRequest,
+    db: Session = Depends(get_db)
+):
+    user = db.query(User).filter(User.id == user_id).first()
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    new_job = Job(
+        user_id=user_id,
+        title=selected_job.title,
+        company=selected_job.company,
+        location=selected_job.location,
+        work_mode=selected_job.work_mode,
+        job_type=selected_job.job_type,
+        description=selected_job.description,
+        skills_required=selected_job.skills_required,
+        source=selected_job.source,
+        job_url=selected_job.job_url
+    )
+
+    db.add(new_job)
+    db.commit()
+    db.refresh(new_job)
+
+    return {
+        "message": "Selected job saved successfully",
+        "job": {
+            "id": new_job.id,
+            "user_id": new_job.user_id,
+            "title": new_job.title,
+            "company": new_job.company,
+            "location": new_job.location,
+            "work_mode": new_job.work_mode,
+            "job_type": new_job.job_type,
+            "description": new_job.description,
+            "skills_required": new_job.skills_required,
+            "source": new_job.source,
+            "job_url": new_job.job_url
+        }
     }
 
 

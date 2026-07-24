@@ -1,6 +1,5 @@
 const API_BASE_URL = "http://127.0.0.1:8000";
 
-
 async function getErrorMessage(response) {
   const text = await response.text();
 
@@ -12,7 +11,6 @@ async function getErrorMessage(response) {
   }
 }
 
-
 export async function checkBackendHealth() {
   const response = await fetch(`${API_BASE_URL}/health`);
 
@@ -22,7 +20,6 @@ export async function checkBackendHealth() {
 
   return response.json();
 }
-
 
 export async function signupUser(userData) {
   const response = await fetch(`${API_BASE_URL}/api/auth/signup`, {
@@ -40,7 +37,6 @@ export async function signupUser(userData) {
   return response.json();
 }
 
-
 export async function loginUser(loginData) {
   const response = await fetch(`${API_BASE_URL}/api/auth/login`, {
     method: "POST",
@@ -56,7 +52,6 @@ export async function loginUser(loginData) {
 
   return response.json();
 }
-
 
 export async function saveUserPreferences(preferences) {
   const response = await fetch(`${API_BASE_URL}/api/preferences`, {
@@ -74,7 +69,6 @@ export async function saveUserPreferences(preferences) {
   return response.json();
 }
 
-
 export async function getUserPreferences(userId) {
   const response = await fetch(`${API_BASE_URL}/api/preferences/${userId}`);
 
@@ -84,7 +78,6 @@ export async function getUserPreferences(userId) {
 
   return response.json();
 }
-
 
 export async function uploadResume(userId, file) {
   const formData = new FormData();
@@ -104,7 +97,6 @@ export async function uploadResume(userId, file) {
   return response.json();
 }
 
-
 export async function getLatestResume(userId) {
   const response = await fetch(`${API_BASE_URL}/api/resume/latest/${userId}`);
 
@@ -114,7 +106,6 @@ export async function getLatestResume(userId) {
 
   return response.json();
 }
-
 
 // Existing Job Search Agent
 // Uses LinkedIn, Indeed, Dice, Google Jobs, ZipRecruiter search links
@@ -130,7 +121,6 @@ export async function searchJobs(userId) {
   return response.json();
 }
 
-
 // Updated Job Search Agent
 // Uses Remotive API real jobs
 export async function searchUpdatedJobs(userId) {
@@ -145,6 +135,22 @@ export async function searchUpdatedJobs(userId) {
   return response.json();
 }
 
+// Manually selected job from LinkedIn, Dice, Indeed, etc.
+export async function addSelectedJob(userId, selectedJobData) {
+  const response = await fetch(`${API_BASE_URL}/api/jobs/selected/${userId}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify(selectedJobData)
+  });
+
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+
+  return response.json();
+}
 
 export async function getJobs(userId) {
   const response = await fetch(`${API_BASE_URL}/api/jobs/${userId}`);
@@ -155,7 +161,6 @@ export async function getJobs(userId) {
 
   return response.json();
 }
-
 
 export async function calculateMatches(userId) {
   const response = await fetch(`${API_BASE_URL}/api/match/calculate/${userId}`, {
@@ -169,7 +174,6 @@ export async function calculateMatches(userId) {
   return response.json();
 }
 
-
 export async function getMatches(userId) {
   const response = await fetch(`${API_BASE_URL}/api/match/${userId}`);
 
@@ -179,7 +183,6 @@ export async function getMatches(userId) {
 
   return response.json();
 }
-
 
 export async function optimizeResume(userId, jobId) {
   const response = await fetch(`${API_BASE_URL}/api/resume/optimize/${userId}/${jobId}`, {
@@ -193,7 +196,6 @@ export async function optimizeResume(userId, jobId) {
   return response.json();
 }
 
-
 export async function getOptimizedResumes(userId) {
   const response = await fetch(`${API_BASE_URL}/api/resume/optimized/${userId}`);
 
@@ -203,7 +205,6 @@ export async function getOptimizedResumes(userId) {
 
   return response.json();
 }
-
 
 export async function generateEmailSummary(userId) {
   const response = await fetch(`${API_BASE_URL}/api/email/generate/${userId}`, {
@@ -217,7 +218,6 @@ export async function generateEmailSummary(userId) {
   return response.json();
 }
 
-
 export async function getEmailLogs(userId) {
   const response = await fetch(`${API_BASE_URL}/api/email/logs/${userId}`);
 
@@ -227,7 +227,6 @@ export async function getEmailLogs(userId) {
 
   return response.json();
 }
-
 
 export async function runFullWorkflow(userId) {
   const response = await fetch(`${API_BASE_URL}/api/scheduler/run/${userId}`, {
