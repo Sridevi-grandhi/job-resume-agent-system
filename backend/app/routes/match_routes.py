@@ -41,6 +41,7 @@ def calculate_matches_for_user(
     jobs = (
         db.query(Job)
         .filter(Job.user_id == user_id)
+        .filter(Job.source.in_(["Remotive API", "User Selected Job"]))
         .order_by(Job.id.desc())
         .all()
     )
@@ -48,7 +49,7 @@ def calculate_matches_for_user(
     if not jobs:
         raise HTTPException(
             status_code=404,
-            detail="Please search jobs before calculating matches"
+            detail="No real Remotive or user-selected jobs are available for matching"
         )
 
     db.query(MatchScore).filter(MatchScore.user_id == user_id).delete()

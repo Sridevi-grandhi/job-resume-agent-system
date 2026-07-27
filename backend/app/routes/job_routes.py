@@ -1,3 +1,5 @@
+import os
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -113,7 +115,13 @@ def save_jobs_to_database(user_id: int, jobs_data, db: Session):
             "description": new_job.description,
             "skills_required": new_job.skills_required,
             "source": new_job.source,
-            "job_url": new_job.job_url
+            "job_url": new_job.job_url,
+            "candidate_required_location": job_data.get("candidate_required_location", new_job.location),
+            "tags": job_data.get("tags", []),
+            "publication_date": job_data.get("publication_date"),
+            "relevance_score": job_data.get("relevance_score"),
+            "matched_preference_skills": job_data.get("matched_preference_skills", []),
+            "role_family_match": job_data.get("role_family_match")
         })
 
     return created_jobs
@@ -147,23 +155,34 @@ def search_jobs_with_updated_agent(
 ):
     user, preference = get_user_and_preferences(user_id, db)
 
-    delete_old_auto_jobs_for_user(user_id, db)
-
-    jobs_data = get_updated_jobs_from_remotive(preference, max_jobs=10)
+    search_result = get_updated_jobs_from_remotive(preference, max_jobs=10)
+    jobs_data = search_result["jobs"]
 
     if not jobs_data:
-        return {
-            "message": "No real jobs found from Remotive API. Try a broader title like QA Automation Engineer, Software Engineer in Test, or Java Developer.",
+        response = {
+            "message": f"No relevant Remotive jobs passed the current filters. Raw jobs received: {search_result['total_api_jobs_received']}. Review role aliases or filtering rules.",
             "agent_used": "Updated Job Search Agent - Remotive API",
+            "requested_job_title": search_result["requested_job_title"],
+            "search_queries_used": search_result["search_queries_used"],
+            "total_api_jobs_received": search_result["total_api_jobs_received"],
+            "irrelevant_jobs_filtered": search_result["irrelevant_jobs_filtered"],
             "jobs_created": 0,
             "jobs": []
         }
+        if os.getenv("ENVIRONMENT", "development").lower() == "development":
+            response["rejection_reasons"] = search_result["rejection_reasons"]
+        return response
 
+    delete_old_auto_jobs_for_user(user_id, db)
     created_jobs = save_jobs_to_database(user_id, jobs_data, db)
 
     return {
-        "message": "Real jobs fetched using Updated Job Search Agent and saved successfully",
+        "message": f"{len(created_jobs)} relevant jobs found for {preference.job_title} and saved successfully.",
         "agent_used": "Updated Job Search Agent - Remotive API",
+        "requested_job_title": search_result["requested_job_title"],
+        "search_queries_used": search_result["search_queries_used"],
+        "total_api_jobs_received": search_result["total_api_jobs_received"],
+        "irrelevant_jobs_filtered": search_result["irrelevant_jobs_filtered"],
         "jobs_created": len(created_jobs),
         "jobs": created_jobs
     }
