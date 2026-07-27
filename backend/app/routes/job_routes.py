@@ -1,5 +1,3 @@
-import os
-
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -11,8 +9,17 @@ from app.models.job_model import Job
 from app.models.match_model import MatchScore
 from app.models.optimized_resume_model import OptimizedResume
 
+# Existing Job Search Agent — LinkedIn / Indeed / Dice / Google Jobs / ZipRecruiter search links
 from app.agents.job_search_agent import get_mock_jobs
+
+# Updated Job Search Agent — Remotive API individual job postings
 from app.agents.updated_job_search_agent import get_updated_jobs_from_remotive
+from app.agents.job_url_import_agent import (
+    JobUrlImportError,
+    SOURCE_VALUES,
+    build_job_preview,
+    normalize_job_url,
+)
 
 
 router = APIRouter(
@@ -28,9 +35,13 @@ class SelectedJobRequest(BaseModel):
     work_mode: str = "Remote"
     job_type: str = "Full-time"
     description: str
-    skills_required: str
+    skills_required: str = ""
     source: str = "User Selected Job"
     job_url: str | None = None
+
+
+class ImportJobUrlRequest(BaseModel):
+    job_url: str
 
 
 def get_user_and_preferences(user_id: int, db: Session):
@@ -59,6 +70,7 @@ def delete_old_auto_jobs_for_user(user_id: int, db: Session):
         db.query(Job)
         .filter(Job.user_id == user_id)
         .filter(Job.source != "User Selected Job")
+        .filter(~Job.source.endswith(" Imported"))
         .all()
     )
 
@@ -127,6 +139,11 @@ def save_jobs_to_database(user_id: int, jobs_data, db: Session):
     return created_jobs
 
 
+# ---------------------------------------------------------------------------
+# Existing Job Search Agent
+# Endpoint: POST /api/jobs/search/{user_id}
+# Uses job_search_agent.py — search-page links only (unchanged)
+# ---------------------------------------------------------------------------
 @router.post("/search/{user_id}")
 def search_jobs_with_existing_agent(
     user_id: int,
@@ -148,6 +165,28 @@ def search_jobs_with_existing_agent(
     }
 
 
+def _public_job_payload(job: dict) -> dict:
+    """Strip diagnostic fields; return the contract fields for API clients."""
+    return {
+        "id": job["id"],
+        "user_id": job["user_id"],
+        "title": job["title"],
+        "company": job["company"],
+        "location": job["location"],
+        "work_mode": job["work_mode"],
+        "job_type": job["job_type"],
+        "description": job["description"],
+        "skills_required": job["skills_required"],
+        "source": job["source"],
+        "job_url": job["job_url"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Updated Job Search Agent
+# Endpoint: POST /api/jobs/search-updated/{user_id}
+# Uses updated_job_search_agent.py — Remotive API individual job postings
+# ---------------------------------------------------------------------------
 @router.post("/search-updated/{user_id}")
 def search_jobs_with_updated_agent(
     user_id: int,
@@ -155,36 +194,36 @@ def search_jobs_with_updated_agent(
 ):
     user, preference = get_user_and_preferences(user_id, db)
 
-    search_result = get_updated_jobs_from_remotive(preference, max_jobs=10)
-    jobs_data = search_result["jobs"]
+    try:
+        search_result = get_updated_jobs_from_remotive(preference, max_jobs=10)
+    except Exception:
+        # Never crash FastAPI; return an empty successful contract response.
+        return {
+            "message": "No relevant jobs found from Remotive for the current preferences",
+            "agent_used": "Updated Job Search Agent - Remotive API",
+            "jobs_created": 0,
+            "jobs": [],
+        }
+
+    jobs_data = search_result.get("jobs") or []
 
     if not jobs_data:
-        response = {
-            "message": f"No relevant Remotive jobs passed the current filters. Raw jobs received: {search_result['total_api_jobs_received']}. Review role aliases or filtering rules.",
+        return {
+            "message": "No relevant jobs found from Remotive for the current preferences",
             "agent_used": "Updated Job Search Agent - Remotive API",
-            "requested_job_title": search_result["requested_job_title"],
-            "search_queries_used": search_result["search_queries_used"],
-            "total_api_jobs_received": search_result["total_api_jobs_received"],
-            "irrelevant_jobs_filtered": search_result["irrelevant_jobs_filtered"],
             "jobs_created": 0,
-            "jobs": []
+            "jobs": [],
         }
-        if os.getenv("ENVIRONMENT", "development").lower() == "development":
-            response["rejection_reasons"] = search_result["rejection_reasons"]
-        return response
 
+    # Replace only previous auto-generated jobs; preserve "User Selected Job".
     delete_old_auto_jobs_for_user(user_id, db)
     created_jobs = save_jobs_to_database(user_id, jobs_data, db)
 
     return {
-        "message": f"{len(created_jobs)} relevant jobs found for {preference.job_title} and saved successfully.",
+        "message": "Accurate jobs fetched using Updated Job Search Agent",
         "agent_used": "Updated Job Search Agent - Remotive API",
-        "requested_job_title": search_result["requested_job_title"],
-        "search_queries_used": search_result["search_queries_used"],
-        "total_api_jobs_received": search_result["total_api_jobs_received"],
-        "irrelevant_jobs_filtered": search_result["irrelevant_jobs_filtered"],
         "jobs_created": len(created_jobs),
-        "jobs": created_jobs
+        "jobs": [_public_job_payload(job) for job in created_jobs],
     }
 
 
@@ -198,6 +237,37 @@ def add_selected_job(
 
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+
+    if selected_job.source.endswith(" Imported"):
+        missing = [
+            field
+            for field in ("title", "company", "description", "job_url")
+            if not str(getattr(selected_job, field, "") or "").strip()
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Imported jobs require: {', '.join(missing)}"
+            )
+        try:
+            detected_source, normalized_url, _ = normalize_job_url(selected_job.job_url)
+        except JobUrlImportError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        selected_job.source = SOURCE_VALUES[detected_source]
+        selected_job.job_url = normalized_url
+        duplicate = db.query(Job).filter(
+            Job.user_id == user_id,
+            Job.job_url == normalized_url
+        ).first()
+        if duplicate:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "success": False,
+                    "duplicate": True,
+                    "message": "This job has already been imported."
+                }
+            )
 
     new_job = Job(
         user_id=user_id,
@@ -232,6 +302,37 @@ def add_selected_job(
             "job_url": new_job.job_url
         }
     }
+
+
+@router.post("/import-url/{user_id}")
+def import_selected_job_by_url(
+    user_id: int,
+    request: ImportJobUrlRequest,
+    db: Session = Depends(get_db)
+):
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    try:
+        preview = build_job_preview(request.job_url)
+    except JobUrlImportError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+    duplicate = db.query(Job).filter(
+        Job.user_id == user_id,
+        Job.job_url == preview["normalized_job_url"]
+    ).first()
+    if duplicate:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "success": False,
+                "duplicate": True,
+                "message": "This job has already been imported."
+            }
+        )
+    return preview
 
 
 @router.get("/{user_id}")

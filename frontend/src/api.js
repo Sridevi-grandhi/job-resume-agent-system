@@ -5,7 +5,7 @@ async function getErrorMessage(response) {
 
   try {
     const data = JSON.parse(text);
-    return data.detail || data.message || text;
+    return data.detail?.message || data.detail || data.message || text;
   } catch {
     return text || "Something went wrong";
   }
@@ -231,6 +231,24 @@ export async function getEmailLogs(userId) {
 export async function runFullWorkflow(userId) {
   const response = await fetch(`${API_BASE_URL}/api/scheduler/run/${userId}`, {
     method: "POST"
+  });
+
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function importJobByUrl(userId, jobUrl) {
+  const response = await fetch(`${API_BASE_URL}/api/jobs/import-url/${userId}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      job_url: jobUrl
+    })
   });
 
   if (!response.ok) {

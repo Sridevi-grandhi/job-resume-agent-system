@@ -6,6 +6,9 @@ from app.agents.relevance_filter import (
     candidate_location_matches,
     deduplicate_ranked_jobs,
     detect_role_family,
+    detect_role_family_key,
+    get_role_aliases,
+    is_role_relevant,
     match_preferred_skills,
     normalize_job_type,
     normalize_text,
@@ -18,6 +21,7 @@ PREFERENCE = SimpleNamespace(
     location="Santa Clara, CA",
     work_mode="Remote",
     job_type="Full-time",
+    job_title="Java Full Stack Developer",
 )
 
 PASSING_TITLES = (
@@ -37,12 +41,13 @@ FAILING_TITLES = (
 )
 
 
-def make_job(title, url="https://example.com/job"):
+def make_job(title, url="https://remotive.com/remote-jobs/software-development/example-1"):
     return {
         "title": title,
         "company_name": "Example Company",
         "candidate_required_location": "United States",
         "job_type": "full_time",
+        "category": "Software Development",
         "tags": ["Java", "SpringBoot", "React.js"],
         "description": "Build Java services with Spring Boot, React, PostgreSQL, AWS, and Docker.",
         "url": url,
@@ -111,24 +116,35 @@ class RelevanceFilterTests(unittest.TestCase):
 
     def test_duplicate_removal_keeps_highest_score(self):
         first = {
-            "job": {"title": "Java Full Stack Engineer", "company": "Acme", "job_url": "https://example.com/1"},
+            "job": {"title": "Java Full Stack Engineer", "company": "Acme", "job_url": "https://remotive.com/remote-jobs/dev/1"},
             "relevance_score": 70,
+            "relevance_tier": 2,
         }
         duplicate_url = {
-            "job": {"title": "Java Full Stack Engineer", "company": "Acme", "job_url": "https://example.com/1"},
+            "job": {"title": "Java Full Stack Engineer", "company": "Acme", "job_url": "https://remotive.com/remote-jobs/dev/1"},
             "relevance_score": 80,
+            "relevance_tier": 3,
         }
         duplicate_title_company = {
-            "job": {"title": "JAVA FULL-STACK ENGINEER", "company": "ACME", "job_url": "https://example.com/2"},
+            "job": {"title": "JAVA FULL-STACK ENGINEER", "company": "ACME", "job_url": "https://remotive.com/remote-jobs/dev/2"},
             "relevance_score": 90,
+            "relevance_tier": 4,
         }
         unique = {
-            "job": {"title": "Java React Developer", "company": "Beta", "job_url": "https://example.com/3"},
+            "job": {"title": "Java React Developer", "company": "Beta", "job_url": "https://remotive.com/remote-jobs/dev/3"},
             "relevance_score": 75,
+            "relevance_tier": 3,
         }
         result = deduplicate_ranked_jobs([first, duplicate_url, duplicate_title_company, unique])
         self.assertEqual(len(result), 2)
         self.assertEqual(result[0]["relevance_score"], 90)
+
+    def test_senior_sdet_family_and_aliases(self):
+        self.assertEqual(detect_role_family_key("Senior SDET"), "sdet")
+        aliases = [a.lower() for a in get_role_aliases("Senior SDET")]
+        self.assertIn("qa automation engineer", aliases)
+        job = make_job("QA Automation Engineer")
+        self.assertTrue(is_role_relevant(job, "Senior SDET", get_role_aliases("Senior SDET")))
 
 
 if __name__ == "__main__":

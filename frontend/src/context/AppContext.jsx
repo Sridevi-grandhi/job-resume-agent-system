@@ -16,6 +16,8 @@ export function AppProvider({ children }) {
   const [selectedResumeFile, setSelectedResumeFile] = useState(null);
   const [jobs, setJobs] = useState([]);
   const [selectedJobForm, setSelectedJobForm] = useState(emptySelectedJob);
+  const [selectedJobImportReady, setSelectedJobImportReady] = useState(false);
+  const [selectedJobImportStatus, setSelectedJobImportStatus] = useState(null);
   const [optimizedResumes, setOptimizedResumes] = useState([]);
   const [matches, setMatches] = useState([]);
   const [emailLogs, setEmailLogs] = useState([]);
@@ -30,7 +32,7 @@ export function AppProvider({ children }) {
 
   const resetData = () => {
     setPreferences(emptyPreferences); setPreferencesSaved(false); setLatestResume(null); setSelectedResumeFile(null);
-    setJobs([]); setSelectedJobForm(emptySelectedJob); setOptimizedResumes([]); setMatches([]); setEmailLogs([]);
+    setJobs([]); setSelectedJobForm(emptySelectedJob); setSelectedJobImportReady(false); setSelectedJobImportStatus(null); setOptimizedResumes([]); setMatches([]); setEmailLogs([]);
     setWorkflowResult(null); setMessages({});
   };
   const authenticate = async (mode, form) => task("auth", async () => {
@@ -47,7 +49,9 @@ export function AppProvider({ children }) {
   const loadJobs = () => task("jobs", async () => { const d=await api.getJobs(userId); setJobs(Array.isArray(d)?d:d.jobs||[]); tell("jobs","Jobs loaded."); });
   const search = (updated=false) => task("jobs", async () => { if(!preferencesSaved) throw new Error("Save your preferences before searching."); const d=await (updated?api.searchUpdatedJobs(userId):api.searchJobs(userId)); tell("jobs",d.message||"Search complete."); const list=await api.getJobs(userId); const saved=Array.isArray(list)?list:list.jobs||[]; const metadata=new Map((d.jobs||[]).map(job=>[String(job.id),job])); setJobs(saved.map(job=>({...job,...(metadata.get(String(job.id))||{})}))); });
   const changeSelectedJob = (e) => setSelectedJobForm((p)=>({...p,[e.target.name]:e.target.value}));
-  const saveSelectedJob = (e) => { e.preventDefault(); return task("selected",async()=>{ const d=await api.addSelectedJob(userId,selectedJobForm); setSelectedJobForm(emptySelectedJob); tell("selected",d.message||"Selected job saved."); const list=await api.getJobs(userId); setJobs(Array.isArray(list)?list:list.jobs||[]); }); };
+  const previewSelectedJobUrl = () => task("selected-import",async()=>{ if(!selectedJobForm.job_url.trim()) throw new Error("Paste a direct job URL first."); const d=await api.importJobByUrl(userId,selectedJobForm.job_url); setSelectedJobForm((current)=>({...emptySelectedJob,title:d.title||current.title,company:d.company||current.company,location:d.location||current.location,work_mode:d.work_mode||current.work_mode||"Remote",job_type:d.job_type||current.job_type||"Full-time",description:d.description||current.description,skills_required:d.skills_required||current.skills_required,source:d.save_source,job_url:d.normalized_job_url})); setSelectedJobImportReady(true); setSelectedJobImportStatus(d); const statusMessage=d.status==="complete"?"Job details fetched successfully.":d.status==="partial"?"Some job details were fetched. Complete the missing fields before saving.":"The job URL was identified, but this provider did not expose the full details. Paste the missing fields below."; tell("selected",statusMessage); return d; });
+  const clearSelectedJob = () => { setSelectedJobForm(emptySelectedJob); setSelectedJobImportReady(false); setSelectedJobImportStatus(null); tell("selected",""); };
+  const saveSelectedJob = (e) => { e.preventDefault(); return task("selected",async()=>{ const d=await api.addSelectedJob(userId,selectedJobForm); setSelectedJobForm(emptySelectedJob); setSelectedJobImportReady(false); setSelectedJobImportStatus(null); tell("selected",d.message||"Selected job saved."); const list=await api.getJobs(userId); setJobs(Array.isArray(list)?list:list.jobs||[]); }); };
   const loadOptimizedResumes = () => task("optimizer",async()=>{ const d=await api.getOptimizedResumes(userId); setOptimizedResumes(Array.isArray(d)?d:d.optimized_resumes||[]); tell("optimizer","Optimized resumes loaded."); });
   const optimizeResume = (jobId) => task("optimizer",async()=>{ const d=await api.optimizeResume(userId,jobId); tell("optimizer",d.message||"Resume optimized."); const list=await api.getOptimizedResumes(userId); setOptimizedResumes(Array.isArray(list)?list:list.optimized_resumes||[]); });
   const loadMatches = () => task("matches",async()=>{ const d=await api.getMatches(userId); setMatches(Array.isArray(d)?d:d.matches||[]); tell("matches","Matches loaded."); });
@@ -55,9 +59,9 @@ export function AppProvider({ children }) {
   const loadEmailLogs = () => task("emails",async()=>{ const d=await api.getEmailLogs(userId); setEmailLogs(Array.isArray(d)?d:d.email_logs||[]); tell("emails","Email logs loaded."); });
   const generateEmailSummary = () => task("emails",async()=>{ const d=await api.generateEmailSummary(userId); tell("emails",d.message||"Email summary generated."); const list=await api.getEmailLogs(userId); setEmailLogs(Array.isArray(list)?list:list.email_logs||[]); });
   const runWorkflow = () => task("workflow",async()=>{ if(!preferencesSaved) throw new Error("Save your preferences before running the workflow."); const d=await api.runFullWorkflow(userId); setWorkflowResult(d); tell("workflow",d.message||"Workflow completed."); await Promise.all([loadJobs(),loadOptimizedResumes(),loadMatches(),loadEmailLogs()]); });
-  const selectedJobs = jobs.filter((j)=>j.source==="User Selected Job");
+  const selectedJobs = jobs.filter((j)=>j.source==="User Selected Job"||j.source?.endsWith(" Imported"));
   const averageMatch = matches.length ? Math.round(matches.reduce((s,m)=>s+Number(m.match_percentage||0),0)/matches.length) : 0;
-  const value = useMemo(()=>({currentUser,backendStatus,preferences,preferencesSaved,latestResume,selectedResumeFile,jobs,selectedJobs,selectedJobForm,optimizedResumes,matches,emailLogs,workflowResult,messages,busy,averageMatch,authenticate,logout,changePreferences,savePreferences,loadPreferences,setSelectedResumeFile,uploadResume,loadLatestResume,loadJobs,search,changeSelectedJob,saveSelectedJob,optimizeResume,loadOptimizedResumes,calculateMatches,loadMatches,generateEmailSummary,loadEmailLogs,runWorkflow}),[currentUser,backendStatus,preferences,preferencesSaved,latestResume,selectedResumeFile,jobs,selectedJobForm,optimizedResumes,matches,emailLogs,workflowResult,messages,busy,averageMatch]);
+  const value = useMemo(()=>({currentUser,backendStatus,preferences,preferencesSaved,latestResume,selectedResumeFile,jobs,selectedJobs,selectedJobForm,selectedJobImportReady,selectedJobImportStatus,optimizedResumes,matches,emailLogs,workflowResult,messages,busy,averageMatch,authenticate,logout,changePreferences,savePreferences,loadPreferences,setSelectedResumeFile,uploadResume,loadLatestResume,loadJobs,search,changeSelectedJob,previewSelectedJobUrl,clearSelectedJob,saveSelectedJob,optimizeResume,loadOptimizedResumes,calculateMatches,loadMatches,generateEmailSummary,loadEmailLogs,runWorkflow}),[currentUser,backendStatus,preferences,preferencesSaved,latestResume,selectedResumeFile,jobs,selectedJobForm,selectedJobImportReady,selectedJobImportStatus,optimizedResumes,matches,emailLogs,workflowResult,messages,busy,averageMatch]);
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }
 export const useApp = () => useContext(AppContext);

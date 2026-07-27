@@ -41,7 +41,10 @@ def calculate_matches_for_user(
     jobs = (
         db.query(Job)
         .filter(Job.user_id == user_id)
-        .filter(Job.source.in_(["Remotive API", "User Selected Job"]))
+        .filter(
+            (Job.source.in_(["Remotive API", "User Selected Job"]))
+            | Job.source.endswith(" Imported")
+        )
         .order_by(Job.id.desc())
         .all()
     )

@@ -21,3 +21,8 @@
 @media(max-width:520px){.page-navigation{align-items:flex-end;flex-direction:column}.page-navigation-message{text-align:right}}
 .job-match-badges{display:flex;align-items:flex-end;flex-direction:column;gap:5px}
 .matched-skills{color:var(--muted);font-size:10px;line-height:1.5;margin:10px 0 0}
+.import-fetch-actions{grid-column:1/-1;display:flex;gap:9px}.import-job-form>.notice{grid-column:1/-1;margin:0}.import-help{color:var(--muted);font-size:10px;margin:0;text-align:right}
+.import-field-status{border:1px solid #b9ddc8;background:#effaf3;border-radius:8px;color:#267043;padding:10px 12px}.import-field-status.warning{border-color:#f0d49a;background:#fff8e8;color:#8a5a00}.import-field-status p{font-size:10px;margin:3px 0;line-height:1.5}
+.job-description{color:var(--muted);font-size:12px;line-height:1.55;margin:10px 0 0}
+.job-link-row{font-size:11px;line-height:1.5;margin:8px 0 0;word-break:break-all}
+.job-link-row a{color:inherit}

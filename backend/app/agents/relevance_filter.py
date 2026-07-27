@@ -1,3 +1,9 @@
+"""
+Relevance helpers for the Updated Job Search Agent (Remotive API only).
+
+Existing Job Search Agent (job_search_agent.py) does not use this module.
+"""
+
 import re
 from html import unescape
 
@@ -10,11 +16,522 @@ TECHNOLOGY_ALIASES = {
     "reactjs": "react",
     "angular js": "angular",
     "node js": "node",
+    "nodejs": "node",
     "postgresql": "postgres",
     "java ee": "j2ee",
     "rest api": "rest",
     "micro service": "microservices",
+    "microservice": "microservices",
+    "xcuitest": "xcuitest",
+    "xctest": "xctest",
+    "big data": "big data",
 }
+
+# Role families used by Updated Job Search Agent alias / keyword matching.
+ROLE_FAMILIES = {
+    "sdet": {
+        "aliases": (
+            "SDET",
+            "Senior SDET",
+            "Software Engineer in Test",
+            "Software Development Engineer in Test",
+            "QA Automation Engineer",
+            "Test Automation Engineer",
+            "Automation Test Engineer",
+            "Quality Assurance Automation Engineer",
+        ),
+        "role_keywords": (
+            "sdet",
+            "software engineer in test",
+            "software development engineer in test",
+            "qa automation",
+            "test automation",
+            "automation engineer",
+            "quality assurance",
+            "automation testing",
+        ),
+        "search_queries": (
+            "SDET",
+            "Software Engineer in Test",
+            "QA Automation Engineer",
+            "Test Automation Engineer",
+        ),
+    },
+    "java_full_stack": {
+        "aliases": (
+            "Java Full Stack",
+            "Java Fullstack",
+            "Full Stack Java",
+            "Fullstack Java",
+            "Java React",
+            "Java Angular",
+            "Java Full Stack Developer",
+            "Full Stack Java Developer",
+            "Java Software Engineer",
+            "Java Developer",
+            "Java Full Stack Engineer",
+            "Backend Java Developer",
+        ),
+        "role_keywords": (
+            "java full stack",
+            "java fullstack",
+            "full stack java",
+            "java developer",
+            "java software engineer",
+            "backend java",
+            "java react",
+            "java angular",
+            "spring boot",
+        ),
+        "search_queries": (
+            "Java Full Stack Developer",
+            "Java Developer",
+            "Java Full Stack",
+            "Backend Java Developer",
+            "Java Software Engineer",
+        ),
+    },
+    "java_developer": {
+        "aliases": (
+            "Java Developer",
+            "Java Full Stack Developer",
+            "Backend Java Developer",
+            "Java Software Engineer",
+            "Java Engineer",
+            "Full Stack Java Developer",
+        ),
+        "role_keywords": (
+            "java developer",
+            "java engineer",
+            "java software",
+            "backend java",
+            "java full stack",
+            "spring boot",
+            "jvm",
+        ),
+        "search_queries": (
+            "Java Developer",
+            "Java Full Stack Developer",
+            "Backend Java Developer",
+            "Java Software Engineer",
+        ),
+    },
+    "data_engineer": {
+        "aliases": (
+            "Data Engineer",
+            "ETL Developer",
+            "ETL Engineer",
+            "Big Data Engineer",
+            "Data Platform Engineer",
+            "Analytics Engineer",
+        ),
+        "role_keywords": (
+            "data engineer",
+            "etl",
+            "big data",
+            "data platform",
+            "data pipeline",
+            "spark",
+            "warehouse",
+            "data infrastructure",
+        ),
+        "search_queries": (
+            "Data Engineer",
+            "ETL Developer",
+            "Big Data Engineer",
+            "Data Platform Engineer",
+        ),
+    },
+    "devops_engineer": {
+        "aliases": (
+            "DevOps Engineer",
+            "Cloud Engineer",
+            "Site Reliability Engineer",
+            "Platform Engineer",
+            "Infrastructure Engineer",
+        ),
+        "role_keywords": (
+            "devops",
+            "site reliability",
+            "sre",
+            "platform engineer",
+            "infrastructure engineer",
+            "cloud engineer",
+        ),
+        "search_queries": (
+            "DevOps Engineer",
+            "Site Reliability Engineer",
+            "Platform Engineer",
+            "Cloud Engineer",
+        ),
+    },
+}
+
+UNRELATED_ROLE_MARKERS = (
+    "marketing",
+    "sales",
+    "business development",
+    "customer support",
+    "customer success",
+    "customer service",
+    "accountant",
+    "accounting",
+    "bookkeeper",
+    "recruiter",
+    "talent acquisition",
+    "content writer",
+    "copywriter",
+    "content reviewer",
+    "patient care",
+    "data entry",
+    "graphic designer",
+    "product designer",
+    "ui ux designer",
+    "video editor",
+    "cinematic",
+)
+
+GENERIC_TITLE_WORDS = {
+    "and", "or", "the", "a", "an", "of", "for", "with", "in", "to",
+    "senior", "sr", "junior", "jr", "lead", "principal", "staff",
+    "full", "stack", "software", "engineer", "developer", "remote",
+}
+
+
+def normalize_text(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        value = " ".join(str(item) for item in value)
+    text = unescape(str(value)).lower()
+    text = re.sub(r"[-_/]+", " ", text)
+    text = re.sub(r"[^\w\s+#]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    for alias, canonical in TECHNOLOGY_ALIASES.items():
+        text = re.sub(rf"\b{re.escape(alias)}\b", canonical, text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_job_type(value) -> str:
+    normalized = normalize_text(value).replace("_", " ")
+    compact = normalized.replace(" ", "")
+    if compact == "fulltime":
+        return "Full-time"
+    if compact == "parttime":
+        return "Part-time"
+    if normalized == "contract":
+        return "Contract"
+    if normalized == "internship":
+        return "Internship"
+    if normalized == "freelance":
+        return "Freelance"
+    if normalized == "temporary":
+        return "Temporary"
+    return str(value or "").strip()
+
+
+def contains_phrase(text: str, phrase: str) -> bool:
+    normalized_phrase = normalize_text(phrase)
+    normalized_text = text if text == normalize_text(text) else normalize_text(text)
+    if not normalized_phrase:
+        return False
+    return bool(re.search(rf"\b{re.escape(normalized_phrase)}\b", normalized_text))
+
+
+def is_java_full_stack_request(title: str) -> bool:
+    normalized = normalize_text(title)
+    return "java" in normalized.split() and any(
+        indicator in normalized for indicator in ("full stack", "fullstack", "react", "angular")
+    )
+
+
+def detect_role_family_key(job_title: str) -> str | None:
+    """Map a preferred job title to a supported role-family key."""
+    normalized = normalize_text(job_title)
+    if not normalized:
+        return None
+
+    if is_java_full_stack_request(job_title):
+        return "java_full_stack"
+
+    # Prefer longer / more specific keys first.
+    ranked_keys = sorted(ROLE_FAMILIES.keys(), key=len, reverse=True)
+    for key in ranked_keys:
+        if key == "java_full_stack":
+            continue
+        if key in normalized or normalized in key:
+            return key
+        for alias in ROLE_FAMILIES[key]["aliases"]:
+            alias_norm = normalize_text(alias)
+            if alias_norm == normalized or alias_norm in normalized or normalized in alias_norm:
+                return key
+
+    if "java" in normalized.split() and any(
+        token in normalized for token in ("developer", "engineer", "backend")
+    ):
+        return "java_developer"
+
+    return None
+
+
+def get_role_aliases(job_title: str) -> list[str]:
+    family_key = detect_role_family_key(job_title)
+    aliases = [job_title]
+    if family_key:
+        aliases.extend(ROLE_FAMILIES[family_key]["aliases"])
+    unique = []
+    seen = set()
+    for alias in aliases:
+        normalized = normalize_text(alias)
+        if normalized and normalized not in seen:
+            unique.append(alias)
+            seen.add(normalized)
+    return unique
+
+
+def get_role_keywords(job_title: str) -> list[str]:
+    family_key = detect_role_family_key(job_title)
+    keywords = []
+    if family_key:
+        keywords.extend(ROLE_FAMILIES[family_key]["role_keywords"])
+    keywords.append(normalize_text(job_title))
+    for word in normalize_text(job_title).split():
+        if word not in GENERIC_TITLE_WORDS and len(word) > 1:
+            keywords.append(word)
+    unique = []
+    seen = set()
+    for keyword in keywords:
+        normalized = normalize_text(keyword)
+        if normalized and normalized not in seen:
+            unique.append(normalized)
+            seen.add(normalized)
+    return unique
+
+
+def build_alternative_queries(job_title: str) -> list[str]:
+    """Focused Remotive search queries: preferred title first, then safe aliases."""
+    family_key = detect_role_family_key(job_title)
+    queries = [job_title.strip()] if job_title and job_title.strip() else []
+    if family_key:
+        queries.extend(ROLE_FAMILIES[family_key]["search_queries"])
+        queries.extend(ROLE_FAMILIES[family_key]["aliases"])
+    else:
+        queries.extend(get_role_aliases(job_title))
+
+    unique = []
+    seen = set()
+    for query in queries:
+        normalized = normalize_text(query)
+        if normalized and normalized not in seen:
+            unique.append(query.strip())
+            seen.add(normalized)
+    return unique
+
+
+def normalize_skill_list(skills_value) -> list[str]:
+    if skills_value is None:
+        return []
+    if isinstance(skills_value, (list, tuple, set)):
+        raw_parts = [str(item) for item in skills_value]
+    else:
+        raw_parts = re.split(r"[,;\n|/]+", str(skills_value))
+    skills = []
+    seen = set()
+    for part in raw_parts:
+        normalized = normalize_text(part)
+        if normalized and normalized not in seen:
+            skills.append(normalized)
+            seen.add(normalized)
+    return skills
+
+
+def skill_overlap(user_skills: list[str], *job_fields) -> list[str]:
+    blob = normalize_text(" ".join(str(field or "") for field in job_fields))
+    matched = []
+    for skill in user_skills:
+        if contains_phrase(blob, skill) or skill in blob:
+            matched.append(skill)
+    return matched
+
+
+def is_clearly_unrelated_role(title: str, category: str = "", description: str = "") -> bool:
+    title_norm = normalize_text(title)
+    category_norm = normalize_text(category)
+    # Prefer title/category signals; avoid false positives from long descriptions.
+    haystack = f"{title_norm} {category_norm}".strip()
+    if not haystack:
+        haystack = normalize_text(description)[:300]
+    return any(contains_phrase(haystack, marker) for marker in UNRELATED_ROLE_MARKERS)
+
+
+def title_matches_request_or_alias(job_title: str, requested_title: str, aliases: list[str]) -> bool:
+    returned = normalize_text(job_title)
+    requested = normalize_text(requested_title)
+    if not returned or not requested:
+        return False
+    if requested in returned or returned in requested:
+        return True
+    if any(contains_phrase(returned, alias) or normalize_text(alias) in returned for alias in aliases):
+        return True
+    return False
+
+
+# Single tokens that are too broad to accept a job by themselves.
+WEAK_SOLO_TOKENS = {
+    "data", "test", "testing", "quality", "automation", "engineer",
+    "developer", "software", "analyst", "platform", "cloud", "backend",
+}
+
+
+def has_enough_role_keywords(job, requested_title: str) -> bool:
+    """
+    Role-keyword gate.
+
+    Remotive often attaches broad technology laundry-list tags to unrelated jobs,
+    so solo tokens like "java" must appear in the title (not only tags).
+    """
+    keywords = get_role_keywords(requested_title)
+    if not keywords:
+        return False
+
+    title_norm = normalize_text(job.get("title"))
+    category_norm = normalize_text(job.get("category"))
+    tags_norm = normalize_text(job.get("tags"))
+    description_norm = normalize_text(job.get("description"))
+    # Title + category only — avoid Remotive's noisy global tag lists.
+    title_blob = f"{title_norm} {category_norm}".strip()
+    enriched_blob = f"{title_blob} {tags_norm}".strip()
+    full_blob = f"{enriched_blob} {description_norm}".strip()
+
+    phrase_keywords = [k for k in keywords if " " in k]
+    # Multi-word phrases may appear in title, category, tags, or description.
+    if any(contains_phrase(full_blob, phrase) for phrase in phrase_keywords):
+        # Still require the title/category to look like the role family
+        # (avoid description-only marketing copy mentioning \"java developer\").
+        if any(contains_phrase(title_blob, phrase) for phrase in phrase_keywords):
+            return True
+        if any(contains_phrase(title_norm, token) for token in (
+            k for k in keywords
+            if " " not in k and k not in GENERIC_TITLE_WORDS and k not in WEAK_SOLO_TOKENS
+        )):
+            return True
+
+    # Strong single tokens (e.g. sdet, java, etl, spark) must be in the title.
+    strong_tokens = [
+        k for k in keywords
+        if " " not in k and k not in GENERIC_TITLE_WORDS and k not in WEAK_SOLO_TOKENS
+    ]
+    if any(contains_phrase(title_norm, token) for token in strong_tokens):
+        return True
+
+    # Two+ keyword hits in title/category (never tags-only).
+    hits = sum(1 for keyword in keywords if contains_phrase(title_blob, keyword))
+    return hits >= 2
+
+
+def is_role_relevant(job, requested_title: str, aliases: list[str]) -> bool:
+    """
+    Accept when at least one of:
+    - normalized job title contains the requested title
+    - requested title contains the normalized job title
+    - job title matches a supported alias
+    - title/tags/category/description contain enough role keywords
+    """
+    if is_clearly_unrelated_role(
+        job.get("title") or "",
+        job.get("category") or "",
+        job.get("description") or "",
+    ):
+        # Allow through only if title itself is a strong alias / exact match.
+        if title_matches_request_or_alias(job.get("title") or "", requested_title, aliases):
+            returned = normalize_text(job.get("title"))
+            if any(contains_phrase(returned, alias) for alias in aliases) or normalize_text(requested_title) in returned:
+                return True
+        return False
+
+    if title_matches_request_or_alias(job.get("title") or "", requested_title, aliases):
+        return True
+    return has_enough_role_keywords(job, requested_title)
+
+
+def passes_skill_relevance(job, preference, aliases: list[str]) -> tuple[bool, list[str]]:
+    """
+    Skill validation:
+    - Do not require every user skill
+    - Reject clearly unrelated jobs (zero overlap on weak matches)
+    - Strong title/alias matches may pass with zero overlap
+    """
+    user_skills = normalize_skill_list(getattr(preference, "skills", ""))
+    matched = skill_overlap(
+        user_skills,
+        job.get("title"),
+        job.get("tags"),
+        job.get("category"),
+        job.get("description"),
+    )
+    # Prefer skills evidenced in title/description so Remotive tag lists cannot alone pass.
+    matched_in_core = skill_overlap(
+        user_skills,
+        job.get("title"),
+        job.get("category"),
+        job.get("description"),
+    )
+    if not user_skills:
+        return True, matched
+
+    strong_title = title_matches_request_or_alias(
+        job.get("title") or "",
+        getattr(preference, "job_title", "") or "",
+        aliases,
+    )
+    if strong_title:
+        return True, matched
+
+    # Weak / keyword-only matches need core (title/description) skill evidence.
+    if matched_in_core:
+        return True, matched
+    return False, matched
+
+
+def calculate_relevance_rank(job, preference, aliases: list[str], matched_skills: list[str]) -> tuple[int, int]:
+    """
+    Sort key:
+    1) exact title match
+    2) strong alias match
+    3) skill overlap
+    4) general description / keyword match
+    Returns (tier, score) where higher is better.
+    """
+    requested = normalize_text(getattr(preference, "job_title", ""))
+    returned = normalize_text(job.get("title"))
+    description = normalize_text(job.get("description"))
+    category = normalize_text(job.get("category"))
+    tags = normalize_text(job.get("tags"))
+
+    if returned == requested:
+        tier = 4
+        score = 1000
+    elif requested and (requested in returned or returned in requested):
+        tier = 3
+        score = 800
+    elif any(contains_phrase(returned, alias) for alias in aliases):
+        tier = 3
+        score = 700
+    elif matched_skills:
+        tier = 2
+        score = 400 + (25 * len(matched_skills))
+    else:
+        tier = 1
+        score = 100
+
+    score += 15 * sum(1 for alias in aliases if contains_phrase(f"{category} {tags}", alias))
+    score += 5 * sum(1 for skill in matched_skills)
+    if any(contains_phrase(description, normalize_text(alias)) for alias in aliases[:6]):
+        score += 10
+    return tier, score
+
+
+# ---- Java full-stack helpers kept for existing unit tests / specialized scoring ----
 
 JAVA_FULL_STACK_SKILLS = {
     "java", "spring boot", "spring", "react", "angular", "javascript",
@@ -40,43 +557,6 @@ ALLOWED_REMOTE_LOCATIONS = (
     "north america",
     "americas",
 )
-
-
-def normalize_text(value) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, (list, tuple, set)):
-        value = " ".join(str(item) for item in value)
-    text = unescape(str(value)).lower()
-    text = re.sub(r"[-/]+", " ", text)
-    text = re.sub(r"[^\w\s+#]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    for alias, canonical in TECHNOLOGY_ALIASES.items():
-        text = re.sub(rf"\b{re.escape(alias)}\b", canonical, text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def normalize_job_type(value) -> str:
-    normalized = normalize_text(value).replace("_", " ")
-    compact = normalized.replace(" ", "")
-    if compact == "fulltime":
-        return "Full-time"
-    if compact == "parttime":
-        return "Part-time"
-    if normalized == "contract":
-        return "Contract"
-    if normalized == "internship":
-        return "Internship"
-    if normalized == "temporary":
-        return "Temporary"
-    return str(value or "").strip()
-
-
-def is_java_full_stack_request(title: str) -> bool:
-    normalized = normalize_text(title)
-    return "java" in normalized.split() and any(
-        indicator in normalized for indicator in ("full stack", "fullstack", "react", "angular")
-    )
 
 
 def detect_role_family(title: str, description: str = ""):
@@ -197,6 +677,9 @@ def deduplicate_ranked_jobs(candidates):
 
     return sorted(
         best_by_title_company.values(),
-        key=lambda candidate: candidate["relevance_score"],
+        key=lambda candidate: (
+            candidate.get("relevance_tier", 0),
+            candidate["relevance_score"],
+        ),
         reverse=True,
     )
