@@ -1,187 +1,130 @@
-# AI Job Search and Resume Optimization System
+# CareerBoost AI
 
-A full-stack application that helps users manage a job-search workflow from one dashboard. Users can create an account, save job preferences, upload a resume, discover jobs, calculate resume-to-job match scores, generate optimized resumes, and create job-summary emails. A scheduler can also run the complete workflow automatically.
+CareerBoost AI is a React/Vite, FastAPI, PostgreSQL application for job discovery, resume matching and optimization, selected jobs, email summaries, and scheduled daily workflows.
 
-## Features
+## Docker architecture
 
-- User signup and login
-- Job-search preferences, including schedule and timezone
-- PDF, DOCX, and TXT resume parsing
-- Job discovery based on saved preferences
-- Keyword-based resume and job matching
-- Job-specific resume optimization
-- Job-summary email generation and history
-- Manual and scheduled end-to-end workflows
-- Interactive FastAPI documentation
+The primary Compose stack runs:
 
-> [!NOTE]
-> The current job-search agent returns mock job data, and the email feature generates and stores an email summary rather than sending it through an external mail provider.
+- `postgres`: PostgreSQL 17 with a health check and the persistent `postgres_data` volume.
+- `backend`: one production Uvicorn worker on port 8000. It creates missing tables, applies the existing additive schema upgrades, and starts the existing APScheduler through FastAPI's lifespan.
+- `frontend`: a Vite production build served by Nginx on port 5173, including SPA route fallback.
 
-## Tech Stack
-
-- **Frontend:** React 19, Vite 8
-- **Backend:** FastAPI, SQLAlchemy, APScheduler
-- **Database:** PostgreSQL 17
-- **Document processing:** PyMuPDF, python-docx
-- **Infrastructure:** Docker Compose for PostgreSQL
-
-## Project Structure
-
-```text
-job-resume-agent-system/
-|-- backend/
-|   |-- app/
-|   |   |-- agents/       # Search, matching, optimization, and email logic
-|   |   |-- models/       # SQLAlchemy database models
-|   |   |-- routes/       # FastAPI endpoints
-|   |   |-- scheduler/    # Automated daily workflow
-|   |   |-- utils/        # Resume parsing and file generation
-|   |   `-- main.py       # FastAPI application
-|   `-- requirements.txt
-|-- frontend/
-|   |-- src/              # React application and API client
-|   `-- package.json
-|-- docker-compose.yml
-`-- README.md
-```
+Uploaded resumes are persisted in the `resume_uploads` volume mounted at `/app/app/uploads`, which is the parent of the application's actual `/app/app/uploads/resumes` storage directory.
 
 ## Prerequisites
 
-Install the following before starting:
+- Docker Desktop
+- Docker Compose (included with current Docker Desktop releases)
 
-- Python 3.11 or newer
-- Node.js 20 or newer
-- Docker Desktop (recommended for PostgreSQL), or a local PostgreSQL installation
+Python, Node.js, a virtual environment, and a host PostgreSQL installation are not required for the Docker workflow.
 
-## Getting Started
+## First startup (Windows PowerShell)
 
-### 1. Start PostgreSQL
+```powershell
+cd D:\workspace\job-resume-agent-system
+Copy-Item .env.example .env
+docker compose up --build
+```
 
-From the project root:
+The repository includes a safe local `.env`; copying the example is useful when setting up a fresh checkout. Put real LLM or SMTP credentials only in `.env`, which Git ignores.
 
-```bash
+Open:
+
+- Frontend: http://localhost:5173
+- Backend API: http://localhost:8000
+- Swagger UI: http://localhost:8000/docs
+- ReDoc: http://localhost:8000/redoc
+- Health: http://localhost:8000/health
+- Database from the host: `localhost:5432`
+
+## Environment variables
+
+| Variable | Default/purpose |
+|---|---|
+| `POSTGRES_DB` | `job_resume_agent_db` |
+| `POSTGRES_USER` | `postgres` |
+| `POSTGRES_PASSWORD` | Local database password; change outside local development |
+| `POSTGRES_PORT` | Host database port, default `5432` |
+| `DATABASE_URL` | Backend SQLAlchemy URL; its Docker hostname must remain `postgres` |
+| `BACKEND_PORT` | Host API port, default `8000` |
+| `FRONTEND_PORT` | Host frontend port, default `5173` |
+| `VITE_API_BASE_URL` | Browser-visible API URL, default `http://localhost:8000` |
+| `CORS_ORIGINS` | Comma-separated allowed browser origins |
+| `APP_TIMEZONE` | Scheduler log/default application timezone, default `America/Chicago` |
+| `AUTO_ANALYZE_SAVED_JOBS` | Existing automatic analysis switch |
+| `MAX_OPTIMIZATIONS_PER_RUN` | Existing ATS workload cap |
+| `LLM_*` | Optional backend-only LLM configuration |
+| `SMTP_*` | Optional backend-only SMTP configuration |
+
+`VITE_API_BASE_URL` is compiled into the public frontend bundle, so it must never contain a secret. LLM, SMTP, and database credentials are passed only to backend/database containers.
+
+## Useful commands
+
+Run these from the project root:
+
+```powershell
+# Start and build
+docker compose up --build
+
+# Start in the background
+docker compose up --build -d
+
+# Status and logs
+docker compose ps
+docker compose logs -f
+docker compose logs -f backend
+docker compose logs -f frontend
+docker compose logs -f postgres
+
+# Stop while preserving all data
+docker compose down
+
+# Restart
+docker compose restart
+
+# Rebuild only the backend
+docker compose build backend
+docker compose up -d backend
+
+# Enter containers
+docker compose exec backend sh
+docker compose exec postgres psql -U $env:POSTGRES_USER -d $env:POSTGRES_DB
+
+# Clean rebuild without deleting data
+docker compose down
+docker compose build --no-cache
 docker compose up -d
 ```
 
-This starts PostgreSQL on port `5432` with the development credentials defined in `docker-compose.yml`.
-
-### 2. Configure the backend
-
-Create `backend/.env`:
-
-```env
-DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/job_resume_agent_db
-```
-
-Create and activate a virtual environment, then install the dependencies.
-
-Windows PowerShell:
+If the PowerShell environment variables are not loaded, use the defaults directly:
 
 ```powershell
-cd backend
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+docker compose exec postgres psql -U postgres -d job_resume_agent_db
 ```
 
-macOS/Linux:
+## Verification
 
-```bash
-cd backend
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
+```powershell
+docker compose build
+docker compose up -d
+docker compose ps
+Invoke-RestMethod http://localhost:8000/health
+docker compose logs backend
+docker compose restart
+docker compose ps
 ```
 
-Start the API from the `backend` directory:
+Then verify the frontend, Swagger UI, signup/login, resume upload, job searches, selected jobs, and optimizer in the browser. The backend logs should contain one scheduler startup message. The production container intentionally uses one Uvicorn worker and no reload process, so the in-process scheduler starts once.
 
-```bash
-uvicorn app.main:app --reload
-```
+To verify persistence, create a user and upload a resume, run `docker compose down`, start again with `docker compose up -d`, and confirm both remain available. Ordinary `down`, restart, and rebuild operations preserve the named volumes.
 
-Initialize the database tables once the backend is running:
+> **Destructive reset:** `docker compose down -v` permanently deletes both the PostgreSQL data volume and uploaded-resume volume. Use it only when intentionally resetting all application data and files.
 
-```bash
-curl -X POST http://127.0.0.1:8000/init-db
-```
+## Local non-container development
 
-You can also open `http://127.0.0.1:8000/docs` and run `POST /init-db` from Swagger UI.
+The existing backend can still be run from `backend/` using its local environment and `python -m uvicorn app.main:app --reload`. The frontend can still be run from `frontend/` with `npm install` and `npm run dev`. For host development, `backend/.env` should use `localhost` in `DATABASE_URL`; inside Compose, the root `.env` uses the `postgres` service hostname.
 
-### 3. Start the frontend
+## Security notes
 
-Open another terminal:
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Open `http://localhost:5173` in your browser.
-
-## Application Workflow
-
-1. Create an account or log in.
-2. Save a desired job title, location, skills, work mode, and schedule.
-3. Upload a resume in PDF, DOCX, or TXT format.
-4. Search for jobs matching the saved preferences.
-5. Calculate match scores between the resume and available jobs.
-6. Generate an optimized resume for a selected job.
-7. Generate a summary email, or run the entire workflow at once.
-
-## API Overview
-
-The API runs at `http://127.0.0.1:8000` by default.
-
-| Area | Endpoints |
-|---|---|
-| Health | `GET /health`, `GET /db-health` |
-| Database | `POST /init-db` |
-| Authentication | `POST /api/auth/signup`, `POST /api/auth/login` |
-| Preferences | `POST /api/preferences`, `GET /api/preferences/{user_id}` |
-| Resumes | Upload, retrieve latest, optimize, and list optimized resumes under `/api/resume` |
-| Jobs | Search and list jobs under `/api/jobs` |
-| Matching | Calculate and retrieve matches under `/api/match` |
-| Email summaries | Generate and retrieve logs under `/api/email` |
-| Workflow | `POST /api/scheduler/run/{user_id}` |
-
-Full request and response schemas are available at:
-
-- Swagger UI: `http://127.0.0.1:8000/docs`
-- ReDoc: `http://127.0.0.1:8000/redoc`
-
-## Development Commands
-
-Run these commands from `frontend/`:
-
-```bash
-npm run dev      # Start the development server
-npm run build    # Create a production build
-npm run lint     # Run ESLint
-npm run preview  # Preview the production build
-```
-
-Run the backend with automatic reload from `backend/`:
-
-```bash
-uvicorn app.main:app --reload
-```
-
-## Configuration Notes
-
-- The frontend API URL is currently set to `http://127.0.0.1:8000` in `frontend/src/api.js`.
-- Backend CORS currently allows `http://localhost:5173` and `http://127.0.0.1:5173`.
-- Uploaded resumes and generated files are stored under the backend application directory. Do not commit files containing personal information.
-- The scheduler starts and stops with the FastAPI application.
-
-## Troubleshooting
-
-- **`DATABASE_URL is missing`:** confirm that `backend/.env` exists and contains the connection string shown above.
-- **Database connection fails:** verify the PostgreSQL container with `docker compose ps`, and ensure port `5432` is available.
-- **Frontend cannot reach backend:** confirm that Uvicorn is running on port `8000` and Vite is running on port `5173`.
-- **Tables do not exist:** call `POST /init-db` after starting the API.
-- **Resume upload fails:** use a supported PDF, DOCX, or TXT file and confirm that the backend can write to its upload directory.
-
-## Security and Production Considerations
-
-The included credentials and configuration are intended for local development. Before deploying, use strong secrets, restrict CORS, move database credentials into a secure secret store, add proper authentication tokens/session management, validate uploaded files, and serve the application over HTTPS.
+The defaults are intended for local development. For deployment, use strong secrets, avoid exposing PostgreSQL publicly, restrict CORS to the deployed frontend, use HTTPS, and store secrets in the target platform's secret manager. Neither `.env` nor uploaded personal documents are committed or copied into images.
