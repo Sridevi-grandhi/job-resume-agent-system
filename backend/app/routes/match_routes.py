@@ -1,3 +1,5 @@
+import json
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -7,6 +9,7 @@ from app.models.resume_model import Resume
 from app.models.job_model import Job
 from app.models.match_model import MatchScore
 from app.agents.matching_agent import calculate_match_score
+from app.services.job_eligibility import job_is_analyzable
 
 
 router = APIRouter(
@@ -61,19 +64,13 @@ def calculate_matches_for_user(
     created_matches = []
 
     for job in jobs:
-        job_text = f"""
-        {job.title}
-        {job.company}
-        {job.location}
-        {job.work_mode}
-        {job.job_type}
-        {job.description}
-        {job.skills_required}
-        """.strip()
+        eligible, _reason = job_is_analyzable(job, require_url=False)
+        if not eligible:
+            continue
 
         match_result = calculate_match_score(
             latest_resume.parsed_text,
-            job_text
+            job
         )
 
         new_match = MatchScore(
@@ -83,7 +80,10 @@ def calculate_matches_for_user(
             match_percentage=match_result["match_percentage"],
             matched_keywords=", ".join(match_result["matched_keywords"]),
             missing_keywords=", ".join(match_result["missing_keywords"]),
-            recommendation=match_result["recommendation"]
+            recommendation=match_result["recommendation"],
+            resume_version="original",
+            suggestions="\n".join(match_result.get("suggestions") or []),
+            score_breakdown=json.dumps(match_result.get("score_breakdown") or {}),
         )
 
         db.add(new_match)
@@ -107,7 +107,8 @@ def calculate_matches_for_user(
             "match_percentage": new_match.match_percentage,
             "matched_keywords": new_match.matched_keywords,
             "missing_keywords": new_match.missing_keywords,
-            "recommendation": new_match.recommendation
+            "recommendation": new_match.recommendation,
+            "resume_version": new_match.resume_version,
         })
 
     return {
@@ -150,6 +151,10 @@ def get_matches_for_user(
             "matched_keywords": match.matched_keywords,
             "missing_keywords": match.missing_keywords,
             "recommendation": match.recommendation,
+            "resume_version": getattr(match, "resume_version", "original") or "original",
+            "optimized_resume_id": getattr(match, "optimized_resume_id", None),
+            "suggestions": getattr(match, "suggestions", None),
+            "score_breakdown": getattr(match, "score_breakdown", None),
             "created_at": str(match.created_at)
         }
         for match, job in matches

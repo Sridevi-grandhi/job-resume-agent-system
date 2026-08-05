@@ -1,63 +1,60 @@
-import re
+"""
+Matching Percentage Agent
 
+Uses the shared weighted ATS scorer. Kept for backward compatibility with
+existing /api/match endpoints and workflow code.
+"""
 
-def clean_text(text: str) -> str:
-    text = text.lower()
-    text = re.sub(r"[^a-z0-9+#.\s]", " ", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+from app.services.ats_scoring import calculate_weighted_ats_score
 
 
 def extract_keywords(text: str):
-    cleaned_text = clean_text(text)
+    """Backward-compatible keyword extraction via weighted scorer helpers."""
+    from app.services.keyword_utils import find_keywords_in_text
 
-    keywords = set()
-
-    important_keywords = [
-        "java", "spring boot", "spring", "hibernate", "jpa",
-        "rest api", "restful", "microservices", "react",
-        "javascript", "typescript", "html", "css",
-        "aws", "docker", "kubernetes", "jenkins", "ci/cd",
-        "postgresql", "mysql", "sql", "oracle",
-        "agile", "scrum", "git", "github",
-        "authentication", "authorization", "jwt",
-        "banking", "finance", "cloud", "api"
-    ]
-
-    for keyword in important_keywords:
-        if keyword in cleaned_text:
-            keywords.add(keyword)
-
-    return keywords
+    return set(k.lower() for k in find_keywords_in_text(text or ""))
 
 
 def calculate_match_score(resume_text: str, job_text: str):
-    resume_keywords = extract_keywords(resume_text)
-    job_keywords = extract_keywords(job_text)
+    """
+    Backward-compatible match API.
 
-    if not job_keywords:
-        return {
-            "match_percentage": 0,
-            "matched_keywords": [],
-            "missing_keywords": [],
-            "recommendation": "No job keywords found."
-        }
-
-    matched_keywords = resume_keywords.intersection(job_keywords)
-    missing_keywords = job_keywords.difference(resume_keywords)
-
-    match_percentage = int((len(matched_keywords) / len(job_keywords)) * 100)
-
-    if match_percentage >= 80:
-        recommendation = "Strong match. Resume aligns well with this job."
-    elif match_percentage >= 60:
-        recommendation = "Good match. Resume can be improved by adding missing keywords."
+    Accepts either a job-like object or a combined job text string.
+    """
+    if hasattr(job_text, "title"):
+        result = calculate_weighted_ats_score(resume_text, job_text)
     else:
-        recommendation = "Low match. Resume needs optimization for this job."
+        class _JobShim:
+            title = ""
+            description = str(job_text or "")
+            skills_required = ""
+
+        # Prefer first line as title when callers pass combined text
+        lines = [line.strip() for line in str(job_text or "").splitlines() if line.strip()]
+        shim = _JobShim()
+        if lines:
+            shim.title = lines[0][:200]
+            shim.description = "\n".join(lines[1:]) if len(lines) > 1 else lines[0]
+        result = calculate_weighted_ats_score(resume_text, shim)
 
     return {
-        "match_percentage": match_percentage,
-        "matched_keywords": sorted(list(matched_keywords)),
-        "missing_keywords": sorted(list(missing_keywords)),
-        "recommendation": recommendation
+        "match_percentage": result["match_percentage"],
+        "matched_keywords": result["matched_keywords"],
+        "missing_keywords": result["missing_keywords"],
+        "recommendation": result["recommendation"],
+        "suggestions": result.get("suggestions", []),
+        "score_breakdown": result.get("score_breakdown", {}),
+        "total_score": result.get("total_score", result["match_percentage"]),
+        "score_status": result.get("score_status"),
+        "confidence": result.get("confidence"),
+        "role_alignment": result.get("role_alignment"),
+        "resume_role_families": result.get("resume_role_families", []),
+        "job_role_family": result.get("job_role_family"),
+        "score_cap_applied": result.get("score_cap_applied"),
+        "score_cap_reason": result.get("score_cap_reason"),
+        "matched_core_skills": result.get("matched_core_skills", []),
+        "matched_transferable_skills": result.get("matched_transferable_skills", []),
+        "missing_mandatory_skills": result.get("missing_mandatory_skills", []),
+        "warning_message": result.get("warning_message", ""),
+        "safe_to_apply": result.get("safe_to_apply", False),
     }
