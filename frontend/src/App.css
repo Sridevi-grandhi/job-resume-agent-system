@@ -26,3 +26,80 @@
 .job-description{color:var(--muted);font-size:12px;line-height:1.55;margin:10px 0 0}
 .job-link-row{font-size:11px;line-height:1.5;margin:8px 0 0;word-break:break-all}
 .job-link-row a{color:inherit}
+.job-disabled-reason{margin:8px 0 0;color:#a36500;font-size:10px}
+.ats-job-picker{display:grid;grid-template-columns:1.1fr .9fr;gap:16px;margin:12px 0 18px}
+.ats-job-picker label{font-size:11px;font-weight:600;color:#34425b}
+.ats-job-picker select{display:block;width:100%;margin-top:6px;padding:10px 11px;border:1px solid var(--line);border-radius:7px;background:#fbfcfe;font-size:11px}
+.ats-job-meta{border:1px solid var(--line);border-radius:10px;padding:12px;background:#f8fafc}
+.ats-job-meta p{margin:4px 0;font-size:11px;color:#526783}
+.ats-score-row{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:8px 0 6px}
+.ats-score-card{border:1px solid var(--line);border-radius:12px;padding:16px;background:#fff;box-shadow:var(--shadow)}
+.ats-score-card span{display:block;font-size:10px;color:var(--muted);font-weight:600}
+.ats-score-card b{display:block;margin-top:8px;font-size:28px}
+.ats-score-card.good b{color:#0aa45a}
+.ats-score-card.accent b{color:#1768e8}
+.ats-improvement-note{font-size:10px;color:var(--muted);margin:0 0 14px}
+.ats-list{margin:0;padding-left:16px;font-size:11px;line-height:1.55;color:#41516c}
+.ats-error{color:#c33}
+.ats-resume-toolbar{display:flex;gap:8px;margin:14px 0;flex-wrap:wrap}
+.ats-tabs{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0 14px}
+.ats-pipeline{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;list-style:none;padding:0;margin:0 0 16px}
+.ats-pipeline li{font-size:10px;padding:10px 8px;border:1px solid var(--line);border-radius:8px;background:#f8fafc;color:#64748b;text-align:center}
+.ats-pipeline li.done{background:#ecfdf5;border-color:#a7f3d0;color:#047857}
+.ats-pipeline li.active{background:#eff6ff;border-color:#93c5fd;color:#1d4ed8;font-weight:600}
+.ats-pipeline li.failed{background:#fef2f2;border-color:#fecaca;color:#b91c1c}
+@media(max-width:850px){.ats-job-picker,.ats-score-row,.ats-pipeline{grid-template-columns:1fr}}
+.button.danger{background:#fff;border:1px solid #efb4b4;color:#b42318}
+.button:disabled{cursor:not-allowed;opacity:.55;transform:none}
+.button.disabled{pointer-events:none;opacity:.55}
+.ats-major-warning{border:2px solid #dc2626;background:#fef2f2;color:#7f1d1d;border-radius:12px;padding:16px;margin:14px 0}
+.ats-major-warning h3{margin:0 0 8px;font-size:15px}.ats-major-warning p{margin:5px 0;font-size:11px;line-height:1.5}
+.ats-risk-ack{display:grid;gap:8px;margin-top:8px}.ats-risk-ack label{display:flex;align-items:flex-start;gap:7px;font-size:10px;color:#7f1d1d}
+.ats-score-explanation{display:grid;gap:7px}.ats-score-explanation p{margin:0;font-size:11px;color:#374151}
+.ats-evidence-snippet{display:block;margin-top:4px;color:#526783;font-size:9px;font-style:italic}
+.ats-wizard-steps{display:grid;grid-template-columns:repeat(7,1fr);gap:6px;list-style:none;padding:0;margin:0 0 18px}
+.ats-wizard-steps li{display:flex;align-items:center;gap:6px;font-size:9px;font-weight:600;padding:9px 7px;border:1px solid var(--line);border-radius:8px;background:#f8fafc;color:#64748b;cursor:pointer}
+.ats-wizard-steps li.locked{cursor:not-allowed;opacity:.5}
+.ats-wizard-steps li.done{background:#ecfdf5;border-color:#a7f3d0;color:#047857}
+.ats-wizard-steps li.active{background:#eff6ff;border-color:#93c5fd;color:#1d4ed8}
+.ats-wizard-step-index{display:inline-grid;place-items:center;width:16px;height:16px;border-radius:50%;background:#e2e8f0;color:#334155;font-size:8px;flex:0 0 auto}
+.ats-wizard-steps li.done .ats-wizard-step-index{background:#10b981;color:#fff}
+.ats-wizard-steps li.active .ats-wizard-step-index{background:#1768e8;color:#fff}
+@media(max-width:850px){.ats-wizard-steps{grid-template-columns:repeat(2,1fr)}}
+.ats-skill-list{display:grid;gap:10px;margin:12px 0}
+.ats-skill-card{border:1px solid var(--line);border-radius:10px;padding:12px;background:#fff}
+.ats-skill-card-header{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ats-skill-card-header b{font-size:12px}
+.badge-mandatory{background:#fee2e2;color:#b91c1c}
+.badge-preferred{background:#eef3ff;color:#4163ad}
+.ats-skill-meta{font-size:9px;color:var(--muted)}
+.ats-skill-checkbox{display:flex;align-items:center;gap:7px;font-size:10px;margin:8px 0;font-weight:600}
+.ats-skill-form{display:grid;grid-template-columns:1fr 1fr;gap:10px;padding-top:8px;border-top:1px dashed var(--line)}
+.ats-skill-form label{font-size:10px;font-weight:600;color:#34425b}
+.ats-skill-form select,.ats-skill-form input,.ats-skill-form textarea{display:block;width:100%;margin-top:5px;padding:8px 9px;border:1px solid var(--line);border-radius:7px;background:#fbfcfe;font-size:10px;color:#17233a}
+.ats-skill-evidence-description{grid-column:1/-1}
+.ats-required-mark{color:#b91c1c;font-weight:700}
+.ats-skill-error{grid-column:1/-1;color:#b91c1c;font-size:9px;margin:0}
+.ats-requirements-summary{margin-top:14px}
+.ats-requirements-summary h4{font-size:11px;margin:12px 0 6px}
+.ats-gap-banner{border:1px solid #fde68a;background:#fffbeb;color:#92400e;border-radius:8px;padding:10px 12px;font-size:10px;margin:10px 0}
+.ats-gap-banner-info{border-color:#93c5fd;background:#eff6ff;color:#1d4ed8}
+.ats-why-not-95{border:1px solid var(--line);background:#f8fafc;border-radius:10px;padding:12px;margin:10px 0}
+.ats-why-not-95 b{font-size:11px}.ats-why-not-95 p{margin:5px 0 0;font-size:10px;color:#374151;line-height:1.5}
+.badge-verified{background:#e7f8ee;color:#07964c}
+.ats-skill-card-verified{background:#f8fdfa;border-color:#d1fae5}
+.ats-skill-question{font-size:10px;font-weight:600;margin:10px 0 6px;color:#34425b}
+.ats-skill-answer-buttons{display:flex;gap:8px;margin-bottom:6px}
+.ats-evidence-summary{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:10px 0 16px}
+.ats-evidence-summary p{border:1px solid var(--line);border-radius:8px;padding:9px;font-size:9px;color:var(--muted);margin:0;text-align:center}
+.ats-evidence-summary p b{display:block;font-size:16px;color:#17233a;margin-top:4px}
+@media(max-width:850px){.ats-evidence-summary{grid-template-columns:repeat(2,1fr)}}
+.ats-module-checkbox-group{display:flex;flex-wrap:wrap;gap:8px 14px;margin-top:6px}
+.ats-improvement-meters{display:grid;grid-template-columns:repeat(2,1fr);gap:14px 22px;margin:8px 0 16px}
+@media(max-width:850px){.ats-improvement-meters{grid-template-columns:1fr}}
+.ats-meter-label{display:flex;justify-content:space-between;font-size:10px;font-weight:600;color:#34425b;margin-bottom:5px}
+.ats-meter-label b{color:#0aa45a}
+.ats-meter-track{position:relative;height:6px;border-radius:99px;background:#e8edf5;overflow:hidden;margin-bottom:4px}
+.ats-meter-fill{position:absolute;top:0;left:0;height:100%;border-radius:99px}
+.ats-meter-fill.before{background:#c7d2e0}
+.ats-meter-fill.after{background:linear-gradient(90deg,#1f73eb,#24c4a0)}

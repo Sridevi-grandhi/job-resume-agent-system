@@ -1,11 +1,16 @@
-const API_BASE_URL = "http://127.0.0.1:8000";
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
 
 async function getErrorMessage(response) {
   const text = await response.text();
 
   try {
     const data = JSON.parse(text);
-    return data.detail?.message || data.detail || data.message || text;
+    if (typeof data.detail === "string") return data.detail;
+    if (data.detail && typeof data.detail === "object") {
+      return data.detail.message || JSON.stringify(data.detail);
+    }
+    return data.message || text;
   } catch {
     return text || "Something went wrong";
   }
@@ -152,6 +157,41 @@ export async function addSelectedJob(userId, selectedJobData) {
   return response.json();
 }
 
+export async function getSelectedJobs(userId) {
+  const response = await fetch(`${API_BASE_URL}/api/jobs/selected/${userId}`);
+
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function deleteSelectedJob(userId, jobId) {
+  const response = await fetch(
+    `${API_BASE_URL}/api/jobs/selected/${userId}/${jobId}`,
+    { method: "DELETE" }
+  );
+
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function getJobDetail(userId, jobId) {
+  const response = await fetch(
+    `${API_BASE_URL}/api/jobs/detail/${userId}/${jobId}`
+  );
+
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+
+  return response.json();
+}
+
 export async function getJobs(userId) {
   const response = await fetch(`${API_BASE_URL}/api/jobs/${userId}`);
 
@@ -188,6 +228,173 @@ export async function optimizeResume(userId, jobId) {
   const response = await fetch(`${API_BASE_URL}/api/resume/optimize/${userId}/${jobId}`, {
     method: "POST"
   });
+
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+// ATS Resume Optimizer & Match Analyzer (async workflow)
+export async function startAtsOptimization(userId, jobId, force = false) {
+  const query = force ? "?force=true" : "";
+  const response = await fetch(
+    `${API_BASE_URL}/api/ats-optimizer/generate/${userId}/${jobId}${query}`,
+    { method: "POST" }
+  );
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+  return response.json();
+}
+
+export async function getAtsWorkflowStatus(workflowId) {
+  const response = await fetch(`${API_BASE_URL}/api/ats-optimizer/status/${workflowId}`);
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+  return response.json();
+}
+
+export async function getAtsResultByJob(userId, jobId) {
+  const response = await fetch(`${API_BASE_URL}/api/ats-optimizer/result/${userId}/${jobId}`);
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+  return response.json();
+}
+
+export async function retryAtsWorkflow(workflowId) {
+  const response = await fetch(`${API_BASE_URL}/api/ats-optimizer/retry/${workflowId}`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+  return response.json();
+}
+
+export function getAtsDownloadUrl(workflowId) {
+  return `${API_BASE_URL}/api/ats-optimizer/download/${workflowId}?format=txt`;
+}
+
+export async function getJobRequirements(userId, jobId) {
+  const response = await fetch(`${API_BASE_URL}/api/ats-optimizer/requirements/${userId}/${jobId}`);
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+  return response.json();
+}
+
+export async function getMissingSkills(userId, jobId, { forceRefresh = false } = {}) {
+  const query = forceRefresh ? "?force_refresh=true" : "";
+  const response = await fetch(
+    `${API_BASE_URL}/api/ats-optimizer/missing-skills/${userId}/${jobId}${query}`
+  );
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+  return response.json();
+}
+
+export async function analyzeOptimizerRequirements(userId, jobId, { forceRefresh = true } = {}) {
+  const query = forceRefresh ? "?force_refresh=true" : "?force_refresh=false";
+  const response = await fetch(
+    `${API_BASE_URL}/api/ats-optimizer/analyze/${userId}/${jobId}${query}`,
+    { method: "POST" }
+  );
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+  return response.json();
+}
+
+export async function getEvidence(userId, jobId) {
+  const response = await fetch(`${API_BASE_URL}/api/ats-optimizer/evidence/${userId}/${jobId}`);
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+  return response.json();
+}
+
+export async function saveEvidence(userId, jobId, items) {
+  const response = await fetch(
+    `${API_BASE_URL}/api/ats-optimizer/evidence/${userId}/${jobId}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items }),
+    }
+  );
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+  return response.json();
+}
+
+export async function deleteEvidence(userId, jobId, evidenceId) {
+  const response = await fetch(
+    `${API_BASE_URL}/api/ats-optimizer/evidence/${userId}/${jobId}/${evidenceId}`,
+    { method: "DELETE" }
+  );
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+  return response.json();
+}
+
+async function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const TERMINAL_ATS_STATUSES = new Set([
+  "COMPLETED",
+  "FAILED",
+  "VALIDATION_FAILED",
+  "INCOMPLETE_JOB",
+  "WAITING_FOR_RESUME",
+  "SKIPPED_GENERIC_SEARCH_LINK",
+]);
+
+export async function pollAtsWorkflow(workflowId, { onProgress, maxAttempts = 90, intervalMs = 2000 } = {}) {
+  let latest = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    latest = await getAtsWorkflowStatus(workflowId);
+    if (onProgress) onProgress(latest);
+    if (TERMINAL_ATS_STATUSES.has(latest.workflow_status)) {
+      return latest;
+    }
+    await sleep(intervalMs);
+  }
+  return latest;
+}
+
+// Combined optimize-and-match (starts shared ATS workflow)
+export async function analyzeAndOptimizeResume(userId, jobId, force = false) {
+  const query = force ? "?force=true" : "";
+  const response = await fetch(
+    `${API_BASE_URL}/api/resume/optimize-and-match/${userId}/${jobId}${query}`,
+    { method: "POST" }
+  );
+
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+
+  const started = await response.json();
+  if (started.workflow_id && !TERMINAL_ATS_STATUSES.has(started.workflow_status)) {
+    return pollAtsWorkflow(started.workflow_id);
+  }
+  return started;
+}
+
+// Backward-compatible alias for the ATS route
+export async function analyzeOptimizeViaAtsRoute(userId, jobId) {
+  const response = await fetch(
+    `${API_BASE_URL}/api/ats/analyze-optimize/${userId}/${jobId}`,
+    { method: "POST" }
+  );
 
   if (!response.ok) {
     throw new Error(await getErrorMessage(response));

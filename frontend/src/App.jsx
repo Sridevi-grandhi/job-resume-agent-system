@@ -9,8 +9,7 @@ import PreferencesPage from "./pages/PreferencesPage";
 import ResumePage from "./pages/ResumePage";
 import JobSearchPage from "./pages/JobSearchPage";
 import SelectedJobsPage from "./pages/SelectedJobsPage";
-import OptimizerPage from "./pages/OptimizerPage";
-import MatchScorePage from "./pages/MatchScorePage";
+import AtsAnalyzerPage from "./pages/AtsAnalyzerPage";
 import EmailSummaryPage from "./pages/EmailSummaryPage";
 import WorkflowPage from "./pages/WorkflowPage";
 
@@ -28,8 +27,11 @@ export default function App() {
               <Route path="/resume" element={<ResumePage />} />
               <Route path="/jobs" element={<JobSearchPage />} />
               <Route path="/selected-jobs" element={<SelectedJobsPage />} />
-              <Route path="/optimizer" element={<OptimizerPage />} />
-              <Route path="/matches" element={<MatchScorePage />} />
+              <Route path="/ats-analyzer" element={<AtsAnalyzerPage />} />
+              <Route path="/optimizer/:jobId" element={<AtsAnalyzerPage />} />
+              {/* Backward-compatible redirects from old Optimizer / Match Score routes */}
+              <Route path="/optimizer" element={<Navigate to="/ats-analyzer" replace />} />
+              <Route path="/matches" element={<Navigate to="/ats-analyzer" replace />} />
               <Route path="/emails" element={<EmailSummaryPage />} />
               <Route path="/workflow" element={<WorkflowPage />} />
             </Route>
