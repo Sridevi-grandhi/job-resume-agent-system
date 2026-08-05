@@ -1,7 +1,7 @@
 from pathlib import Path
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -11,6 +11,15 @@ from app.models.job_model import Job
 from app.models.optimized_resume_model import OptimizedResume
 from app.utils.resume_parser import parse_resume_file
 from app.agents.resume_optimization_agent import optimize_resume_for_job
+from app.services.ats_optimization_workflow_service import (
+    max_optimizations_per_run,
+    start_or_get_workflow,
+    start_workflow_for_saved_job,
+    run_workflow_job,
+    workflow_to_dict,
+)
+from app.services.job_eligibility import job_is_analyzable
+
 
 router = APIRouter(
     prefix="/api/resume",
@@ -23,6 +32,7 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 @router.post("/upload")
 async def upload_resume(
+    background_tasks: BackgroundTasks,
     user_id: int = Form(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
@@ -85,13 +95,38 @@ async def upload_resume(
     db.commit()
     db.refresh(new_resume)
 
+    # New resume version: optionally start ATS workflows for recent complete jobs.
+    # Does not overwrite historical results for previous resume_id values.
+    started = []
+    recent_jobs = (
+        db.query(Job)
+        .filter(Job.user_id == user_id)
+        .order_by(Job.id.desc())
+        .limit(20)
+        .all()
+    )
+    for job in recent_jobs:
+        if not job_is_analyzable(job, require_url=False)[0]:
+            continue
+        if len(started) >= max_optimizations_per_run():
+            break
+        result = start_workflow_for_saved_job(
+            db,
+            user_id=user_id,
+            job_id=job.id,
+            background_tasks=background_tasks,
+        )
+        if result.get("workflow_id"):
+            started.append(result)
+
     return {
         "message": "Resume uploaded and parsed successfully",
         "resume_id": new_resume.id,
         "user_id": new_resume.user_id,
         "file_name": new_resume.original_file_name,
         "file_type": new_resume.file_type,
-        "text_preview": parsed_text[:500]
+        "text_preview": parsed_text[:500],
+        "ats_workflows_started": started,
     }
 
 
@@ -115,16 +150,12 @@ def get_latest_resume(user_id: int, db: Session = Depends(get_db)):
         "file_name": resume.original_file_name,
         "file_type": resume.file_type,
         "uploaded_at": resume.uploaded_at,
-        "text_preview": resume.parsed_text[:1000]
+        "text_preview": resume.parsed_text[:1000],
     }
 
 
 @router.post("/optimize/{user_id}/{job_id}")
-def optimize_resume(
-    user_id: int,
-    job_id: int,
-    db: Session = Depends(get_db)
-):
+def optimize_resume(user_id: int, job_id: int, db: Session = Depends(get_db)):
     latest_resume = db.query(Resume).filter(
         Resume.user_id == user_id
     ).order_by(
@@ -137,30 +168,19 @@ def optimize_resume(
             detail="No resume found for this user. Please upload resume first."
         )
 
-    job = db.query(Job).filter(
-        Job.id == job_id,
-        Job.user_id == user_id
-    ).first()
-
+    job = db.query(Job).filter(Job.id == job_id, Job.user_id == user_id).first()
     if not job:
-        raise HTTPException(
-            status_code=404,
-            detail="Job not found for this user"
-        )
+        raise HTTPException(status_code=404, detail="Job not found for this user")
 
-    optimization_result = optimize_resume_for_job(
-        latest_resume.parsed_text,
-        job
-    )
+    optimization_result = optimize_resume_for_job(latest_resume.parsed_text, job)
 
     optimized_resume = OptimizedResume(
         user_id=user_id,
         resume_id=latest_resume.id,
         job_id=job.id,
         optimized_text=optimization_result["optimized_text"],
-        optimization_notes=optimization_result["optimization_notes"]
+        optimization_notes=optimization_result["optimization_notes"],
     )
-
     db.add(optimized_resume)
     db.commit()
     db.refresh(optimized_resume)
@@ -173,11 +193,55 @@ def optimize_resume(
         "job_id": job.id,
         "job_title": job.title,
         "company": job.company,
+        "job_url": job.job_url,
         "match_percentage": optimization_result["match_percentage"],
+        "original_match_percentage": optimization_result["original_match_percentage"],
+        "optimized_match_percentage": optimization_result["match_percentage"],
+        "score_improvement": optimization_result["score_improvement"],
+        "role_alignment": optimization_result.get("role_alignment"),
+        "score_status": optimization_result.get("score_status"),
+        "optimization_allowed": optimization_result.get("optimization_allowed", False),
+        "safe_to_apply": optimization_result.get("safe_to_apply", False),
+        "matched_core_skills": optimization_result.get("matched_core_skills", []),
+        "matched_transferable_skills": optimization_result.get("matched_transferable_skills", []),
+        "critical_missing_skills": optimization_result.get("missing_mandatory_skills", []),
+        "warning": optimization_result.get("warning_message", ""),
         "matched_keywords": optimization_result["matched_keywords"],
         "missing_keywords": optimization_result["missing_keywords"],
         "optimization_notes": optimized_resume.optimization_notes,
         "optimized_text_preview": optimized_resume.optimized_text[:1500]
+    }
+
+
+@router.post("/optimize-and-match/{user_id}/{job_id}")
+def optimize_and_match_resume(
+    user_id: int,
+    job_id: int,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+    force: bool = False,
+):
+    """
+    Combined Resume Optimization + Match Comparison.
+
+    Starts the shared ATSOptimizationWorkflowService (same as automatic job-save
+    and /api/ats-optimizer/generate). Returns quickly with workflow_id for polling.
+    """
+    workflow = start_or_get_workflow(
+        db,
+        user_id=user_id,
+        job_id=job_id,
+        force=force,
+    )
+    if workflow.workflow_status == "PENDING":
+        background_tasks.add_task(run_workflow_job, workflow.id)
+
+    job = db.query(Job).filter(Job.id == job_id).first()
+    return {
+        "message": "ATS optimize-and-match workflow accepted",
+        "workflow_id": workflow.id,
+        "workflow_status": workflow.workflow_status,
+        **workflow_to_dict(workflow, job),
     }
 
 
@@ -208,11 +272,11 @@ def get_optimized_resumes(user_id: int, db: Session = Depends(get_db)):
             "company": job.company if job else None,
             "optimization_notes": optimized_resume.optimization_notes,
             "optimized_text_preview": optimized_resume.optimized_text[:1000],
-            "created_at": optimized_resume.created_at
+            "created_at": optimized_resume.created_at,
         })
 
     return {
         "user_id": user_id,
         "total_optimized_resumes": len(result),
-        "optimized_resumes": result
+        "optimized_resumes": result,
     }

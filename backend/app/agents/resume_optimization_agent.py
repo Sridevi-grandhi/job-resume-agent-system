@@ -1,64 +1,65 @@
-from app.agents.matching_agent import calculate_match_score
+"""
+Resume Optimization Agent
+
+Backward-compatible wrapper around the ATS Analyzer generator.
+Existing /api/resume/optimize endpoint continues to work.
+"""
+
+from app.services.ats_scoring import calculate_weighted_ats_score
+from app.services.keyword_injection_service import plan_keyword_injection
+from app.services.resume_generator import generate_optimized_resume
+from app.services.resume_structure_parser import parse_resume_structure
 
 
 def optimize_resume_for_job(resume_text: str, job):
-    job_text = f"{job.title} {job.description} {job.skills_required}"
+    structure = parse_resume_structure(resume_text or "")
+    injection_plan = plan_keyword_injection(
+        resume_text=resume_text or "",
+        job=job,
+        employments=structure.get("employments") or [],
+        projects=structure.get("projects") or [],
+    )
+    generated = generate_optimized_resume(resume_text or "", job, injection_plan)
+    plain = generated["plain_text"]
 
-    match_result = calculate_match_score(
-        resume_text,
-        job_text
+    original = calculate_weighted_ats_score(resume_text or "", job)
+    # The optimized document may surface evidence, but the original resume remains
+    # the only source allowed to prove a candidate claim.
+    optimized = calculate_weighted_ats_score(
+        plain,
+        job,
+        evidence_source_text=resume_text or "",
     )
 
-    matched_keywords = match_result["matched_keywords"]
-    missing_keywords = match_result["missing_keywords"]
+    matched_keywords = optimized.get("matched_keywords") or []
+    missing_keywords = optimized.get("missing_keywords") or []
 
-    matched_keywords_text = ", ".join(matched_keywords) if matched_keywords else "No matched keywords found"
-    missing_keywords_text = ", ".join(missing_keywords) if missing_keywords else "No major missing keywords found"
-
-    optimized_text = f"""
-TARGET ROLE
-{job.title}
-
-TARGET COMPANY
-{job.company}
-
-MATCHING KEYWORDS
-{matched_keywords_text}
-
-MISSING KEYWORDS TO ADD NATURALLY
-{missing_keywords_text}
-
-OPTIMIZED PROFESSIONAL SUMMARY
-Java Full Stack Developer with strong experience in designing, developing, and deploying scalable enterprise applications. Skilled in Java, Spring Boot, REST APIs, microservices, React, SQL databases, cloud platforms, and Agile delivery. Experienced in building secure backend services, responsive frontend applications, and production-ready full stack solutions aligned with business and technical requirements.
-
-OPTIMIZED TECHNICAL SKILLS
-Java, Spring Boot, REST APIs, Microservices, React, JavaScript, TypeScript, SQL, PostgreSQL, MySQL, AWS, Docker, Jenkins, Git, Agile, CI/CD, Cloud Deployment
-
-OPTIMIZED EXPERIENCE POINTS
-- Designed and developed scalable full stack applications using Java, Spring Boot, React, REST APIs, and SQL databases.
-- Built backend services and microservices to support secure, high-performance enterprise application workflows.
-- Developed responsive frontend components using React, JavaScript, TypeScript, HTML, and CSS.
-- Integrated RESTful APIs with frontend modules to improve application performance, usability, and maintainability.
-- Worked with cloud-based deployment practices using AWS, Docker, CI/CD pipelines, and Agile development methods.
-- Improved application reliability by writing clean, modular, reusable, and testable code across backend and frontend layers.
-- Collaborated with cross-functional teams including developers, QA engineers, business analysts, and product owners.
-- Used Git, Jenkins, and Agile/Scrum practices for version control, build automation, sprint delivery, and production releases.
-
-JOB DESCRIPTION USED FOR OPTIMIZATION
-{job.description}
-""".strip()
-
-    optimization_notes = f"""
-Current Match Percentage: {match_result["match_percentage"]}%
-Matched Keywords: {matched_keywords_text}
-Missing Keywords: {missing_keywords_text}
-Recommendation: {match_result["recommendation"]}
-""".strip()
+    optimization_notes = (
+        f"Original Match Percentage: {original['match_percentage']}%\n"
+        f"Optimized Match Percentage: {optimized['match_percentage']}%\n"
+        f"Matched Keywords: {', '.join(matched_keywords) if matched_keywords else 'None'}\n"
+        f"Missing Keywords: {', '.join(missing_keywords) if missing_keywords else 'None'}\n"
+        f"Recommendation: {optimized.get('recommendation', '')}\n"
+        f"Selected Technologies: {', '.join(injection_plan.get('supportedKeywords') or [])}\n"
+        f"Rejected Technologies: {', '.join(injection_plan.get('rejectedTechnologies') or [])}"
+    )
 
     return {
-        "optimized_text": optimized_text,
+        "optimized_text": plain,
         "optimization_notes": optimization_notes,
-        "match_percentage": match_result["match_percentage"],
+        "match_percentage": optimized["match_percentage"],
         "matched_keywords": matched_keywords,
-        "missing_keywords": missing_keywords
+        "missing_keywords": missing_keywords,
+        "original_match_percentage": original["match_percentage"],
+        "score_improvement": optimized["match_percentage"] - original["match_percentage"],
+        "role_alignment": original.get("role_alignment"),
+        "score_status": optimized.get("score_status"),
+        "safe_to_apply": optimized.get("safe_to_apply", False),
+        "optimization_allowed": original.get("optimization_allowed", False),
+        "matched_core_skills": original.get("matched_core_skills", []),
+        "matched_transferable_skills": original.get("matched_transferable_skills", []),
+        "missing_mandatory_skills": original.get("missing_mandatory_skills", []),
+        "warning_message": original.get("warning_message", ""),
+        "supported_keywords": injection_plan.get("supportedKeywords") or [],
+        "unsupported_keywords": injection_plan.get("unsupportedKeywords") or [],
     }
