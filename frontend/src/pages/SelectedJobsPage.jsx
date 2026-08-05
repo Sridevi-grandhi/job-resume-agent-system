@@ -1,3 +1,5 @@
+/* eslint-disable react-hooks/exhaustive-deps */
+import { useEffect } from "react";
 import { useApp } from "../context/AppContext";
 import { Page, Panel, Notice } from "../components/Page";
 import JobCard from "../components/JobCard";
@@ -15,7 +17,18 @@ export default function SelectedJobsPage() {
     form.title.trim() && form.company.trim() && form.description.trim() && form.job_url.trim()
   );
 
-  return <Page title="Selected Jobs" subtitle="Import one direct job URL, review its details, and save it for optimization and matching.">
+  useEffect(() => {
+    app.verifyLatestResume();
+    app.loadSelectedJobs();
+  }, [app.currentUser?.user_id]);
+
+  const removeJob = (job) => {
+    if (window.confirm("Are you sure you want to remove this selected job?")) {
+      app.removeSelectedJob(job.id);
+    }
+  };
+
+  return <Page title="Selected Jobs" subtitle="Import or save a complete individual job. Optimization and both match scores run automatically after a successful save.">
     <div className="two-col selected-layout">
       <Panel title="4. Import Selected Job" subtitle="Paste a direct job URL. You can complete or correct every field before saving.">
         <form className="form-grid import-job-form" onSubmit={app.saveSelectedJob}>
@@ -59,9 +72,14 @@ export default function SelectedJobsPage() {
           {!canSave && <p className="import-help full">{hasImportPreview ? "Complete the job title, company, description, and normalized URL before saving." : "Fetch and validate the direct job URL before saving."}</p>}
         </form>
       </Panel>
-      <Panel title="Saved Selected Jobs" subtitle={`${app.selectedJobs.length} manually selected or imported opportunities`}>
+      <Panel
+        title="Saved Selected Jobs"
+        subtitle={`${app.selectedJobs.length} manually selected or imported opportunities`}
+        actions={<button className="button secondary" onClick={app.loadSelectedJobs} disabled={app.busy === "selected-load"}>{app.busy === "selected-load" ? "Loading..." : "Load Selected Jobs"}</button>}
+      >
+        <Notice>{app.messages.selected}</Notice>
         {app.selectedJobs.length
-          ? <div className="stack">{app.selectedJobs.map((job, index) => <JobCard job={job} key={job.id || index} />)}</div>
+          ? <div className="stack">{app.selectedJobs.map((job, index) => <JobCard job={job} key={job.id || index} selected onRemove={() => removeJob(job)} removing={String(app.deletingJobId) === String(job.id)} />)}</div>
           : <EmptyState title="No selected jobs" text="Import a direct job URL and complete its job details." />}
       </Panel>
     </div>
