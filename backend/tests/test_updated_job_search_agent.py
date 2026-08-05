@@ -145,6 +145,29 @@ class UpdatedJobSearchAgentTests(unittest.TestCase):
         self.assertEqual(normalized["work_mode"], "Remote")
         self.assertTrue(normalized["job_url"].startswith("https://"))
 
+    def test_does_not_invent_skills_from_user_preferences(self):
+        pref = preference(skills="Swift, XCUITest, XCTest, Jenkins, Git, Agile")
+        normalized = normalize_remotive_job(remotive_job(tags=[]), pref)
+        self.assertEqual(normalized["skills_required"], "")
+        self.assertNotIn("XCUITest", normalized["skills_required"])
+
+    def test_rejects_remotive_search_and_homepage_urls(self):
+        self.assertIsNone(extract_valid_job_url({"url": "https://remotive.com/remote-jobs"}))
+        self.assertIsNone(extract_valid_job_url({"url": "https://remotive.com/remote-jobs?search=java"}))
+        self.assertIsNone(extract_valid_job_url({"url": "https://www.remotive.com/"}))
+
+    def test_rejects_javascript_only_frontend_for_java_full_stack(self):
+        pref = preference(job_title="Java Full Stack Developer", skills="Java, Spring Boot, React")
+        aliases = get_role_aliases(pref.job_title)
+        job = remotive_job(
+            title="Senior React Developer",
+            category="Software Development",
+            tags=["React", "JavaScript", "TypeScript"],
+            description="Build UI with React and TypeScript. No Java required.",
+            url="https://remotive.com/remote-jobs/software-development/react-dev-99",
+        )
+        self.assertFalse(is_role_relevant(job, pref.job_title, aliases))
+
     def test_skill_relevance_allows_partial_overlap(self):
         pref = preference()
         aliases = get_role_aliases(pref.job_title)
@@ -153,31 +176,67 @@ class UpdatedJobSearchAgentTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("jenkins", matched)
 
+    def test_accepts_normalized_java_fullstack_titles(self):
+        pref = preference(job_title="JAVA FULL STACK", location="usa", experience="8", skills="Java, Spring Boot, React")
+        aliases = get_role_aliases(pref.job_title)
+        for title in (
+            "Senior Full Stack Software Engineer (Java)",
+            "Senior Fullstack Developer (Java/React)",
+            "Java React Developer",
+            "Spring Boot React Developer",
+        ):
+            job = remotive_job(
+                title=title,
+                tags=["Java", "Spring Boot", "React"],
+                description="Develop Java Spring Boot REST APIs and React UIs.",
+                candidate_required_location="Worldwide",
+            )
+            self.assertTrue(is_role_relevant(job, pref.job_title, aliases), title)
+
     @patch("app.agents.updated_job_search_agent.fetch_jobs_from_remotive")
     def test_get_updated_jobs_filters_and_limits(self, mock_fetch):
-        mock_fetch.return_value = [
-            remotive_job(title="Senior SDET", url="https://remotive.com/remote-jobs/software-development/sdet-1"),
-            remotive_job(title="QA Automation Engineer", url="https://remotive.com/remote-jobs/software-development/qa-2"),
-            remotive_job(title="Marketing Manager", category="Marketing", url="https://remotive.com/remote-jobs/marketing/mkt-3"),
-            remotive_job(title="Senior SDET", company_name="Acme QA", url="https://remotive.com/remote-jobs/software-development/sdet-1"),
-        ]
+        mock_fetch.return_value = (
+            [
+                remotive_job(title="Senior SDET", url="https://remotive.com/remote-jobs/software-development/sdet-1"),
+                remotive_job(title="QA Automation Engineer", url="https://remotive.com/remote-jobs/software-development/qa-2"),
+                remotive_job(title="Marketing Manager", category="Marketing", url="https://remotive.com/remote-jobs/marketing/mkt-3"),
+                remotive_job(title="Senior SDET", company_name="Acme QA", url="https://remotive.com/remote-jobs/software-development/sdet-1"),
+            ],
+            None,
+            200,
+        )
         result = get_updated_jobs_from_remotive(preference(), max_jobs=10)
         titles = [job["title"] for job in result["jobs"]]
         self.assertIn("Senior SDET", titles)
         self.assertIn("QA Automation Engineer", titles)
         self.assertNotIn("Marketing Manager", titles)
         self.assertLessEqual(len(result["jobs"]), 10)
+        self.assertLessEqual(len(result["search_queries_used"]), 8)
         for job in result["jobs"]:
             self.assertTrue(job["job_url"].startswith("https://"))
             self.assertEqual(job["source"], "Remotive API")
 
     @patch("app.agents.updated_job_search_agent.fetch_jobs_from_remotive")
     def test_no_relevant_jobs_returns_empty(self, mock_fetch):
-        mock_fetch.return_value = [
-            remotive_job(title="Sales Executive", category="Sales", tags=[], description="Sell products."),
-        ]
+        mock_fetch.return_value = (
+            [
+                remotive_job(title="Sales Executive", category="Sales", tags=[], description="Sell products."),
+            ],
+            None,
+            200,
+        )
         result = get_updated_jobs_from_remotive(preference(), max_jobs=10)
         self.assertEqual(result["jobs"], [])
+        self.assertEqual(result["api_status"], "no_relevant_jobs")
+        self.assertEqual(result["diagnostics"]["zero_count_stage"], "title_filter")
+
+    @patch("app.agents.updated_job_search_agent.fetch_jobs_from_remotive")
+    def test_api_failure_returns_unavailable_without_fake_jobs(self, mock_fetch):
+        mock_fetch.return_value = ([], "timeout", None)
+        result = get_updated_jobs_from_remotive(preference(), max_jobs=10)
+        self.assertEqual(result["jobs"], [])
+        self.assertEqual(result["api_status"], "unavailable")
+        self.assertEqual(result["api_error"], "timeout")
 
     def test_evaluate_rejects_missing_url(self):
         pref = preference()
