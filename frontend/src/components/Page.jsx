@@ -19,18 +19,23 @@ const navigationByPath = {
     disabledMessage: "Search for jobs or load existing jobs before continuing.",
   },
   "/selected-jobs": {
-    nextPath: "/optimizer",
+    nextPath: "/ats-analyzer",
     canContinue: true,
   },
+  "/ats-analyzer": {
+    nextPath: "/emails",
+    stateKey: "atsResult",
+    disabledMessage: "Run ATS Analyzer for at least one complete job before continuing.",
+  },
   "/optimizer": {
-    nextPath: "/matches",
-    stateKey: "optimizedResumes",
-    disabledMessage: "Create or load at least one optimized resume before continuing.",
+    nextPath: "/emails",
+    stateKey: "atsResult",
+    disabledMessage: "Run ATS Analyzer for at least one complete job before continuing.",
   },
   "/matches": {
     nextPath: "/emails",
-    stateKey: "matches",
-    disabledMessage: "Calculate or load match results before continuing.",
+    stateKey: "atsResult",
+    disabledMessage: "Run ATS Analyzer for at least one complete job before continuing.",
   },
   "/emails": {
     nextPath: "/workflow",

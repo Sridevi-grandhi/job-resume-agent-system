@@ -1,3 +1,4 @@
+import { useNavigate } from "react-router-dom";
 import { useApp } from "../context/AppContext";
 import StatusBadge from "./StatusBadge";
 
@@ -15,15 +16,45 @@ function truncate(text, max = 280) {
   return value.length > max ? `${value.slice(0, max).trim()}…` : value;
 }
 
-export default function JobCard({ job, compact = false }) {
-  const { matches, optimizeResume, busy } = useApp();
-  const match = matches.find((item) => String(item.job_id) === String(job.id || job.job_id));
+export default function JobCard({ job, compact = false, selected = false, onRemove, removing = false }) {
+  const { matches, latestResume, setAtsSelectedJobId, busy } = useApp();
+  const navigate = useNavigate();
+  const match = matches.find((item) => String(item.job_id) === String(job.id || job.job_id) && (item.resume_version || "original") === "original")
+    || matches.find((item) => String(item.job_id) === String(job.id || job.job_id));
+  const originalMatch = job.original_match_percentage ?? match?.match_percentage;
   const isRemotive = job.source === "Remotive API";
   const isRealJob = isRemotive || job.source === "User Selected Job" || job.source?.endsWith(" Imported");
-  const canOptimize = isRealJob && Boolean(job.description?.trim());
+  const hasDescription = Boolean(job.description?.trim()) && String(job.description).trim().length >= 40;
+  const hasUrl = Boolean(String(job.job_url || "").trim());
+  const isImportedOrSelected = job.source === "User Selected Job" || job.source?.endsWith(" Imported");
+  const canAnalyze = isRealJob && hasDescription && Boolean(latestResume) && (hasUrl || isImportedOrSelected);
+  const disabledReason = !latestResume
+    ? "Upload a resume first"
+    : genericSearchSources.has(job.source)
+      ? "Generic search links cannot be analyzed"
+      : !hasDescription
+        ? "Job description is incomplete"
+        : !hasUrl && !isImportedOrSelected
+          ? "Direct job URL is required"
+          : "";
   const description = truncate(job.description);
   const skills = String(job.skills_required || "").trim();
   const jobUrl = String(job.job_url || "").trim();
+
+  const openAtsAnalyzer = () => {
+    const jobId = String(job.id || job.job_id);
+    setAtsSelectedJobId(jobId);
+    sessionStorage.setItem("atsSelectedJobId", jobId);
+    navigate(`/optimizer/${jobId}`, {
+      state: {
+        job_id: Number(jobId),
+        title: job.title,
+        company: job.company,
+        job_url: job.job_url,
+        source: job.source,
+      },
+    });
+  };
 
   return <article className={`job-card ${compact ? "compact" : ""}`}>
     <div className="company-mark">{(job.company || job.source || "J")[0].toUpperCase()}</div>
@@ -34,8 +65,8 @@ export default function JobCard({ job, compact = false }) {
           <p>{job.company || job.source || "Unknown company"} · {job.location || "Location not listed"}</p>
         </div>
         <div className="job-match-badges">
-          {match && isRealJob && (
-            <StatusBadge tone="neutral">Resume Match {Math.round(match.match_percentage)}%</StatusBadge>
+          {originalMatch != null && isRealJob && (
+            <StatusBadge tone="neutral">Resume Match {Math.round(originalMatch)}%</StatusBadge>
           )}
           {genericSearchSources.has(job.source) && (
             <StatusBadge tone="neutral">Match unavailable</StatusBadge>
@@ -60,8 +91,27 @@ export default function JobCard({ job, compact = false }) {
         </p>
       )}
       {!compact && <div className="card-actions">
-        {jobUrl && <a className="button secondary" href={jobUrl} target="_blank" rel="noreferrer">View Job ↗</a>}
-        {canOptimize && <button className="button primary" onClick={() => optimizeResume(job.id || job.job_id)} disabled={busy === "optimizer"}>Optimize Resume</button>}
+        {jobUrl ? (
+          <a className="button secondary" href={jobUrl} target="_blank" rel="noopener noreferrer">
+            {isRemotive ? "View Job / Apply" : "View Job ↗"}
+          </a>
+        ) : selected ? <button className="button secondary" disabled>View Job</button> : null}
+        <button
+          className="button primary"
+          onClick={openAtsAnalyzer}
+          disabled={!canAnalyze || busy === "ats" || busy === "selected"}
+          title={disabledReason || "Optimize Resume for This Job"}
+        >
+          {isRemotive ? "Optimize Resume for This Job" : "Optimize and Compare Scores"}
+        </button>
+        {selected && (
+          <button className="button danger" onClick={onRemove} disabled={removing}>
+            {removing ? "Removing..." : "Remove Job"}
+          </button>
+        )}
+        {!canAnalyze && disabledReason && (
+          <p className="job-disabled-reason">{disabledReason}</p>
+        )}
       </div>}
     </div>
   </article>;

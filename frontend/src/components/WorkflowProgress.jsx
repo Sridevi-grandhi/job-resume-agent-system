@@ -1,2 +1,14 @@
 import {Link} from "react-router-dom"; import {Icon} from "./Icons"; import {useApp} from "../context/AppContext";
-export default function WorkflowProgress(){const a=useApp(); const items=[["/preferences","preferences","Preferences",a.preferencesSaved?"Saved":"Pending",a.preferencesSaved],["/resume","resume","Resume",a.latestResume?"Uploaded":"Pending",!!a.latestResume],["/jobs","jobs","Job Search",a.jobs.length?`${a.jobs.length} jobs`:"Pending",!!a.jobs.length],["/selected-jobs","selected","Selected Jobs",a.selectedJobs.length?`${a.selectedJobs.length} added`:"Optional",!!a.selectedJobs.length],["/optimizer","optimizer","Optimizer",a.optimizedResumes.length?`${a.optimizedResumes.length} optimized`:"Pending",!!a.optimizedResumes.length],["/matches","matches","Match Score",a.matches.length?`${a.averageMatch}% avg`:"Pending",!!a.matches.length],["/emails","emails","Email Summary",a.emailLogs.length?`${a.emailLogs.length} sent`:"Pending",!!a.emailLogs.length],["/workflow","workflow","Workflow",a.workflowResult?"Complete":"Ready",!!a.workflowResult]]; return <section className="workflow-progress">{items.map(([to,icon,label,status,done],i)=><Link className={done?"done":""} to={to} key={to}><div className="flow-icon"><Icon name={icon}/></div><b>{label}</b><small>{status}</small>{i<items.length-1&&<i className="connector"/>}</Link>)}</section>}
+export default function WorkflowProgress(){
+  const a=useApp();
+  const items=[
+    ["/preferences","preferences","Preferences",a.preferencesSaved?"Saved":"Pending",a.preferencesSaved],
+    ["/resume","resume","Resume",a.latestResume?"Uploaded":"Pending",!!a.latestResume],
+    ["/jobs","jobs","Job Search",a.jobs.length?`${a.jobs.length} jobs`:"Pending",!!a.jobs.length],
+    ["/selected-jobs","selected","Selected Jobs",a.selectedJobs.length?`${a.selectedJobs.length} added`:"Optional",!!a.selectedJobs.length],
+    ["/ats-analyzer","optimizer","ATS Analyzer",a.atsResult?"Analyzed":a.optimizedResumes.length?`${a.optimizedResumes.length} optimized`:"Pending",!!(a.atsResult||a.optimizedResumes.length||a.matches.length)],
+    ["/emails","emails","Email Summary",a.emailLogs.length?`${a.emailLogs.length} sent`:"Pending",!!a.emailLogs.length],
+    ["/workflow","workflow","Workflow",a.workflowResult?"Complete":"Ready",!!a.workflowResult],
+  ];
+  return <section className="workflow-progress">{items.map(([to,icon,label,status,done],i)=><Link key={to} to={to} className={done?"done":""}><div className="flow-icon"><Icon name={icon} size={18}/></div><b>{label}</b><small>{status}</small>{i<items.length-1&&<i className="connector"/>}</Link>)}</section>;
+}
