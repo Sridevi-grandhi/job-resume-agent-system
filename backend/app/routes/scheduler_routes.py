@@ -8,13 +8,13 @@ from app.models.user_preference_model import UserPreference
 from app.models.resume_model import Resume
 from app.models.job_model import Job
 from app.models.match_model import MatchScore
-from app.models.optimized_resume_model import OptimizedResume
 from app.models.email_log_model import EmailLog
 
+# Existing Job Search Agent — unchanged search-link generation
 from app.agents.job_search_agent import get_mock_jobs
-from app.agents.matching_agent import calculate_match_score
-from app.agents.resume_optimization_agent import optimize_resume_for_job
 from app.agents.email_agent import build_job_summary_email
+from app.services.ats_analyzer_service import analyze_and_optimize_resume
+from app.services.job_eligibility import job_is_analyzable
 
 router = APIRouter(
     prefix="/api/scheduler",
@@ -54,7 +54,7 @@ def run_full_workflow(user_id: int, db: Session = Depends(get_db)):
             detail="No resume found. Please upload resume first."
         )
 
-    # 1. Job Search Agent
+    # 1. Existing Job Search Agent (search links only — unchanged)
     mock_jobs = get_mock_jobs(preference)
 
     saved_jobs = []
@@ -81,84 +81,57 @@ def run_full_workflow(user_id: int, db: Session = Depends(get_db)):
     for job in saved_jobs:
         db.refresh(job)
 
-    # 2. Matching Percentage Agent
-    saved_matches = []
+    # 2-6. ATS Analyzer on complete jobs only (never on generic search links)
+    analyzable_jobs = [
+        job
+        for job in db.query(Job).filter(Job.user_id == user_id).order_by(Job.id.desc()).all()
+        if job_is_analyzable(job, require_url=False)[0]
+    ][:3]
 
-    for job in saved_jobs:
-        job_text = f"{job.title} {job.description} {job.skills_required}"
+    ats_results = []
+    for job in analyzable_jobs:
+        try:
+            result = analyze_and_optimize_resume(user_id=user_id, job_id=job.id, db=db)
+            ats_results.append(result)
+        except Exception:
+            # Do not fail the full workflow if one ATS run fails.
+            continue
 
-        match_result = calculate_match_score(
-            latest_resume.parsed_text,
-            job_text
-        )
+    # 7. Email summary using original + optimized scores when available
+    matches = (
+        db.query(MatchScore)
+        .filter(MatchScore.user_id == user_id)
+        .order_by(MatchScore.match_percentage.desc())
+        .all()
+    )
+    by_job = {}
+    for match in matches:
+        bucket = by_job.setdefault(match.job_id, {})
+        version = getattr(match, "resume_version", "original") or "original"
+        bucket[version] = match
 
-        new_match = MatchScore(
-            user_id=user_id,
-            resume_id=latest_resume.id,
-            job_id=job.id,
-            match_percentage=match_result["match_percentage"],
-            matched_keywords=", ".join(match_result["matched_keywords"]),
-            missing_keywords=", ".join(match_result["missing_keywords"]),
-            recommendation=match_result["recommendation"]
-        )
-
-        db.add(new_match)
-
-        saved_matches.append({
-            "match": new_match,
+    matches_with_jobs = []
+    for job_id, versions in by_job.items():
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            continue
+        original = versions.get("original") or next(iter(versions.values()), None)
+        if not original:
+            continue
+        matches_with_jobs.append({
+            "match": original,
+            "optimized_match": versions.get("optimized"),
             "job": job,
-            "match_result": match_result
         })
 
-    db.commit()
-
-    for item in saved_matches:
-        db.refresh(item["match"])
-
-    # 3. Resume Optimization Agent
-    saved_matches.sort(
+    matches_with_jobs.sort(
         key=lambda item: item["match"].match_percentage,
-        reverse=True
+        reverse=True,
     )
-
-    optimized_resumes = []
-
-    for item in saved_matches[:3]:
-        job = item["job"]
-
-        optimization_result = optimize_resume_for_job(
-            latest_resume.parsed_text,
-            job
-        )
-
-        optimized_resume = OptimizedResume(
-            user_id=user_id,
-            resume_id=latest_resume.id,
-            job_id=job.id,
-            optimized_text=optimization_result["optimized_text"],
-            optimization_notes=optimization_result["optimization_notes"]
-        )
-
-        db.add(optimized_resume)
-        optimized_resumes.append(optimized_resume)
-
-    db.commit()
-
-    for optimized_resume in optimized_resumes:
-        db.refresh(optimized_resume)
-
-    # 4. Email Agent
-    matches_with_jobs = [
-        {
-            "match": item["match"],
-            "job": item["job"]
-        }
-        for item in saved_matches
-    ]
 
     email_content = build_job_summary_email(
         user=user,
-        matches_with_jobs=matches_with_jobs
+        matches_with_jobs=matches_with_jobs[:5]
     )
 
     email_log = EmailLog(
@@ -178,8 +151,9 @@ def run_full_workflow(user_id: int, db: Session = Depends(get_db)):
         "user_id": user_id,
         "resume_id": latest_resume.id,
         "jobs_created": len(saved_jobs),
-        "matches_calculated": len(saved_matches),
-        "optimized_resumes_created": len(optimized_resumes),
+        "ats_analyses_completed": len(ats_results),
+        "matches_calculated": len(matches_with_jobs),
+        "optimized_resumes_created": len(ats_results),
         "email_log_id": email_log.id,
         "email_status": email_log.status,
         "top_matches": [
@@ -187,9 +161,14 @@ def run_full_workflow(user_id: int, db: Session = Depends(get_db)):
                 "job_id": item["job"].id,
                 "job_title": item["job"].title,
                 "company": item["job"].company,
-                "match_percentage": item["match"].match_percentage
+                "original_match_percentage": item["match"].match_percentage,
+                "optimized_match_percentage": (
+                    item["optimized_match"].match_percentage
+                    if item.get("optimized_match")
+                    else None
+                ),
             }
-            for item in saved_matches
+            for item in matches_with_jobs[:5]
         ],
         "email_preview": email_log.body[:1500]
     }

@@ -1,5 +1,6 @@
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+import os
 
 from app.database import SessionLocal
 
@@ -8,13 +9,16 @@ from app.models.user_preference_model import UserPreference
 from app.models.resume_model import Resume
 from app.models.job_model import Job
 from app.models.match_model import MatchScore
-from app.models.optimized_resume_model import OptimizedResume
 from app.models.email_log_model import EmailLog
 
 from app.agents.job_search_agent import get_mock_jobs
-from app.agents.matching_agent import calculate_match_score
-from app.agents.resume_optimization_agent import optimize_resume_for_job
 from app.agents.email_agent import build_job_summary_email
+from app.services.ats_optimization_workflow_service import (
+    execute_workflow,
+    max_optimizations_per_run,
+    start_or_get_workflow,
+)
+from app.services.job_eligibility import job_is_analyzable
 
 
 scheduler = BackgroundScheduler()
@@ -48,7 +52,7 @@ def run_workflow_for_user(user_id: int):
             print(f"Resume not found for user: {user_id}")
             return
 
-        # 1. Job Search Agent
+        # 1. Existing Job Search Agent (unchanged)
         mock_jobs = get_mock_jobs(preference)
 
         saved_jobs = []
@@ -75,83 +79,55 @@ def run_workflow_for_user(user_id: int):
         for job in saved_jobs:
             db.refresh(job)
 
-        # 2. Matching Percentage Agent
-        saved_matches = []
+        # Combined ATS workflow on analyzable jobs only (cost-limited)
+        analyzable_jobs = [
+            job
+            for job in db.query(Job).filter(Job.user_id == user_id).order_by(Job.id.desc()).all()
+            if job_is_analyzable(job, require_url=False)[0]
+        ][: max_optimizations_per_run()]
 
-        for job in saved_jobs:
-            job_text = f"{job.title} {job.description} {job.skills_required}"
+        for job in analyzable_jobs:
+            try:
+                workflow = start_or_get_workflow(db, user_id=user_id, job_id=job.id, force=False)
+                if workflow.workflow_status == "PENDING":
+                    execute_workflow(db, workflow.id)
+            except Exception as error:
+                print(f"ATS workflow failed for job {job.id}: {type(error).__name__}")
 
-            match_result = calculate_match_score(
-                latest_resume.parsed_text,
-                job_text
-            )
+        matches = (
+            db.query(MatchScore)
+            .filter(MatchScore.user_id == user_id)
+            .order_by(MatchScore.match_percentage.desc())
+            .all()
+        )
+        by_job = {}
+        for match in matches:
+            bucket = by_job.setdefault(match.job_id, {})
+            version = getattr(match, "resume_version", "original") or "original"
+            bucket[version] = match
 
-            new_match = MatchScore(
-                user_id=user_id,
-                resume_id=latest_resume.id,
-                job_id=job.id,
-                match_percentage=match_result["match_percentage"],
-                matched_keywords=", ".join(match_result["matched_keywords"]),
-                missing_keywords=", ".join(match_result["missing_keywords"]),
-                recommendation=match_result["recommendation"]
-            )
-
-            db.add(new_match)
-
-            saved_matches.append({
-                "match": new_match,
-                "job": job
+        matches_with_jobs = []
+        for job_id, versions in by_job.items():
+            job = db.query(Job).filter(Job.id == job_id).first()
+            if not job:
+                continue
+            original = versions.get("original") or next(iter(versions.values()), None)
+            if not original:
+                continue
+            matches_with_jobs.append({
+                "match": original,
+                "optimized_match": versions.get("optimized"),
+                "job": job,
             })
 
-        db.commit()
-
-        for item in saved_matches:
-            db.refresh(item["match"])
-
-        # 3. Resume Optimization Agent
-        saved_matches.sort(
+        matches_with_jobs.sort(
             key=lambda item: item["match"].match_percentage,
-            reverse=True
+            reverse=True,
         )
-
-        optimized_resumes = []
-
-        for item in saved_matches[:3]:
-            job = item["job"]
-
-            optimization_result = optimize_resume_for_job(
-                latest_resume.parsed_text,
-                job
-            )
-
-            optimized_resume = OptimizedResume(
-                user_id=user_id,
-                resume_id=latest_resume.id,
-                job_id=job.id,
-                optimized_text=optimization_result["optimized_text"],
-                optimization_notes=optimization_result["optimization_notes"]
-            )
-
-            db.add(optimized_resume)
-            optimized_resumes.append(optimized_resume)
-
-        db.commit()
-
-        for optimized_resume in optimized_resumes:
-            db.refresh(optimized_resume)
-
-        # 4. Email Agent
-        matches_with_jobs = [
-            {
-                "match": item["match"],
-                "job": item["job"]
-            }
-            for item in saved_matches
-        ]
 
         email_content = build_job_summary_email(
             user=user,
-            matches_with_jobs=matches_with_jobs
+            matches_with_jobs=matches_with_jobs[:5]
         )
 
         email_log = EmailLog(
@@ -164,59 +140,60 @@ def run_workflow_for_user(user_id: int):
 
         db.add(email_log)
         db.commit()
-        db.refresh(email_log)
 
-        print(
-            f"Daily workflow completed for user {user_id}. "
-            f"Email log ID: {email_log.id}"
-        )
+        print(f"Daily workflow completed for user: {user_id}")
 
     except Exception as error:
-        db.rollback()
-        print(f"Scheduler error for user {user_id}: {str(error)}")
+        print(f"Daily workflow failed for user {user_id}: {error}")
 
     finally:
         db.close()
 
 
-def run_daily_workflow_for_all_users():
+def schedule_user_jobs():
     db = SessionLocal()
 
     try:
-        users = db.query(User).all()
+        preferences = db.query(UserPreference).all()
 
-        if not users:
-            print("No users found for daily scheduler.")
-            return
+        for preference in preferences:
+            if not preference.schedule_time:
+                continue
 
-        for user in users:
-            run_workflow_for_user(user.id)
+            hour = preference.schedule_time.hour
+            minute = preference.schedule_time.minute
+            timezone = preference.timezone or "America/Chicago"
+            job_id = f"daily_workflow_user_{preference.user_id}"
+
+            if scheduler.get_job(job_id):
+                scheduler.remove_job(job_id)
+
+            scheduler.add_job(
+                run_workflow_for_user,
+                trigger=CronTrigger(
+                    hour=hour,
+                    minute=minute,
+                    timezone=timezone
+                ),
+                id=job_id,
+                args=[preference.user_id],
+                replace_existing=True
+            )
 
     finally:
         db.close()
 
 
 def start_daily_scheduler():
-    if scheduler.running:
-        return
-
-    scheduler.add_job(
-        run_daily_workflow_for_all_users,
-        CronTrigger(
-            hour=8,
-            minute=0,
-            timezone="America/Chicago"
-        ),
-        id="daily_job_resume_workflow",
-        replace_existing=True
-    )
-
-    scheduler.start()
-
-    print("Daily scheduler started. It will run every day at 8:00 AM America/Chicago.")
+    if not scheduler.running:
+        scheduler.start()
+        print(
+            "Daily scheduler started. It will run every day at 8:00 AM "
+            f"{os.getenv('APP_TIMEZONE', 'America/Chicago')}."
+        )
+    schedule_user_jobs()
 
 
 def stop_daily_scheduler():
     if scheduler.running:
-        scheduler.shutdown()
-        print("Daily scheduler stopped.")
+        scheduler.shutdown(wait=False)
