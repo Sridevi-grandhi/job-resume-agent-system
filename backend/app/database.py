@@ -8,7 +8,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 ENV_PATH = BACKEND_DIR / ".env"
 
-load_dotenv(dotenv_path=ENV_PATH, override=True, encoding="utf-8-sig")
+load_dotenv(dotenv_path=ENV_PATH, override=False, encoding="utf-8-sig")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 

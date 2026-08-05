@@ -19,4 +19,10 @@ class MatchScore(Base):
     missing_keywords = Column(Text, nullable=True)
     recommendation = Column(Text, nullable=True)
 
+    # ATS Analyzer extensions (backward compatible)
+    resume_version = Column(String(20), nullable=False, default="original")
+    optimized_resume_id = Column(Integer, ForeignKey("optimized_resumes.id"), nullable=True)
+    score_breakdown = Column(Text, nullable=True)
+    suggestions = Column(Text, nullable=True)
+
     created_at = Column(DateTime(timezone=True), server_default=func.now())
