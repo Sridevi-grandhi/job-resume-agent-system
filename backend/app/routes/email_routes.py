@@ -28,7 +28,7 @@ def generate_email_summary(user_id: int, db: Session = Depends(get_db)):
         MatchScore.user_id == user_id
     ).order_by(
         MatchScore.match_percentage.desc()
-    ).limit(5).all()
+    ).all()
 
     if not matches:
         raise HTTPException(
@@ -36,16 +36,31 @@ def generate_email_summary(user_id: int, db: Session = Depends(get_db)):
             detail="No match scores found. Please calculate matches first."
         )
 
-    matches_with_jobs = []
-
+    by_job = {}
     for match in matches:
-        job = db.query(Job).filter(Job.id == match.job_id).first()
+        bucket = by_job.setdefault(match.job_id, {})
+        version = getattr(match, "resume_version", "original") or "original"
+        bucket[version] = match
 
-        if job:
-            matches_with_jobs.append({
-                "match": match,
-                "job": job
-            })
+    matches_with_jobs = []
+    for job_id, versions in by_job.items():
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            continue
+        original = versions.get("original") or next(iter(versions.values()), None)
+        if not original:
+            continue
+        matches_with_jobs.append({
+            "match": original,
+            "optimized_match": versions.get("optimized"),
+            "job": job,
+        })
+
+    matches_with_jobs.sort(
+        key=lambda item: item["match"].match_percentage,
+        reverse=True,
+    )
+    matches_with_jobs = matches_with_jobs[:5]
 
     if not matches_with_jobs:
         raise HTTPException(
