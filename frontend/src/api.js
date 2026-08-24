@@ -58,6 +58,38 @@ export async function loginUser(loginData) {
   return response.json();
 }
 
+export async function forgotPassword(email) {
+  const response = await fetch(`${API_BASE_URL}/api/auth/forgot-password`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ email })
+  });
+
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+
+  return response.json();
+}
+
+export async function resetPassword({ token, new_password }) {
+  const response = await fetch(`${API_BASE_URL}/api/auth/reset-password`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ token, new_password })
+  });
+
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+
+  return response.json();
+}
+
 export async function saveUserPreferences(preferences) {
   const response = await fetch(`${API_BASE_URL}/api/preferences`, {
     method: "POST",
@@ -310,6 +342,56 @@ export async function analyzeOptimizerRequirements(userId, jobId, { forceRefresh
   return response.json();
 }
 
+export async function getOptimizationEligibility(userId, jobId) {
+  const response = await fetch(`${API_BASE_URL}/api/ats-optimizer/eligibility/${userId}/${jobId}`);
+  if (!response.ok) throw new Error(await getErrorMessage(response));
+  return response.json();
+}
+
+export async function getEditableOptimizedResume(userId, jobId, optimizedResumeId) {
+  const response = await fetch(`${API_BASE_URL}/api/optimizer/resume/${userId}/${jobId}/${optimizedResumeId}`);
+  if (!response.ok) throw new Error(await getErrorMessage(response));
+  return response.json();
+}
+
+export async function saveEditedOptimizedResume(userId, jobId, optimizedResumeId, editedResumeText, action, options = {}) {
+  const body = {
+    optimized_resume_id: optimizedResumeId,
+    action,
+    persist: options.persist !== false,
+    score_only: Boolean(options.scoreOnly),
+    skip_score: Boolean(options.skipScore),
+    presentation_only: Boolean(options.presentationOnly),
+  };
+  if (options.document) {
+    body.document = options.document;
+  } else {
+    body.edited_resume_text = editedResumeText;
+  }
+  const response = await fetch(`${API_BASE_URL}/api/optimizer/resume/${userId}/${jobId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) throw new Error(await getErrorMessage(response));
+  return response.json();
+}
+
+export async function improveResumeSnippet(userId, jobId, optimizedResumeId, text, context = "bullet") {
+  const response = await fetch(`${API_BASE_URL}/api/optimizer/resume/${userId}/${jobId}/improve-snippet`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ optimized_resume_id: optimizedResumeId, text, context }),
+  });
+  if (!response.ok) throw new Error(await getErrorMessage(response));
+  return response.json();
+}
+
+export function getFinalResumeDownloadUrl(userId, jobId, optimizedResumeId, format = "docx") {
+  const query = format && format !== "docx" ? `?format=${encodeURIComponent(format)}` : "";
+  return `${API_BASE_URL}/api/optimizer/resume/${userId}/${jobId}/${optimizedResumeId}/download${query}`;
+}
+
 export async function getEvidence(userId, jobId) {
   const response = await fetch(`${API_BASE_URL}/api/ats-optimizer/evidence/${userId}/${jobId}`);
   if (!response.ok) {
@@ -348,26 +430,64 @@ async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export const DEFAULT_ATS_POLL_INTERVAL_MS = 2000;
+export const DEFAULT_ATS_GENERATION_TIMEOUT_SECONDS = 300;
+
+const ATS_STATUS_ALIASES = {
+  GENERATING: "GENERATING_RESUME",
+  GENERATED: "COMPLETED",
+  CALCULATING_SCORE: "ANALYZING_OPTIMIZED",
+  CALCULATING_OPTIMIZED_MATCH: "ANALYZING_OPTIMIZED",
+  COMPLETE: "COMPLETED",
+  SUCCESS: "COMPLETED",
+  ERROR: "FAILED",
+  FAILURE: "FAILED",
+};
+
+export function normalizeAtsWorkflowStatus(status) {
+  const upper = String(status || "").trim().toUpperCase().replace(/[\s-]+/g, "_");
+  return ATS_STATUS_ALIASES[upper] || upper;
+}
+
 const TERMINAL_ATS_STATUSES = new Set([
   "COMPLETED",
   "FAILED",
   "VALIDATION_FAILED",
   "INCOMPLETE_JOB",
+  "INELIGIBLE_LOW_SCORE", "INELIGIBLE_ROLE_ALIGNMENT",
   "WAITING_FOR_RESUME",
   "SKIPPED_GENERIC_SEARCH_LINK",
 ]);
 
-export async function pollAtsWorkflow(workflowId, { onProgress, maxAttempts = 90, intervalMs = 2000 } = {}) {
+export async function pollAtsWorkflow(workflowId, {
+  onProgress,
+  maxAttempts,
+  intervalMs,
+  timeoutSeconds,
+} = {}) {
+  const interval = Number.isFinite(intervalMs) ? intervalMs : DEFAULT_ATS_POLL_INTERVAL_MS;
+  const timeout = Number.isFinite(timeoutSeconds) ? timeoutSeconds : DEFAULT_ATS_GENERATION_TIMEOUT_SECONDS;
+  const attempts = maxAttempts ?? Math.max(1, Math.ceil((timeout * 1000) / Math.max(interval, 1)));
   let latest = null;
-  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     latest = await getAtsWorkflowStatus(workflowId);
+    const normalized = normalizeAtsWorkflowStatus(latest?.workflow_status);
+    latest = { ...latest, workflow_status: normalized };
     if (onProgress) onProgress(latest);
-    if (TERMINAL_ATS_STATUSES.has(latest.workflow_status)) {
+    if (TERMINAL_ATS_STATUSES.has(normalized)) {
       return latest;
     }
-    await sleep(intervalMs);
+    if (interval > 0) await sleep(interval);
   }
-  return latest;
+  const timedOut = latest || { workflow_id: workflowId, workflow_status: "FAILED" };
+  if (!TERMINAL_ATS_STATUSES.has(normalizeAtsWorkflowStatus(timedOut.workflow_status))) {
+    return {
+      ...timedOut,
+      workflow_status: "FAILED",
+      error_message: timedOut.error_message || "Resume generation could not be completed.",
+    };
+  }
+  return { ...timedOut, workflow_status: normalizeAtsWorkflowStatus(timedOut.workflow_status) };
 }
 
 // Combined optimize-and-match (starts shared ATS workflow)

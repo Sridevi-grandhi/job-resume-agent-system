@@ -64,61 +64,60 @@ def _rewrite_summary(original_summary: str, job_title: str, keywords: list[str],
     )
 
 
+def _categorize_skills_dynamically(ordered: list[str], extras: list[str]) -> str:
+    """Group skills by lightweight keyword families — no role-hardcoded templates."""
+    families: list[tuple[str, tuple[str, ...]]] = [
+        ("Languages", ("python", "java", "javascript", "typescript", "c#", "c++", "go", "golang", "ruby", "php", "scala", "kotlin", "swift", "r ", "sql")),
+        ("Backend", ("spring", "django", "flask", "fastapi", "node", ".net", "express", "hibernate", "microservices", "rest", "graphql", "api")),
+        ("Frontend", ("react", "angular", "vue", "html", "css", "next.js", "redux", "ui")),
+        ("Data", ("spark", "hadoop", "kafka", "airflow", "dbt", "snowflake", "bigquery", "redshift", "etl", "pandas", "numpy")),
+        ("Databases", ("postgres", "mysql", "oracle", "mongo", "redis", "dynamodb", "sql server", "cassandra", "elasticsearch")),
+        ("Cloud", ("aws", "azure", "gcp", "cloud")),
+        ("DevOps / SRE", ("docker", "kubernetes", "terraform", "ansible", "jenkins", "github actions", "gitlab ci", "ci/cd", "helm", "prometheus", "grafana")),
+        ("Testing / QA", ("selenium", "cypress", "junit", "pytest", "testng", "cucumber", "playwright", "postman", "jmeter")),
+        ("Security", ("oauth", "saml", "vault", "sso", "owasp", "iam", "security")),
+        ("Methodologies", ("agile", "scrum", "kanban", "devops", "sre")),
+    ]
+    used: set[str] = set()
+    lines: list[str] = []
+    lower_map = {k: k for k in ordered}
+
+    def _matches(skill: str, needles: tuple[str, ...]) -> bool:
+        s = skill.lower()
+        return any(n.strip() in s for n in needles)
+
+    for label, needles in families:
+        bucket = [k for k in ordered if k not in used and _matches(k, needles)]
+        if bucket:
+            lines.append(f"{label}: " + ", ".join(bucket))
+            used.update(bucket)
+    leftover = [k for k in ordered if k not in used] + [e for e in extras if e not in ordered and e not in used]
+    if leftover:
+        lines.append("Additional: " + ", ".join(leftover[:24]))
+    return "\n".join(lines) if lines else ", ".join((ordered + extras)[:40])
+
+
 def _reorder_skills(original_skills: str, priority_keywords: list[str], resume_text: str) -> str:
     existing = find_keywords_in_text(original_skills or resume_text)
     # Preserve unknowns from original comma/line lists
     extras = []
     for part in re.split(r"[,;\n|/]+", original_skills or ""):
         part = part.strip()
-        if part and part not in existing and len(part) < 40:
+        if part and part not in existing and len(part) < 40 and not re.search(r"(?i)^(backend|frontend|database|cloud|devops|languages|testing|tools)\s*:?\s*$", part):
             extras.append(part)
 
     ordered = []
     for keyword in priority_keywords:
-        if contains_keyword(resume_text, keyword) and keyword not in ordered:
+        # Priority keywords are already limited to resume-verified or accepted confirmed evidence.
+        if keyword and keyword not in ordered:
             ordered.append(keyword)
     for keyword in existing:
         if keyword not in ordered:
             ordered.append(keyword)
 
-    # Group lightly if original used category labels
-    if re.search(r"(?i)(backend|frontend|database|cloud|devops)\s*:", original_skills or ""):
-        backend = [k for k in ordered if k in {
-            "Java", "Spring", "Spring Boot", "Spring MVC", "Spring Security", "Hibernate",
-            "Microservices", "REST APIs", "Kafka", "RabbitMQ", "Node.js", "Python",
-            "Django", "Flask", "FastAPI",
-        }]
-        frontend = [k for k in ordered if k in {
-            "React", "Angular", "AngularJS", "Vue", "HTML", "CSS", "JavaScript", "TypeScript", "Next.js",
-        }]
-        database = [k for k in ordered if k in {
-            "PostgreSQL", "MySQL", "Oracle", "MongoDB", "Redis", "SQL", "SQL Server",
-        }]
-        cloud = [k for k in ordered if k in {
-            "AWS", "Azure", "GCP", "Docker", "Kubernetes", "Jenkins", "GitHub Actions",
-            "Terraform", "CI/CD", "Git",
-        }]
-        testing = [k for k in ordered if k in {
-            "JUnit", "PyTest", "Selenium", "Splunk", "ELK", "Dynatrace", "AppDynamics",
-        }]
-        methods = [k for k in ordered if k in {"Agile", "Scrum"}]
-        lines = []
-        if backend:
-            lines.append("Backend: " + ", ".join(backend))
-        if frontend:
-            lines.append("Frontend: " + ", ".join(frontend))
-        if database:
-            lines.append("Database: " + ", ".join(database))
-        if cloud:
-            lines.append("Cloud/DevOps: " + ", ".join(cloud))
-        if testing:
-            lines.append("Testing/Monitoring: " + ", ".join(testing))
-        if methods:
-            lines.append("Methodologies: " + ", ".join(methods))
-        leftover = [k for k in ordered if k not in backend + frontend + database + cloud + testing + methods]
-        if leftover or extras:
-            lines.append("Additional: " + ", ".join(leftover + extras[:8]))
-        return "\n".join(lines)
+    # Prefer dynamic categorical layout whenever the original used categories OR many skills.
+    if re.search(r"(?i)(backend|frontend|database|cloud|devops|languages|skills)\s*:", original_skills or "") or len(ordered) >= 8:
+        return _categorize_skills_dynamically(ordered, extras)
 
     combined = ordered + [e for e in extras if e not in ordered]
     return ", ".join(combined[:40])
@@ -163,7 +162,7 @@ def _strengthen_bullet(bullet: str, allowed_keywords: list[str], domain: str) ->
     if text and text[0].islower():
         text = text[0].upper() + text[1:]
 
-    # Naturally weave up to two missing allowed keywords already implied by bullet context.
+        # Naturally weave up to two missing allowed keywords already implied by bullet context.
     lower = text.lower()
     woven = 0
     newly_woven = []
@@ -172,16 +171,15 @@ def _strengthen_bullet(bullet: str, allowed_keywords: list[str], domain: str) ->
             break
         if contains_keyword(text, keyword):
             continue
-        # Only add if bullet already discusses related work (apis, services, deploy, etc.)
-        related = False
-        if keyword in {"REST APIs", "Spring Boot", "Microservices", "Java"} and re.search(r"api|service|backend|java|spring", lower):
-            related = True
-        if keyword in {"React", "JavaScript", "TypeScript", "HTML", "CSS"} and re.search(r"front|ui|react|javascript|component", lower):
-            related = True
-        if keyword in {"Docker", "Kubernetes", "Jenkins", "AWS", "CI/CD"} and re.search(r"deploy|ci|cd|container|cloud|pipeline|docker", lower):
-            related = True
-        if keyword in {"PostgreSQL", "MySQL", "MongoDB", "SQL", "Redis"} and re.search(r"database|sql|data|query", lower):
-            related = True
+        # Contextual weave: only when the bullet already discusses related work themes.
+        related = bool(
+            re.search(
+                r"api|service|backend|frontend|ui|deploy|ci|cd|container|cloud|pipeline|"
+                r"docker|database|sql|data|query|test|automat|monitor|integrat|configur|"
+                r"build|develop|implement|architect|platform|infrastruct",
+                lower,
+            )
+        )
         if related and keyword.lower() not in lower:
             newly_woven.append(keyword)
             woven += 1
@@ -349,6 +347,7 @@ def _target_employment_index(employments: list[dict], employer_name: str | None)
 
 
 def _employment_bullet(item: dict) -> str:
+    skill = (item.get("skill") or "").strip()
     pieces = [item.get("usage_description") or ""]
     modules = item.get("skill_modules")
     if modules and modules.lower() not in pieces[0].lower():
@@ -362,7 +361,11 @@ def _employment_bullet(item: dict) -> str:
     impact = item.get("impact_description")
     if impact:
         pieces.append(impact if impact.strip().endswith((".", "!", "?")) else impact.strip() + ".")
-    return _confirmed_bullet(" ".join(p for p in pieces if p).strip())
+    body = " ".join(p for p in pieces if p).strip()
+    # Ensure the confirmed technology itself appears when the free-text evidence omits it.
+    if skill and skill.lower() not in body.lower():
+        body = f"Applied {skill} in professional work. {body}".strip()
+    return _confirmed_bullet(body)
 
 
 def _new_employment_block(item: dict) -> str:
@@ -449,10 +452,22 @@ def generate_optimized_resume(
         unplaced_professional = list(buckets["professional"])
 
     placement = injection_plan.get("placement") or {}
-    summary_kw = placement.get("summary") or injection_plan.get("supportedKeywords", [])[:5]
-    skills_kw = placement.get("skills") or injection_plan.get("supportedKeywords", [])[:12]
-    experience_kw = placement.get("experience") or injection_plan.get("supportedKeywords", [])[:8]
-    project_kw = placement.get("projects") or injection_plan.get("supportedKeywords", [])[:6]
+    summary_kw = list(placement.get("summary") or injection_plan.get("supportedKeywords", [])[:5])
+    skills_kw = list(placement.get("skills") or injection_plan.get("supportedKeywords", [])[:12])
+    experience_kw = list(placement.get("experience") or injection_plan.get("supportedKeywords", [])[:8])
+    project_kw = list(placement.get("projects") or injection_plan.get("supportedKeywords", [])[:6])
+    # Confirmed evidence skills must appear in skills/summary placement when JD-relevant.
+    from app.services.keyword_utils import normalize_keyword as _nk
+
+    confirmed_names = []
+    for skill, item in (confirmed_evidence or {}).items():
+        display = _nk(item.get("skill") or skill)
+        if display:
+            confirmed_names.append(display)
+    if confirmed_names:
+        skills_kw = list(dict.fromkeys(confirmed_names + skills_kw))
+        summary_kw = list(dict.fromkeys(confirmed_names[:5] + summary_kw))
+        experience_kw = list(dict.fromkeys(confirmed_names + experience_kw))
     job_title = getattr(job, "title", "") or ""
 
     output_sections = []
@@ -485,14 +500,37 @@ def generate_optimized_resume(
 
         output_sections.append({"heading": heading, "content": new_content})
 
-    # If parser found no sections, preserve original text with a summary prepended carefully
+    # If parser found no sections, still optimize from structured parse instead of copying.
     if not output_sections:
-        plain = resume_text.strip()
-        return {
-            "plain_text": plain,
-            "structure": structure,
-            "sections": [],
-        }
+        summary = _rewrite_summary("", job_title, summary_kw, resume_text)
+        skills = _reorder_skills("", skills_kw, resume_text)
+        experience = _rewrite_experience_section(
+            "",
+            structure.get("employments") or [],
+            experience_kw,
+            resume_text,
+        )
+        projects = _rewrite_projects_section(
+            "",
+            structure.get("projects") or [],
+            project_kw,
+            resume_text,
+        )
+        output_sections = [
+            {"heading": "Professional Summary", "content": summary},
+            {
+                "heading": "Technical Skills",
+                "content": skills or ", ".join(find_keywords_in_text(resume_text)[:20]),
+            },
+        ]
+        if experience.strip():
+            output_sections.append({"heading": "Professional Experience", "content": experience})
+        elif (resume_text or "").strip():
+            # Keep original body under experience when employment parse is empty,
+            # but still prepend optimized summary/skills so content always changes.
+            output_sections.append({"heading": "Professional Experience", "content": (resume_text or "").strip()})
+        if projects.strip():
+            output_sections.append({"heading": "Projects", "content": projects})
 
     # Professional evidence that names an employer not already on the resume (or has no
     # employments to attach to at all) — never merged into an unrelated existing role,
@@ -522,6 +560,18 @@ def generate_optimized_resume(
         parts.append(section["heading"])
         parts.append(section["content"])
     plain = "\n\n".join([p.strip() for p in parts if p and p.strip()])
+
+    # Guarantee a meaningful content change when JD-aligned optimization is possible.
+    original_norm = re.sub(r"\s+", " ", (resume_text or "").strip().lower())
+    plain_norm = re.sub(r"\s+", " ", plain.lower())
+    if plain_norm == original_norm and (job_title or summary_kw or skills_kw or confirmed_evidence):
+        tailored = _rewrite_summary(
+            "",
+            job_title,
+            summary_kw or skills_kw or list((confirmed_evidence or {}).keys()),
+            resume_text,
+        )
+        plain = f"Professional Summary\n{tailored}\n\n{plain}".strip()
 
     # Absolute ban on newly introduced fake metrics — but user-supplied confirmed evidence
     # is truthful, not invented, so it's part of the baseline this check is compared against.

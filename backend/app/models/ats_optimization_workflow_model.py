@@ -20,7 +20,7 @@ class AtsOptimizationWorkflow(Base):
     job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
     optimized_resume_id = Column(Integer, ForeignKey("optimized_resumes.id"), nullable=True)
 
-    workflow_status = Column(String(40), nullable=False, default="PENDING", index=True)
+    workflow_status = Column(String(60), nullable=False, default="PENDING", index=True)
     content_hash = Column(String(128), nullable=True, index=True)
 
     original_match_score = Column(Integer, nullable=True)
@@ -34,12 +34,18 @@ class AtsOptimizationWorkflow(Base):
     generated_resume_plain_text = Column(Text, nullable=True)
     generated_resume_markdown = Column(Text, nullable=True)
 
-    llm_provider = Column(String(50), nullable=True)
+    llm_provider = Column(String(80), nullable=True)
     llm_model = Column(String(120), nullable=True)
-    prompt_version = Column(String(40), nullable=True)
-    analysis_version = Column(String(40), nullable=True)
+    llm_service = Column(String(40), nullable=True)
+    generation_method = Column(String(60), nullable=True)
+    llm_used = Column(Boolean, nullable=True)
+    fallback_used = Column(Boolean, nullable=True)
+    fallback_reason = Column(String(80), nullable=True)
+    prompt_version = Column(String(80), nullable=True)
+    # Must fit current ANALYSIS_VERSION (48+) and future version strings.
+    analysis_version = Column(String(120), nullable=True)
 
-    error_message = Column(String(500), nullable=True)
+    error_message = Column(Text, nullable=True)
     missing_job_fields = Column(Text, nullable=True)
 
     original_resume_hash = Column(String(64), nullable=True)
@@ -47,7 +53,10 @@ class AtsOptimizationWorkflow(Base):
     original_text_length = Column(Integer, nullable=True)
     optimized_text_length = Column(Integer, nullable=True)
     content_changed = Column(Boolean, nullable=True)
-    optimization_status = Column(String(30), nullable=True)
+    optimization_status = Column(String(40), nullable=True)
+    optimization_allowed = Column(Boolean, nullable=True)
+    eligibility_reason = Column(Text, nullable=True)
+    eligibility_tier = Column(String(80), nullable=True)
     improvement_report_json = Column(Text, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())

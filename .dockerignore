@@ -7,5 +7,9 @@
 **/dist
 **/.env
 **/*.pyc
+**/.coverage
+**/.pytest_cache
+**/pytest-temp-*
+**/test-results*.txt
 .vscode
 .idea

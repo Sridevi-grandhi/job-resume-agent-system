@@ -30,6 +30,11 @@ class UserConfirmedSkill(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
     job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
     resume_id = Column(Integer, ForeignKey("resumes.id"), nullable=True)
+    # Scopes confirmations to the current analyze/workflow run. Historical rows
+    # keep prior values for audit; inactive rows never block generation.
+    workflow_run_id = Column(String(120), nullable=True, index=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    superseded_at = Column(DateTime(timezone=True), nullable=True)
 
     skill_name = Column(String(120), nullable=False)
     normalized_skill_name = Column(String(120), nullable=False, index=True)
@@ -40,6 +45,9 @@ class UserConfirmedSkill(Base):
 
     evidence_type = Column(String(60), nullable=True)
     evidence_status = Column(String(40), nullable=False, default="INCOMPLETE")
+    evidence_source = Column(String(30), nullable=False, default="user_selection")
+    user_input_description = Column(Text, nullable=True)
+    ai_rewritten_description = Column(Text, nullable=True)
 
     # Simplified default form (current). "Beginner"/"Intermediate"/"Advanced" and a
     # bucketed range — not required unless the user has already answered "Yes".

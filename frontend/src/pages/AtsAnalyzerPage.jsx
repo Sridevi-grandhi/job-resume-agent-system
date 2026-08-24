@@ -1,11 +1,132 @@
 /* eslint-disable react-hooks/exhaustive-deps */
-import { useEffect, useMemo, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Link, useParams } from "react-router-dom";
 import { useApp } from "../context/AppContext";
 import { Page, Panel, Notice } from "../components/Page";
 import EmptyState from "../components/EmptyState";
-import { getAtsDownloadUrl, getJobDetail } from "../api";
+import ResumeWorkspace from "../components/resume-workspace/ResumeWorkspace";
+import { evidenceStatusLabel } from "../utils/evidenceLabels";
+import {
+  getEditableOptimizedResume,
+  getFinalResumeDownloadUrl,
+  getJobDetail,
+  getOptimizationEligibility,
+  improveResumeSnippet,
+  saveEditedOptimizedResume,
+} from "../api";
 
+function isGenerationFailureMessage(message) {
+  const text = String(message || "");
+  return /^(Failed|Validation failed)\b/i.test(text)
+    || /evidence incomplete/i.test(text);
+}
+
+function buildAtsStatusBanner({
+  step,
+  busy,
+  messages,
+  missingSkillsGroups,
+  canContinueToOptimization,
+  isComplete,
+  result,
+  disabledReason,
+}) {
+  if (busy === "ats-requirements") return { text: "Analyzing job requirements…", tone: "info" };
+  if (busy === "ats-skills") return { text: "Updating skill evidence…", tone: "info" };
+  if (busy === "ats" && step >= 5) {
+    return { text: messages.ats || "Generating optimized resume…", tone: "info" };
+  }
+
+  const analysisFailed = missingSkillsGroups?.analysis_status === "REQUIREMENT_EXTRACTION_FAILED"
+    || missingSkillsGroups?.analysis_status === "ANALYSIS_CONSISTENCY_FAILED";
+  if (analysisFailed) {
+    return {
+      text: messages["ats-requirements"] || missingSkillsGroups?.analysis_error || "Requirement analysis failed.",
+      tone: "error",
+    };
+  }
+
+  // Successful requirement analysis (any wizard step before generation) owns the banner.
+  // Never allow a prior generation FAILED message to surface here.
+  if (missingSkillsGroups && !analysisFailed && step < 5) {
+    if (step <= 2) {
+      return {
+        text: messages["ats-requirements"] || "Job requirements analyzed successfully.",
+        tone: "info",
+      };
+    }
+    if (step === 3) {
+      return {
+        text: messages["ats-skills"] || messages["ats-requirements"] || "Confirm skills that need evidence for this job.",
+        tone: "info",
+      };
+    }
+    if (step === 4) {
+      return { text: "Evidence review ready. You can continue to generation.", tone: "info" };
+    }
+  }
+
+  if (step === 3) {
+    return {
+      text: messages["ats-skills"] || "Confirm skills that need evidence for this job.",
+      tone: "info",
+    };
+  }
+
+  if (step === 4) {
+    return { text: "Evidence review ready. You can continue to generation.", tone: "info" };
+  }
+
+  if (step === 5) {
+    if (isComplete) {
+      return {
+        text: messages.ats || "Optimized resume ready.",
+        tone: "info",
+      };
+    }
+    const staleEvidenceFailure = /evidence incomplete/i.test(
+      String(messages.ats || result?.error_message || ""),
+    );
+    const generationFailed = ["FAILED", "VALIDATION_FAILED"].includes(result?.workflow_status)
+      && !staleEvidenceFailure;
+    if (generationFailed) {
+      return {
+        text: /timed out waiting/i.test(String(messages.ats || ""))
+          ? "Resume generation could not be completed. You can retry."
+          : (messages.ats || "Resume generation could not be completed. You can retry."),
+        tone: "error",
+      };
+    }
+    if (canContinueToOptimization) {
+      return {
+        text: messages.ats && !isGenerationFailureMessage(messages.ats)
+          ? messages.ats
+          : "Ready to generate optimized resume.",
+        tone: "info",
+      };
+    }
+    return {
+      text: disabledReason || "Upload a resume and select a job to generate.",
+      tone: "error",
+    };
+  }
+
+  // Steps 1–4: never show a stale generation Failed banner.
+  if (step < 5 && isGenerationFailureMessage(messages.ats)) {
+    return {
+      text: messages["ats-requirements"] || messages["ats-skills"] || disabledReason || "",
+      tone: "info",
+    };
+  }
+
+  const text = messages["ats-requirements"] || messages["ats-skills"] || disabledReason || "";
+  // Prefer step-scoped messages; only fall back to messages.ats when it is not a failure.
+  const fallback = text || (isGenerationFailureMessage(messages.ats) ? "" : (messages.ats || ""));
+  return {
+    text: fallback,
+    tone: "info",
+  };
+}
 const genericSearchSources = new Set([
   "LinkedIn Jobs",
   "Indeed",
@@ -41,9 +162,7 @@ const WIZARD_STEPS = [
   { id: 2, label: "Analyze Requirements" },
   { id: 3, label: "Confirm Skills" },
   { id: 4, label: "Review Evidence" },
-  { id: 5, label: "Generate Resume" },
-  { id: 6, label: "Validate Resume" },
-  { id: 7, label: "Compare Scores" },
+  { id: 5, label: "Generate, Review & Download" },
 ];
 
 const EVIDENCE_TYPES = [
@@ -59,6 +178,13 @@ const EVIDENCE_TYPES = [
 
 const EXPERIENCE_LEVELS = ["Beginner", "Intermediate", "Advanced"];
 const EXPERIENCE_RANGES = ["Less than 6 months", "6-12 months", "1-2 years", "2-4 years", "4+ years"];
+
+const QUICK_CONTEXTS = [
+  { value: "Current employment", label: "Professional experience" },
+  { value: "Personal project", label: "Personal project" },
+  { value: "Academic project", label: "Academic project" },
+  { value: "Training/coursework", label: "Training / learning" },
+];
 
 const EMPLOYMENT_EVIDENCE_TYPES = new Set(["Current employment", "Previous employment"]);
 const PROJECT_EVIDENCE_TYPES = new Set(["Professional project", "Personal project", "Academic project"]);
@@ -129,6 +255,10 @@ function draftIsValid(draft) {
   const evidenceType = draft.evidence_type;
   if (!evidenceType) return false;
 
+  if (draft.simple_confirmation) {
+    return Boolean(draft.experience_level) && Boolean(draft.evidence_type) && hasText(draft.usage_description) && String(draft.usage_description).length <= 300;
+  }
+
   const missing = [];
   if (!draft.experience_level) missing.push("experience_level");
   if (!draft.experience_range) missing.push("experience_range");
@@ -152,80 +282,53 @@ function draftIsValid(draft) {
   return missing.length === 0;
 }
 
+function groupedByCategory(skills) {
+  return skills.reduce((groups, skill) => {
+    const category = skill.category || "Other skills";
+    (groups[category] ||= []).push(skill);
+    return groups;
+  }, {});
+}
+
+function CompactEvidenceRow({ skillInfo, draft, onChange }) {
+  const open = draft.answer === "has_it";
+  return (
+    <div className={`ats-compact-evidence-row ${open ? "open" : ""}`}>
+      <div className="ats-compact-evidence-heading">
+        <b>{skillInfo.skill}</b>
+        <span className="badge badge-preferred">{open ? "Selected — evidence needed" : "Needs confirmation"}</span>
+      </div>
+      {open && (
+        <div className="ats-compact-evidence-fields">
+          <label>Experience level
+            <select value={draft.experience_level || ""} onChange={(e) => onChange({ ...draft, experience_level: e.target.value })}>
+              <option value="">Select…</option>
+              <option value="Beginner">Basic</option>
+              <option value="Intermediate">Intermediate</option>
+              <option value="Advanced">Advanced</option>
+            </select>
+          </label>
+          <label>Where have you used it?
+            <select value={draft.evidence_type || ""} onChange={(e) => onChange({ ...draft, evidence_type: e.target.value })}>
+              <option value="">Select…</option>
+              {QUICK_CONTEXTS.map((context) => <option key={context.value} value={context.value}>{context.label}</option>)}
+            </select>
+          </label>
+          <label className="ats-compact-description">Briefly describe how you used {skillInfo.skill} (optional)
+            <textarea maxLength={300} rows={2} value={draft.usage_description || ""}
+              placeholder={`Example: Used ${skillInfo.skill} to build, test, or deliver a project.`}
+              onChange={(e) => onChange({ ...draft, usage_description: e.target.value })} />
+            <small>{(draft.usage_description || "").length}/300</small>
+          </label>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function listText(value) {
   if (Array.isArray(value)) return value.length ? value.join(", ") : "—";
   return value || "—";
-}
-
-function ScoreCard({ label, score, tone = "neutral" }) {
-  return (
-    <div className={`ats-score-card ${tone}`}>
-      <span>{label}</span>
-      <b>{Number.isFinite(Number(score)) ? `${Math.round(Number(score))}%` : "—"}</b>
-    </div>
-  );
-}
-
-const METER_LABELS = {
-  resume_quality: "Resume Quality",
-  ats_match: "ATS Match",
-  keyword_coverage: "Keyword Coverage",
-  formatting: "Formatting",
-};
-
-function MeterBar({ label, before, after }) {
-  return (
-    <div className="ats-meter">
-      <div className="ats-meter-label">
-        <span>{label}</span>
-        <span>{Math.round(before)}% → <b>{Math.round(after)}%</b></span>
-      </div>
-      <div className="ats-meter-track">
-        <div className="ats-meter-fill before" style={{ width: `${Math.min(100, before)}%` }} />
-      </div>
-      <div className="ats-meter-track">
-        <div className="ats-meter-fill after" style={{ width: `${Math.min(100, after)}%` }} />
-      </div>
-    </div>
-  );
-}
-
-function ImprovementReportPanel({ report }) {
-  if (!report) return null;
-  const meters = report.meters || {};
-  return (
-    <Panel title="AI Resume Improvement Report">
-      <div className="ats-improvement-meters">
-        {Object.entries(meters).map(([key, value]) => (
-          <MeterBar key={key} label={METER_LABELS[key] || key} before={value.before} after={value.after} />
-        ))}
-      </div>
-      <div className="document-grid">
-        <Panel title="What Changed">
-          <p><b>New skills added (verified):</b> {listText(report.new_skills_added)}</p>
-          <p><b>Keywords added:</b> {listText(report.keywords_added)}</p>
-          <p><b>Sections improved:</b> {listText(report.sections_improved)}</p>
-          <p><b>Bullets rewritten:</b> {report.bullets_rewritten ?? 0}</p>
-        </Panel>
-        <Panel title="Still Missing">
-          <p>{listText(report.missing_skills_remaining)}</p>
-          {!report.missing_skills_remaining?.length && <p className="ats-skill-meta">No mandatory skills remain missing.</p>}
-        </Panel>
-      </div>
-      <Panel title="Why your score changed">
-        <ul className="ats-list">
-          {(report.explanation || []).map((reason, index) => <li key={index}>{reason}</li>)}
-        </ul>
-      </Panel>
-      {report.ats_recommendations?.length > 0 && (
-        <Panel title="ATS Recommendations">
-          <ul className="ats-list">
-            {report.ats_recommendations.map((item, index) => <li key={index}>{item}</li>)}
-          </ul>
-        </Panel>
-      )}
-    </Panel>
-  );
 }
 
 function PipelineProgress({ status }) {
@@ -245,6 +348,79 @@ function PipelineProgress({ status }) {
     </ol>
   );
 }
+
+function gapItemReason(item) {
+  const status = String(item.evidence_status || item.code || "").toUpperCase();
+  const skill = item.skill || "This requirement";
+  if (status === "REJECTED" || status === "NOT_POSSESSED") {
+    return `${skill} was marked as not possessed. It will not be added to the optimized resume.`;
+  }
+  if (status === "INCOMPLETE" || status === "INCOMPLETE_EVIDENCE") {
+    return `${skill} is not supported by your current resume or confirmed evidence. It will not be added to the optimized resume.`;
+  }
+  return `${skill} is not supported by your current resume or confirmed evidence. It will not be added to the optimized resume.`;
+}
+
+function gapItemsFromScoreView(scoreView, result) {
+  const remaining = scoreView?.remaining_gaps;
+  const mandatoryMissing = (
+    (remaining?.unsupported?.length ? remaining.unsupported : null)
+    || scoreView?.mandatory_requirements?.missing
+    || scoreView?.missing_mandatory_skills
+    || []
+  );
+  if (mandatoryMissing.length) {
+    return mandatoryMissing.map((skill) => ({
+      skill: typeof skill === "string" ? skill : (skill?.skill || skill?.label || String(skill)),
+      normalized_skill: typeof skill === "object" ? skill?.normalized_skill : undefined,
+      code: "UNSUPPORTED_REQUIREMENT",
+    }));
+  }
+  const legacy = result?.unsupported_keywords_not_added || result?.remaining_gaps;
+  if (Array.isArray(legacy)) {
+    return legacy.map((skill) => ({ skill, code: "UNSUPPORTED_REQUIREMENT" }));
+  }
+  if (legacy?.unsupported?.length) {
+    return legacy.unsupported.map((skill) => ({ skill, code: "UNSUPPORTED_REQUIREMENT" }));
+  }
+  return [];
+}
+
+function RemainingGapsPanel({ items }) {
+  const gaps = (items || []).filter((item) => item?.skill);
+  if (!gaps.length) return null;
+  return (
+    <details className="ats-remaining-gaps" open>
+      <summary>Remaining Gaps ({gaps.length})</summary>
+      <ul>
+        {gaps.map((item) => (
+          <li key={item.normalized_skill || item.skill}>
+            <b>{item.skill}</b>
+            {" — "}
+            {gapItemReason(item)}
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+const FALLBACK_REASON_LABELS = {
+  timeout: "Ollama timed out; deterministic optimization was used.",
+  connection_failed: "Ollama was unavailable; deterministic optimization was used.",
+  connection_refused: "Ollama connection was refused; deterministic optimization was used.",
+  model_not_found: "Configured Ollama model was not found; deterministic optimization was used.",
+  invalid_json: "The model returned an unusable response; deterministic optimization was used.",
+  invalid_response: "The model returned an unusable response; deterministic optimization was used.",
+  llm_not_configured: "AI generation was not configured; deterministic optimization was used.",
+  llm_disabled: "AI generation was disabled; deterministic optimization was used.",
+  llm_skipped: "Ollama was skipped after a prior timeout; deterministic optimization was used.",
+  validation_failed: "AI output failed validation; deterministic optimization was used.",
+  schema_validation_failed: "AI output failed schema validation; deterministic optimization was used.",
+  unsupported_provider: "Unsupported LLM provider; deterministic optimization was used.",
+  provider_error: "AI generation failed; deterministic optimization was used.",
+  unexpected_provider_error: "AI generation failed unexpectedly; deterministic optimization was used.",
+};
 
 function WizardSteps({ step, maxUnlockedStep, onSelect }) {
   return (
@@ -268,7 +444,7 @@ function WizardSteps({ step, maxUnlockedStep, onSelect }) {
   );
 }
 
-function evidenceStatusLabel(draft) {
+function draftEvidenceStatusLabel(draft) {
   if (draft.evidence_status === "VERIFIED_FROM_RESUME") return "Verified from resume";
   if (!draft.answer) return "Evidence required";
   if (draft.answer === "not_possessed") return "Marked as not possessed";
@@ -382,6 +558,8 @@ function SkillModulesPicker({ skill, modules, draft, onChange }) {
   );
 }
 
+// Retained for compatibility with the detailed evidence path used by older saved drafts.
+// eslint-disable-next-line no-unused-vars
 function SkillConfirmationCard({ skillInfo, draft, onChange, isPreferred, resumeEmployments }) {
   const valid = draftIsValid(draft);
   const evidenceType = draft.evidence_type;
@@ -426,7 +604,7 @@ function SkillConfirmationCard({ skillInfo, draft, onChange, isPreferred, resume
       <p className="ats-skill-meta">
         Found in uploaded resume: <b>{foundInResume ? `Yes — ${skillInfo.evidence_strength || resumeStatus} evidence` : "No"}</b>
       </p>
-      <p className="ats-skill-meta">Status: <b>{resumeStatus === "MISSING" ? evidenceStatusLabel(draft) : resumeStatus}</b></p>
+      <p className="ats-skill-meta">Status: <b>{resumeStatus === "MISSING" ? draftEvidenceStatusLabel(draft) : resumeStatus}</b></p>
 
       <p className="ats-skill-question">Do you currently have this skill?</p>
       <div className="ats-skill-answer-buttons">
@@ -516,6 +694,7 @@ export default function AtsAnalyzerPage() {
     atsResult,
     atsSelectedJobId,
     setAtsSelectedJobId,
+    setAtsResult,
     analyzeAndOptimize,
     retryAtsWorkflow,
     loadAtsResultForJob,
@@ -525,6 +704,7 @@ export default function AtsAnalyzerPage() {
     loadSkillConfirmations,
     saveConfirmedSkills,
     deleteConfirmedSkill,
+    setMissingSkillsGroups,
     messages,
     busy,
     verifyLatestResume,
@@ -532,11 +712,16 @@ export default function AtsAnalyzerPage() {
   } = useApp();
 
   const [step, setStep] = useState(1);
-  const [viewMode, setViewMode] = useState("optimized");
-  const [activeTab, setActiveTab] = useState("scores");
   const [authoritativeJob, setAuthoritativeJob] = useState(null);
   const [riskAcknowledged, setRiskAcknowledged] = useState(false);
   const [skillDrafts, setSkillDrafts] = useState({});
+  const [confirmationStage, setConfirmationStage] = useState(1);
+  const [eligibility, setEligibility] = useState(null);
+  const [editableResume, setEditableResume] = useState(null);
+  const [editResult, setEditResult] = useState(null);
+  const [workspaceDocument, setWorkspaceDocument] = useState(null);
+  const [stepTransitionError, setStepTransitionError] = useState("");
+  const [pendingRemove, setPendingRemove] = useState(null);
 
   useEffect(() => {
     if (!routeJobId || !currentUser?.user_id) return;
@@ -549,20 +734,36 @@ export default function AtsAnalyzerPage() {
       .catch(() => setAuthoritativeJob(null));
   }, [routeJobId, currentUser?.user_id]);
 
-  const analyzableJobs = useMemo(
-    () =>
-      [
-        ...(authoritativeJob ? [authoritativeJob] : []),
-        ...(jobs || []).filter((job) => String(job.id) !== String(authoritativeJob?.id)),
-      ].filter((job) => {
-        if (genericSearchSources.has(job.source)) return false;
-        if (!job.description || String(job.description).trim().length < 40) return false;
-        const isSelected = job.source === "User Selected Job" || job.source?.endsWith(" Imported");
-        if (!job.job_url && !isSelected) return false;
-        return true;
-      }),
-    [jobs, authoritativeJob]
-  );
+  const analyzableJobs = useMemo(() => {
+    const byId = new Map();
+    for (const job of jobs || []) {
+      if (job?.id == null) continue;
+      byId.set(String(job.id), job);
+    }
+    // Merge route/detail fetch without dropping a job that already has a usable description.
+    // A sparse authoritative payload must not make selectedJob flicker to null mid-wizard.
+    if (authoritativeJob?.id != null) {
+      const key = String(authoritativeJob.id);
+      const existing = byId.get(key);
+      const authLen = String(authoritativeJob.description || "").trim().length;
+      const existLen = String(existing?.description || "").trim().length;
+      byId.set(
+        key,
+        existing
+          ? (authLen >= existLen
+            ? { ...existing, ...authoritativeJob }
+            : { ...authoritativeJob, ...existing, id: authoritativeJob.id })
+          : authoritativeJob,
+      );
+    }
+    return [...byId.values()].filter((job) => {
+      if (genericSearchSources.has(job.source)) return false;
+      if (!job.description || String(job.description).trim().length < 40) return false;
+      const isSelected = job.source === "User Selected Job" || job.source?.endsWith(" Imported");
+      if (!job.job_url && !isSelected) return false;
+      return true;
+    });
+  }, [jobs, authoritativeJob]);
 
   const selectedJob =
     analyzableJobs.find((job) => String(job.id) === String(atsSelectedJobId)) ||
@@ -576,53 +777,32 @@ export default function AtsAnalyzerPage() {
     }
   }, [selectedJob?.id]);
 
-  // Reset wizard progress when the selected job changes. Comparing against the
-  // previous render's job id (instead of a useEffect) avoids an extra cascading render.
-  const [stepResetForJobId, setStepResetForJobId] = useState(selectedJob?.id);
-  if (selectedJob?.id !== stepResetForJobId) {
-    setStepResetForJobId(selectedJob?.id);
+  // Reset wizard only on real job switches. Never wipe an in-progress Step 5 from
+  // transient selection flicker (authoritative fetch / list refresh).
+  const [stepResetForJobId, setStepResetForJobId] = useState(() => selectedJob?.id ?? null);
+  const stepRef = useRef(step);
+  stepRef.current = step;
+  useEffect(() => {
+    const nextId = selectedJob?.id ?? null;
+    if (nextId == null) return;
+    if (stepResetForJobId == null) {
+      setStepResetForJobId(nextId);
+      return;
+    }
+    if (String(nextId) === String(stepResetForJobId)) return;
+    setStepResetForJobId(nextId);
     setStep(1);
-  }
-
-  // Seed drafts from previously-saved evidence once loaded, same pattern as above.
-  const [seededConfirmedSkills, setSeededConfirmedSkills] = useState(null);
-  if (confirmedSkills?.length && confirmedSkills !== seededConfirmedSkills) {
-    setSeededConfirmedSkills(confirmedSkills);
-    setSkillDrafts((current) => {
-      const next = { ...current };
-      confirmedSkills.forEach((row) => {
-        const answer =
-          row.evidence_status === "LEARNING_ONLY" ? "learning_only" :
-          row.evidence_status === "REJECTED" ? "not_possessed" :
-          row.confirmed ? "has_it" : undefined;
-        next[row.skill] = {
-          id: row.id,
-          answer,
-          evidence_status: row.evidence_status,
-          evidence_type: row.evidence_type || "",
-          is_new_employment: Boolean(row.employer_name) && Boolean(row.role_title || row.start_date),
-          employer_name: row.employer_name || "",
-          role_title: row.role_title || "",
-          project_name: row.project_name || "",
-          certification_name: row.certification_name || "",
-          provider_name: row.provider_name || "",
-          start_date: row.start_date || "",
-          end_date: row.end_date || "",
-          currently_using: Boolean(row.currently_using),
-          experience_level: row.experience_level || "",
-          experience_range: row.experience_range || "",
-          usage_description: row.usage_description || "",
-          work_completed: row.work_completed || "",
-          related_technologies: row.related_technologies || "",
-          supporting_context: row.supporting_context || "",
-          impact_description: row.impact_description || "",
-          skill_modules: row.skill_modules || "",
-          confirmed_accurate: Boolean(row.confirmed_accurate),
-        };
-      });
-      return next;
-    });
-  }
+    setConfirmationStage(1);
+    setSkillDrafts({});
+    setEligibility(null);
+    setEditableResume(null);
+    setEditResult(null);
+    setWorkspaceDocument(null);
+    setMissingSkillsGroups(null);
+    setStepTransitionError("");
+    setPendingRemove(null);
+    setAtsResult(null);
+  }, [selectedJob?.id, stepResetForJobId, setMissingSkillsGroups, setAtsResult]);
 
   const disabledReason = !latestResume
     ? "Upload a resume before saving and optimizing jobs."
@@ -635,80 +815,215 @@ export default function AtsAnalyzerPage() {
   const status = result?.workflow_status;
   const originalScore = result?.original_match_percentage ?? result?.original_match_score ?? result?.original_analysis?.match_percentage;
   const optimizedScore = result?.optimized_match_percentage ?? result?.optimized_match_score ?? result?.optimized_analysis?.match_percentage;
-  const improvement = result?.improvement_percentage ?? result?.score_improvement;
-  const matchedBefore = result?.original_matched_keywords || result?.original_analysis?.matched_keywords;
-  const missingBefore = result?.original_missing_keywords || result?.original_analysis?.missing_keywords;
-  const matchedAfter = result?.optimized_matched_keywords || result?.optimized_analysis?.matched_keywords;
-  const missingAfter = result?.remaining_missing_keywords || result?.optimized_missing_keywords || result?.optimized_analysis?.missing_keywords;
-  const newlyMatched = result?.newly_matched_keywords || [];
   const unsupported = result?.unsupported_keywords_not_added || [];
-  const warnings = result?.validation_warnings || result?.final_validation?.warnings || [];
   const generatedPlain = result?.generated_resume?.plain_text || result?.generated_resume_plain || result?.generated_resume;
   const generatedPreview = result?.generated_resume?.formatted_preview || result?.generated_resume_preview_markdown || generatedPlain;
   const canRetry = ["FAILED", "VALIDATION_FAILED"].includes(status);
   const isComplete = status === "COMPLETED";
-  const scoreStatus = result?.score_status || result?.optimized_analysis?.score_status || result?.original_analysis?.score_status;
   const roleAlignment = result?.role_alignment || result?.original_analysis?.role_alignment;
   const resumeRoles = result?.resume_role_families || result?.original_analysis?.resume_role_families || [];
   const targetRole = result?.target_job_role || result?.original_analysis?.job_role_family;
-  const safeToApply = result?.safe_to_apply ?? result?.optimized_analysis?.safe_to_apply ?? false;
-  const missingMandatory = result?.critical_missing_skills || result?.original_analysis?.missing_mandatory_skills || [];
-  const matchedCore = result?.matched_core_skills || result?.original_analysis?.matched_core_skills || [];
-  const matchedTransferable = result?.matched_transferable_skills || result?.original_analysis?.matched_transferable_skills || [];
-  const scoreCap = result?.gap_analysis?.score_cap ?? result?.original_analysis?.score_cap_applied;
-  const scoreCapReason = result?.gap_analysis?.score_cap_reason || result?.original_analysis?.score_cap_reason;
-  const majorMismatch = scoreStatus === "NOT_RECOMMENDED" || roleAlignment === "MISMATCH";
+  const majorMismatch = roleAlignment === "MISMATCH";
   const contentChanged = result?.content_changed;
   const optimizationStatus = result?.optimization_status;
   const whyNot95 = result?.why_not_95;
-  const confirmedSkillsUsed = result?.confirmed_skills_used || [];
+  const confirmedSkillsUsed = result?.confirmed_skills_incorporated
+    || result?.confirmed_skills_used
+    || [];
   const improvementReport = result?.improvement_report;
+  const generationMetadata = result?.generation_metadata || result || {};
+  const generationLabel = generationMetadata.fallback_used
+    ? "Generation: Deterministic fallback"
+    : generationMetadata.llm_used
+      ? `Generation: ${generationMetadata.llm_service === "ollama" ? "Ollama" : generationMetadata.llm_provider || "LLM"} · ${generationMetadata.llm_model || "Unknown model"}`
+      : null;
+  const fallbackReason = generationMetadata.fallback_used
+    ? (FALLBACK_REASON_LABELS[generationMetadata.fallback_reason] || generationMetadata.fallback_reason || null)
+    : null;
 
   const verifiedSkills = missingSkillsGroups?.verified_resume_skills || [];
   const weakSkills = missingSkillsGroups?.weak_or_indirect_skills || [];
   const mandatorySkills = missingSkillsGroups?.missing_mandatory_skills || [];
   const preferredSkills = missingSkillsGroups?.missing_preferred_skills || [];
   const confirmationSkills = useMemo(() => [...weakSkills, ...mandatorySkills, ...preferredSkills], [weakSkills, mandatorySkills, preferredSkills]);
+  // Keep legacy alias used by save/continue helpers — this is the confirmation queue,
+  // NOT "skills not found". Weak/indirect evidence is intentionally included.
   const missingSkills = confirmationSkills;
+  const notFoundSkills = useMemo(() => [...mandatorySkills, ...preferredSkills], [mandatorySkills, preferredSkills]);
 
-  const answeredDrafts = missingSkills.filter((s) => skillDrafts[s.skill]?.answer);
+  const answeredDrafts = confirmationSkills.filter((s) => skillDrafts[s.skill]?.answer);
   const allAnsweredValid = answeredDrafts.every((s) => draftIsValid(skillDrafts[s.skill]));
-  const allMandatoryAnswered = [...weakSkills.filter((s) => s.requirement_type === "MANDATORY"), ...mandatorySkills].every((s) => skillDrafts[s.skill]?.answer);
   const canSaveConfirmations = answeredDrafts.length > 0 && allAnsweredValid;
-  const canContinueToOptimization = Boolean(missingSkillsGroups) && allMandatoryAnswered && allAnsweredValid;
+  const blockingReasons = missingSkillsGroups?.blocking_reasons || [];
+  const evidenceSummary = missingSkillsGroups?.evidence_summary || {};
+  const USER_CONFIRMED_STATUSES = useMemo(() => new Set([
+    "USER_CONFIRMED_PROFESSIONAL",
+    "USER_CONFIRMED_PROJECT",
+    "USER_CONFIRMED_CERTIFICATION",
+    "USER_CONFIRMED_TRAINING",
+  ]), []);
+  // Never fall back to unfiltered confirmedSkills — that reintroduces historical INCOMPLETE rows.
+  const activeEvidence = useMemo(() => {
+    const fromSummary = Array.isArray(evidenceSummary.evidence) ? evidenceSummary.evidence : null;
+    const fromGroups = Array.isArray(missingSkillsGroups?.evidence) ? missingSkillsGroups.evidence : null;
+    const rows = fromSummary || fromGroups || [];
+    return rows.filter((row) => row && row.evidence_status !== "OBSOLETE" && row.is_active !== false);
+  }, [evidenceSummary, missingSkillsGroups]);
+  const evidenceHistory = useMemo(() => (
+    Array.isArray(evidenceSummary.evidence_history)
+      ? evidenceSummary.evidence_history
+      : (Array.isArray(missingSkillsGroups?.evidence_history) ? missingSkillsGroups.evidence_history : [])
+  ), [evidenceSummary, missingSkillsGroups]);
+  const userConfirmedEvidence = useMemo(
+    () => (Array.isArray(evidenceSummary.user_confirmed) && evidenceSummary.user_confirmed.length
+      ? evidenceSummary.user_confirmed
+      : activeEvidence.filter((row) => USER_CONFIRMED_STATUSES.has(row.evidence_status))),
+    [evidenceSummary, activeEvidence, USER_CONFIRMED_STATUSES],
+  );
+  const incompleteEvidence = useMemo(
+    () => (Array.isArray(evidenceSummary.incomplete) && evidenceSummary.incomplete.length
+      ? evidenceSummary.incomplete
+      : activeEvidence.filter((row) => row.evidence_status === "INCOMPLETE")),
+    [evidenceSummary, activeEvidence],
+  );
+  const optionalEvidence = useMemo(
+    () => (Array.isArray(evidenceSummary.optional_preferred) ? evidenceSummary.optional_preferred : []),
+    [evidenceSummary],
+  );
+  // Step 4 summary lists unsupported required items for awareness (warnings, not blockers).
+  const currentUnresolvedRequired = useMemo(() => {
+    const fromWarnings = Array.isArray(missingSkillsGroups?.generation_warnings)
+      ? missingSkillsGroups.generation_warnings
+      : [];
+    if (fromWarnings.length) return fromWarnings;
+    const mandatoryIncomplete = incompleteEvidence.filter(
+      (row) => (row.requirement_type || "").toUpperCase() === "MANDATORY",
+    );
+    if (mandatoryIncomplete.length) return mandatoryIncomplete;
+    return (blockingReasons || []).filter((item) => {
+      const status = String(item.evidence_status || "").toUpperCase();
+      return !USER_CONFIRMED_STATUSES.has(status) && status !== "VERIFIED_FROM_RESUME";
+    });
+  }, [incompleteEvidence, blockingReasons, USER_CONFIRMED_STATUSES, missingSkillsGroups]);
+
+  const optimizedScoreView = result?.optimized_score_view
+    || result?.optimized_analysis?.score_view
+    || editResult?.score
+    || editableResume?.score
+    || null;
+  const authoritativeRemainingGaps = useMemo(() => {
+    if (isComplete && (optimizedScoreView || result?.optimized_analysis)) {
+      const analysis = result?.optimized_analysis;
+      const view = optimizedScoreView || (analysis ? {
+        mandatory_requirements: analysis.mandatory_requirements || {
+          covered: Math.max(0, (analysis.mandatory_unit_count || (analysis.required_skills || []).length)
+            - (analysis.missing_mandatory_skills || []).length),
+          total: analysis.mandatory_unit_count || (analysis.required_skills || []).length,
+          missing: analysis.missing_mandatory_skills || [],
+        },
+        remaining_gaps: analysis.remaining_gaps || {
+          unsupported: analysis.missing_mandatory_skills || [],
+          preferred_gaps: analysis.missing_preferred_skills || [],
+        },
+        missing_mandatory_skills: analysis.missing_mandatory_skills || [],
+      } : null);
+      return gapItemsFromScoreView(view, result);
+    }
+    return currentUnresolvedRequired;
+  }, [isComplete, optimizedScoreView, result, currentUnresolvedRequired]);
+
+  // Authoritative gate: analysis must succeed. Unsupported JD gaps never block Continue/Generate.
+  const analysisFailed = missingSkillsGroups?.analysis_status === "REQUIREMENT_EXTRACTION_FAILED"
+    || missingSkillsGroups?.analysis_status === "ANALYSIS_CONSISTENCY_FAILED";
+  const canContinueToOptimization = Boolean(missingSkillsGroups && !analysisFailed);
+  const generationWarningMessage = missingSkillsGroups?.generation_warning_message
+    || (currentUnresolvedRequired.length
+      ? `${currentUnresolvedRequired.map((item) => item.skill).filter(Boolean).join(", ")} ${
+        currentUnresolvedRequired.length === 1 ? "is" : "are"
+      } not supported and will remain a gap. Generation can continue; unsupported requirements will be excluded.`
+      : "");
+  const unresolvedRequiredCount = currentUnresolvedRequired.length;
 
   const summaryCounts = useMemo(() => {
-    const counts = {
+    const backendCounts = missingSkillsGroups?.active_confirmation_counts || evidenceSummary.counts;
+    if (backendCounts && typeof backendCounts === "object") {
+      const incomplete = backendCounts.incomplete ?? incompleteEvidence.length;
+      return {
+        verifiedFromResume: backendCounts.verified_from_resume ?? verifiedSkills.length,
+        userConfirmedWithEvidence: backendCounts.user_confirmed_with_evidence ?? userConfirmedEvidence.length,
+        learningOnly: backendCounts.learning_only ?? 0,
+        notPossessed: backendCounts.not_possessed ?? 0,
+        incomplete,
+      };
+    }
+    return {
       verifiedFromResume: verifiedSkills.length,
-      userConfirmedWithEvidence: 0,
-      learningOnly: 0,
-      notPossessed: 0,
-      incomplete: 0,
+      userConfirmedWithEvidence: userConfirmedEvidence.length,
+      learningOnly: activeEvidence.filter((row) => row.evidence_status === "LEARNING_ONLY").length,
+      notPossessed: activeEvidence.filter((row) => row.evidence_status === "REJECTED").length,
+      incomplete: incompleteEvidence.length,
     };
-    confirmedSkills.forEach((row) => {
-      if (["USER_CONFIRMED_PROFESSIONAL", "USER_CONFIRMED_PROJECT", "USER_CONFIRMED_CERTIFICATION", "USER_CONFIRMED_TRAINING"].includes(row.evidence_status)) {
-        counts.userConfirmedWithEvidence += 1;
-      } else if (row.evidence_status === "LEARNING_ONLY") {
-        counts.learningOnly += 1;
-      } else if (row.evidence_status === "REJECTED") {
-        counts.notPossessed += 1;
-      }
-    });
-    missingSkills.forEach((s) => {
-      const draft = skillDrafts[s.skill];
-      if (draft?.answer === "has_it" && !draftIsValid(draft)) counts.incomplete += 1;
-    });
-    return counts;
-  }, [verifiedSkills, confirmedSkills, missingSkills, skillDrafts]);
+  }, [verifiedSkills, activeEvidence, missingSkillsGroups, evidenceSummary, userConfirmedEvidence, incompleteEvidence]);
 
   const updateDraft = (skill, draft) => setSkillDrafts((current) => ({ ...current, [skill]: draft }));
+
+  const toggleQuickSkill = (skill) => setSkillDrafts((current) => {
+    const draft = current[skill] || {};
+    const selected = draft.answer === "has_it";
+    return {
+      ...current,
+      [skill]: selected
+        ? {}
+        : { answer: "has_it", simple_confirmation: true, confirmed_accurate: true },
+    };
+  });
+
+  const startEvidenceConfirmation = () => {
+    // Keep drafts frontend-only until Save Evidence — never persist answer:null INCOMPLETE stubs.
+    const selected = confirmationSkills.filter((item) => skillDrafts[item.skill]?.answer === "has_it");
+    if (!selected.length) return;
+    setSkillDrafts((current) => {
+      const next = { ...current };
+      selected.forEach((item) => {
+        next[item.skill] = {
+          ...(next[item.skill] || {}),
+          answer: "has_it",
+          simple_confirmation: true,
+          confirmed_accurate: true,
+        };
+      });
+      return next;
+    });
+    setConfirmationStage(2);
+  };
+
+  const denyAllMissingSkills = async () => {
+    const items = confirmationSkills.map((item) => ({
+      skill: item.skill,
+      requirement_type: item.requirement_type || item.importance,
+      answer: "not_possessed",
+      simple_confirmation: true,
+    }));
+    setSkillDrafts((current) => {
+      const next = { ...current };
+      confirmationSkills.forEach((item) => {
+        next[item.skill] = { ...(next[item.skill] || {}), answer: "not_possessed", simple_confirmation: true };
+      });
+      return next;
+    });
+    if (items.length) {
+      await saveConfirmedSkills(selectedJob.id, items);
+    }
+    setConfirmationStage(2);
+    setStep(4);
+  };
 
   const handleSaveConfirmations = async () => {
     const items = answeredDrafts.map((s) => {
       const draft = skillDrafts[s.skill];
       return {
         skill: s.skill,
-        requirement_type: s.importance,
+        requirement_type: s.requirement_type || s.importance,
         answer: draft.answer,
         evidence_type: draft.answer === "has_it" ? draft.evidence_type || null : null,
         is_new_employment: Boolean(draft.is_new_employment),
@@ -729,21 +1044,218 @@ export default function AtsAnalyzerPage() {
         impact_description: draft.impact_description || null,
         skill_modules: draft.skill_modules || null,
         confirmed_accurate: Boolean(draft.confirmed_accurate),
+        simple_confirmation: Boolean(draft.simple_confirmation),
       };
     });
     if (!items.length) return;
     await saveConfirmedSkills(selectedJob.id, items);
+    setStep(4);
   };
 
   const maxUnlockedStep = useMemo(() => {
-    if (isComplete) return 7;
-    if (["VALIDATING_RESUME", "VALIDATION_FAILED", "ANALYZING_OPTIMIZED"].includes(status)) return 6;
-    if (["GENERATING_RESUME"].includes(status)) return 5;
+    if (isComplete || ["VALIDATING_RESUME", "VALIDATION_FAILED", "ANALYZING_OPTIMIZED", "GENERATING_RESUME"].includes(status)) {
+      return 5;
+    }
     if (canContinueToOptimization) return 5;
-    if (missingSkillsGroups) return 3;
+    // Analysis exists ⇒ Steps 1–4 stay reachable so users can review blockers.
+    // Only Step 5 requires zero mandatory unresolved evidence.
+    if (missingSkillsGroups) return 4;
     if (selectedJob) return 2;
     return 1;
   }, [selectedJob, missingSkillsGroups, canContinueToOptimization, status, isComplete]);
+
+  useEffect(() => {
+    if (!isComplete || !result?.optimized_resume_id || !selectedJob?.id || !currentUser?.user_id) return;
+    getEditableOptimizedResume(currentUser.user_id, selectedJob.id, result.optimized_resume_id)
+      .then((data) => {
+        setEditableResume(data);
+        setWorkspaceDocument(data.document || null);
+        if (data.score || data.edited_score != null) {
+          setEditResult((current) => ({
+            ...(current || {}),
+            edited_score: data.edited_score,
+            generated_score: data.generated_score,
+            score: data.score,
+            safe_to_download: data.validation_status === "passed",
+            final_text: data.final_text,
+          }));
+        }
+      })
+      .catch(() => null);
+  }, [isComplete, result?.optimized_resume_id, selectedJob?.id, currentUser?.user_id]);
+
+  const analyzeRequirementsAndEligibility = async () => {
+    const groups = await loadMissingSkills(selectedJob.id);
+    if (!groups) return;
+    if (groups.analysis_status === "REQUIREMENT_EXTRACTION_FAILED" || groups.analysis_status === "ANALYSIS_CONSISTENCY_FAILED") {
+      setEligibility({
+        optimization_allowed: false,
+        eligibility_status: "ANALYSIS_FAILED",
+        analysis_status: groups.analysis_status,
+        reason: groups.analysis_error || "Analysis could not be completed.",
+        eligibility_reason: groups.analysis_error || "Analysis could not be completed.",
+        original_score: null,
+      });
+      // Stay on Step 2 — do not advance on failed analysis.
+      return;
+    }
+    const check = await getOptimizationEligibility(currentUser.user_id, selectedJob.id);
+    setEligibility(check);
+    if (check?.analysis_status === "REQUIREMENT_EXTRACTION_FAILED") {
+      return;
+    }
+    // Drop stale FAILED / INELIGIBLE workflow banners when CURRENT analysis succeeds.
+    setAtsResult((current) => {
+      if (!current) return current;
+      const status = String(current.workflow_status || "");
+      const stale = status.startsWith("INELIGIBLE")
+        || status === "FAILED"
+        || status === "VALIDATION_FAILED";
+      return stale ? null : current;
+    });
+    setStep(3);
+  };
+
+  const enterOptimizationStep = (event) => {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const unresolved = currentUnresolvedRequired;
+    if (import.meta.env.DEV) {
+      console.info("CONTINUE_OPTIMIZATION_CLICK", {
+        currentStep: stepRef.current,
+        canGenerateResume: canContinueToOptimization,
+        can_generate_resume: missingSkillsGroups?.can_generate_resume,
+        unresolvedRequiredCount: unresolved.length,
+        selectedJobId: selectedJob?.id,
+        resumeId: latestResume?.id ?? latestResume?.resume_id,
+        analysisId: missingSkillsGroups?.analysis_id,
+      });
+    }
+
+    // Single invariant: analysis must be present. Unsupported gaps never block navigation.
+    if (!missingSkillsGroups) {
+      const message = "Could not continue to optimization: current ATS analysis could not be loaded.";
+      console.error(message);
+      setStepTransitionError(message);
+      return;
+    }
+    if (analysisFailed) {
+      setStepTransitionError("Could not continue: requirement analysis failed.");
+      return;
+    }
+
+    // Context warnings are shown on Step 5 — they must not block navigation.
+    const warnings = [];
+    if (!selectedJob?.id) warnings.push("No job is selected.");
+    if (!(latestResume?.id ?? latestResume?.resume_id)) warnings.push("No resume is loaded.");
+    if (generationWarningMessage) warnings.push(generationWarningMessage);
+    setStepTransitionError("");
+    // Soft amber notice for gaps is rendered from generationWarningMessage on Step 5.
+    void warnings;
+
+    // Review page only — never await backend before advancing.
+    setStep(5);
+  };
+
+  const runGenerateOptimizedResume = async () => {
+    if (!selectedJob?.id) {
+      setStepTransitionError("Could not generate: no job is selected.");
+      return;
+    }
+    if (!canContinueToOptimization) {
+      setStepTransitionError(
+        analysisFailed
+          ? "Could not generate: requirement analysis failed."
+          : "Could not generate: analyze a job with a valid resume first.",
+      );
+      return;
+    }
+    setStepTransitionError("");
+    try {
+      const readiness = await loadSkillConfirmations(selectedJob.id);
+      const systemBlockers = (readiness?.blocking_reasons || []).filter(
+        (item) => item?.code && !String(item.code).includes("EVIDENCE") && item.code !== "MANDATORY_EVIDENCE_INCOMPLETE",
+      );
+      if (readiness && readiness.can_generate_resume === false && systemBlockers.length) {
+        setStepTransitionError(
+          readiness.generation_blocked_message
+          || systemBlockers.map((item) => item.reason || item.skill).filter(Boolean).join(", ")
+          || "Could not generate optimized resume due to a system error.",
+        );
+        return;
+      }
+    } catch (error) {
+      console.error("Generate readiness check failed:", error);
+      setStepTransitionError(
+        `Could not generate: ${error?.message || "evidence readiness check failed."}`,
+      );
+      return;
+    }
+    const generated = await analyzeAndOptimize(selectedJob.id, true);
+    if (generated?.workflow_status === "COMPLETED" && generated?.optimized_resume_id) {
+      setStep(5);
+      setStepTransitionError("");
+    } else if (generated && generated.workflow_status && generated.workflow_status !== "COMPLETED") {
+      const err = String(generated.error_message || "");
+      // Stale evidence-incomplete failures must not look like hard errors after this product change.
+      if (/evidence incomplete/i.test(err)) {
+        setStepTransitionError("");
+      } else {
+        setStepTransitionError(
+          generated.error_message
+          || `Could not generate: workflow status ${generated.workflow_status}.`,
+        );
+      }
+    }
+  };
+
+  const saveWorkspace = async ({ document, plainText, action, skipScore }) => {
+    const saved = await saveEditedOptimizedResume(
+      currentUser.user_id,
+      selectedJob.id,
+      result.optimized_resume_id,
+      plainText,
+      action,
+      { document, skipScore: Boolean(skipScore) },
+    );
+    setEditResult(saved);
+    if (saved?.document) setWorkspaceDocument(saved.document);
+    return saved;
+  };
+
+  const scoreWorkspace = async ({ document, plainText }) => {
+    const scored = await saveEditedOptimizedResume(
+      currentUser.user_id,
+      selectedJob.id,
+      result.optimized_resume_id,
+      plainText,
+      "score",
+      { document, scoreOnly: true, persist: false },
+    );
+    setEditResult((current) => ({ ...(current || {}), ...scored }));
+    return scored;
+  };
+
+  const improveWorkspaceSnippet = async ({ text, context }) => (
+    improveResumeSnippet(currentUser.user_id, selectedJob.id, result.optimized_resume_id, text, context)
+  );
+
+  const statusBanner = buildAtsStatusBanner({
+    step,
+    busy,
+    messages,
+    missingSkillsGroups,
+    canContinueToOptimization,
+    isComplete,
+    result,
+    disabledReason,
+  });
+
+  const confirmRemoveEvidence = async () => {
+    if (!pendingRemove?.id || !selectedJob?.id) return;
+    await deleteConfirmedSkill(selectedJob.id, pendingRemove.id);
+    setPendingRemove(null);
+  };
 
   return (
     <Page
@@ -761,7 +1273,9 @@ export default function AtsAnalyzerPage() {
         ) : null
       }
     >
-      <Notice>{messages.ats || messages["ats-requirements"] || messages["ats-skills"] || disabledReason}</Notice>
+      <Notice tone={statusBanner.tone === "error" ? "error" : statusBanner.tone === "warning" ? "warning" : undefined}>
+        {statusBanner.text}
+      </Notice>
 
       <WizardSteps step={step} maxUnlockedStep={maxUnlockedStep} onSelect={setStep} />
 
@@ -804,42 +1318,81 @@ export default function AtsAnalyzerPage() {
 
       {step === 2 && (
         <Panel title="Step 2 · Analyze Job Requirements">
+          <p className="ats-improvement-note">
+            Analyzing resume <b>{latestResume?.file_name || latestResume?.original_file_name || "—"}</b>
+            {latestResume?.id ? ` (id ${latestResume.id})` : ""} against job <b>{selectedJob?.title || "—"}</b>
+            {selectedJob?.id ? ` (id ${selectedJob.id})` : ""}.
+          </p>
           <button
             className="button primary"
             disabled={!selectedJob || busy === "ats-requirements"}
-            onClick={() => loadMissingSkills(selectedJob.id).then((d) => d && setStep(3))}
+            onClick={analyzeRequirementsAndEligibility}
           >
             {busy === "ats-requirements" ? "Analyzing…" : "Analyze Job Description"}
           </button>
-          {missingSkillsGroups && (
+          {busy === "ats-requirements" && <p className="ats-generation-indicator">Loading requirement analysis…</p>}
+          {missingSkillsGroups?.analysis_status === "REQUIREMENT_EXTRACTION_FAILED" || missingSkillsGroups?.analysis_status === "ANALYSIS_CONSISTENCY_FAILED" ? (
+            <section className="ats-threshold-warning" role="alert">
+              <h3>Analysis could not be completed</h3>
+              <p>{missingSkillsGroups.analysis_error || "We could not extract requirements from this job description. Please retry."}</p>
+              <button className="button primary" onClick={analyzeRequirementsAndEligibility}>Retry Analysis</button>
+            </section>
+          ) : null}
+          {missingSkillsGroups && missingSkillsGroups.analysis_status !== "REQUIREMENT_EXTRACTION_FAILED" && missingSkillsGroups.analysis_status !== "ANALYSIS_CONSISTENCY_FAILED" && (
             <div className="ats-requirements-summary">
-              <p><b>Verified from resume:</b> {verifiedSkills.length} skill(s)</p>
-              <p><b>Weak or indirect:</b> {weakSkills.length} skill(s)</p>
-              <p><b>Missing — mandatory:</b> {mandatorySkills.length} skill(s)</p>
-              <p><b>Missing — preferred:</b> {preferredSkills.length} skill(s)</p>
-              <h4>Verified in Resume</h4>
+              {missingSkillsGroups.score_explanation?.match_percentage != null && (
+                <div className="ats-evidence-summary">
+                  <p><b>ATS Match:</b> {Math.round(Number(missingSkillsGroups.score_explanation.match_percentage))}%</p>
+                  <p><b>Role alignment:</b> {missingSkillsGroups.score_explanation.role_alignment || "—"}</p>
+                  <details className="ats-score-explanation" open>
+                    <summary>Why this score?</summary>
+                    {Object.entries(missingSkillsGroups.score_explanation.component_scores || {}).map(([name, component]) => (
+                      <p key={name}>
+                        <b>{name.replaceAll("_", " ")}:</b>{" "}
+                        {component && typeof component === "object"
+                          ? `${component.earned ?? component}/${component.max ?? ""}`
+                          : String(component)}
+                      </p>
+                    ))}
+                    {missingSkillsGroups.score_explanation.why_not_95 && <p>{missingSkillsGroups.score_explanation.why_not_95}</p>}
+                  </details>
+                </div>
+              )}
+              <p><b>✓ Verified from resume:</b> {verifiedSkills.length} skill(s)</p>
+              <p><b>? Possible evidence — confirm:</b> {weakSkills.length} skill(s)</p>
+              <p><b>✕ Not found — mandatory:</b> {mandatorySkills.length} skill(s)</p>
+              <p><b>✕ Not found — preferred:</b> {preferredSkills.length} skill(s)</p>
+              <h4>✓ Verified from Your Resume</h4>
               <ul className="ats-list">
                 {verifiedSkills.map((s) => (
-                  <li key={s.skill}>{s.skill} <span className="ats-skill-meta">({s.category} · {s.match_type} · {s.evidence_strength})</span>{s.evidence_snippets?.[0] && <small className="ats-evidence-snippet">{s.evidence_snippets[0]}</small>}</li>
+                  <li key={s.skill}>{s.skill} <span className="ats-skill-meta">({s.category} · {s.match_type} · {s.evidence_strength})</span>{s.evidence_snippets?.[0] && <small className="ats-evidence-snippet">{s.evidence_snippets[0]}</small>}{s.reason && <small className="ats-evidence-snippet">{s.reason}</small>}</li>
                 ))}
                 {!verifiedSkills.length && <li>No requirements are clearly supported by the resume yet.</li>}
               </ul>
-              <h4>Weak or Indirect Evidence — Confirmation Recommended</h4>
+              <h4>? Possible Evidence — Please Confirm</h4>
               <ul className="ats-list">
-                {weakSkills.map((s) => <li key={s.skill}>{s.skill} <span className="ats-skill-meta">({s.match_type} · {s.evidence_strength})</span></li>)}
+                {weakSkills.map((s) => (
+                  <li key={s.skill}>{s.skill} <span className="ats-skill-meta">({s.match_type} · {s.evidence_strength})</span>{s.evidence_snippets?.[0] && <small className="ats-evidence-snippet">Possible evidence: {s.evidence_snippets[0]}</small>}{s.reason && <small className="ats-evidence-snippet">{s.reason}</small>}</li>
+                ))}
                 {!weakSkills.length && <li>No weak or indirect evidence requires confirmation.</li>}
               </ul>
-              <h4>Missing — Evidence Required</h4>
+              <h4>✕ Not Found in Resume — Mandatory</h4>
               <ul className="ats-list">
                 {mandatorySkills.map((s) => <li key={s.skill}>{s.skill} <span className="ats-skill-meta">({s.category})</span></li>)}
                 {!mandatorySkills.length && <li>No mandatory skills are missing.</li>}
               </ul>
-              <h4>Optional / Preferred</h4>
+              <h4>Optional / Preferred Missing</h4>
               <ul className="ats-list">
                 {preferredSkills.map((s) => <li key={s.skill}>{s.skill} <span className="ats-skill-meta">({s.category})</span></li>)}
                 {!preferredSkills.length && <li>No preferred skills are missing.</li>}
               </ul>
-              <button className="button primary" onClick={() => setStep(3)}>Continue to Skill Confirmation</button>
+              <button
+                className="button primary"
+                disabled={missingSkillsGroups.analysis_status === "REQUIREMENT_EXTRACTION_FAILED"}
+                onClick={() => setStep(3)}
+              >
+                Continue to Skill Confirmation
+              </button>
             </div>
           )}
         </Panel>
@@ -847,6 +1400,73 @@ export default function AtsAnalyzerPage() {
 
       {step === 3 && (
         <Panel title="Step 3 · Confirm Your Current Skills">
+          {eligibility?.optimization_allowed === false ? (
+            <section className={eligibility.role_alignment === "MISMATCH" ? "ats-major-warning" : "ats-threshold-warning"} role="alert">
+              <h3>
+                {eligibility.analysis_status === "REQUIREMENT_EXTRACTION_FAILED" || eligibility.eligibility_status === "ANALYSIS_FAILED"
+                  ? "Analysis could not be completed"
+                  : eligibility.role_alignment === "MISMATCH"
+                    ? "Major role mismatch detected"
+                    : "Resume below optimization threshold"}
+              </h3>
+              {eligibility.analysis_status === "REQUIREMENT_EXTRACTION_FAILED" || eligibility.eligibility_status === "ANALYSIS_FAILED" ? (
+                <p>{eligibility.reason || eligibility.eligibility_reason || "We could not extract requirements from this job description. Please retry."}</p>
+              ) : eligibility.role_alignment === "MISMATCH" ? (
+                <p>Your current resume matches this job at <b>{eligibility.original_score}%</b> and targets a different role family. Please review the role details or upload a more relevant resume.</p>
+              ) : (
+                <p>{eligibility.reason || eligibility.eligibility_reason || "Role aligned, but ATS score is below 65%."}</p>
+              )}
+              {eligibility.original_score != null && (
+              <div className="ats-evidence-summary">
+                <p>Current Resume Match: <b>{eligibility.original_score}%</b></p>
+                <p>Minimum Required: <b>65%</b></p>
+                <p>Resume role: <b>{eligibility.resume_role_family_display || eligibility.resume_role_family || "—"}</b></p>
+                <p>Target role: <b>{eligibility.target_job_title || eligibility.job_role_family_display || eligibility.job_role_family || "—"}</b></p>
+                <p>Role alignment: <b>{eligibility.role_alignment || eligibility.eligibility_tier}</b></p>
+                <p>Suggested role family: <b>{eligibility.suggested_role_family || "—"}</b></p>
+              </div>
+              )}
+              <p><b>Missing core skills:</b> {listText(eligibility.missing_core_skills)}</p>
+              <p><b>Missing mandatory skills:</b> {listText(eligibility.missing_mandatory_skills)}</p>
+              <p><b>Missing preferred skills:</b> {listText(eligibility.missing_preferred_skills)}</p>
+              <details className="ats-score-explanation" open>
+                <summary>Why this score?</summary>
+                {Object.entries(eligibility.component_scores || {}).map(([name, component]) => (
+                  <p key={name}><b>{name.replaceAll("_", " ")}:</b> {name === "education_certifications" && eligibility.education_category_applicable === false ? "N/A (neutral)" : `${component.earned}/${component.max}`}</p>
+                ))}
+                <p><b>Score cap:</b> {eligibility.score_cap ? `${eligibility.score_cap}% — ${eligibility.score_cap_reason}` : "None"}</p>
+                <p><b>Strong evidence:</b> {listText(eligibility.strong_evidence_skills)}</p>
+                <p><b>Weak evidence:</b> {listText(eligibility.weak_evidence_skills)}</p>
+              </details>
+              {eligibility.role_alignment === "MISMATCH" && <p><b>Major mismatch reasons:</b> {listText(eligibility.major_mismatch_reasons)}</p>}
+              <div className="ats-confirmation-actions">
+                <Link className="button primary" to="/resume">Upload Different Resume</Link>
+                <button className="button secondary" onClick={() => setStep(2)}>View Missing Skills</button>
+                <Link className="button secondary" to="/selected-jobs">Return to Selected Jobs</Link>
+              </div>
+            </section>
+          ) : (
+          <>
+          {eligibility && (
+            <section className="ats-role-aligned" aria-label="Role alignment summary">
+              <h3>Role alignment: {eligibility.role_alignment === "EXACT" ? "Exact" : eligibility.role_alignment}</h3>
+              <p><b>Resume role:</b> {eligibility.resume_role_family_display || eligibility.resume_role_family}</p>
+              <p><b>Target role:</b> {eligibility.target_job_title || eligibility.job_role_family_display || eligibility.job_role_family}</p>
+              <p><b>Role alignment:</b> {eligibility.role_alignment}</p>
+              <p><b>Suggested role family:</b> {eligibility.suggested_role_family || eligibility.resume_role_family_display || "—"}</p>
+              <p><b>Original match:</b> {eligibility.original_score}%</p>
+              <p><b>Optimization:</b> Eligible</p>
+              {eligibility.role_classification?.resume?.strong_signals?.length > 0 && (
+                <p className="ats-improvement-note">
+                  Strong role signals: {listText(eligibility.role_classification.resume.strong_signals)}
+                  {(eligibility.role_classification.resume.supporting_signals || []).length > 0
+                    ? ` · Supporting/shared: ${listText(eligibility.role_classification.resume.supporting_signals)}`
+                    : ""}
+                </p>
+              )}
+              {eligibility.eligibility_warning && <p>{eligibility.eligibility_warning}</p>}
+            </section>
+          )}
           <p className="ats-improvement-note">
             Your uploaded resume may be outdated. Select only the skills you currently possess. You may be
             asked to provide supporting details. Do not select skills you have not used.
@@ -855,84 +1475,104 @@ export default function AtsAnalyzerPage() {
             <EmptyState title="Analyze requirements first" text="Go back to Step 2 and analyze the job description." />
           ) : (
             <>
-              <h4>Verified in Resume — no action needed</h4>
-              <div className="ats-skill-list">
-                {verifiedSkills.map((s) => (
-                  <div key={s.skill} className="ats-skill-card ats-skill-card-verified">
-                    <div className="ats-skill-card-header">
-                      <b>{s.skill}</b>
-                      <span className="badge badge-verified">Verified from resume</span>
-                      <span className="ats-skill-meta">{s.category}</span>
+              <details className="ats-verified-skills">
+                <summary>✓ Verified from your resume ({verifiedSkills.length})</summary>
+                <div className="ats-verified-skill-chips">
+                  {verifiedSkills.map((s) => <span key={s.skill}>{s.skill}</span>)}
+                  {!verifiedSkills.length && <p>No requirements are confidently verified yet.</p>}
+                </div>
+              </details>
+
+              {confirmationStage === 1 ? (
+                <section className="ats-quick-confirmation">
+                  <h3>Confirm Your Skills</h3>
+                  <p>Review the skills below before continuing. Select only the skills you genuinely have experience with.</p>
+                  {confirmedSkills.length > 0 && (
+                    <p className="ats-improvement-note">
+                      This job has {confirmedSkills.length} previously saved decision{confirmedSkills.length === 1 ? "" : "s"}. They are visible in Review Evidence and are not copied into these forms automatically.
+                    </p>
+                  )}
+                  {weakSkills.length > 0 && (
+                    <div className="ats-skill-category">
+                      <h4>? Possible Evidence Found — Please Confirm</h4>
+                      <p className="ats-skill-meta">Your resume mentions these, but we could not confidently confirm detailed professional usage. Confirm only what you have genuinely used.</p>
+                      {weakSkills.map((item) => (
+                        <div className="ats-quick-skill-item" key={item.skill}>
+                          <label className="ats-quick-skill-row">
+                            <input type="checkbox" checked={skillDrafts[item.skill]?.answer === "has_it"} onChange={() => toggleQuickSkill(item.skill)} />
+                            <span>{item.skill}</span>
+                            <span className={`badge ${(item.requirement_type || item.importance) === "PREFERRED" ? "badge-preferred" : "badge-mandatory"}`}>{(item.requirement_type || item.importance) === "PREFERRED" ? "Preferred" : "Required"}</span>
+                          </label>
+                          {item.evidence_snippets?.[0] && (
+                            <small className="ats-evidence-snippet">Possible evidence: {item.evidence_snippets[0]}</small>
+                          )}
+                        </div>
+                      ))}
                     </div>
-                    <p className="ats-skill-meta">Found in uploaded resume: <b>Yes</b></p>
-                    <p className="ats-skill-meta">Status: <b>{s.resume_status || "VERIFIED"}</b></p>
-                    <p className="ats-skill-meta">Evidence: {s.evidence_strength}</p>
-                    {s.evidence_snippets?.map((snippet, index) => <p className="ats-evidence-snippet" key={`${s.skill}-${index}`}>{snippet}</p>)}
+                  )}
+                  {(mandatorySkills.length > 0 || preferredSkills.length > 0) && (
+                    <div className="ats-skill-category-group">
+                      <h4 className="ats-not-found-heading">✕ Not Found in Resume</h4>
+                      <p className="ats-skill-meta">The job requires these, but we could not find any evidence of them anywhere in your uploaded resume.</p>
+                      {Object.entries(groupedByCategory([...mandatorySkills, ...preferredSkills])).map(([category, skills]) => (
+                        <div className="ats-skill-category" key={category}>
+                          <h4>{category}</h4>
+                          {skills.map((item) => (
+                            <label className="ats-quick-skill-row" key={item.skill}>
+                              <input type="checkbox" checked={skillDrafts[item.skill]?.answer === "has_it"} onChange={() => toggleQuickSkill(item.skill)} />
+                              <span>{item.skill}</span>
+                              <span className={`badge ${(item.requirement_type || item.importance) === "PREFERRED" ? "badge-preferred" : "badge-mandatory"}`}>{(item.requirement_type || item.importance) === "PREFERRED" ? "Preferred" : "Required"}</span>
+                            </label>
+                          ))}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  <div className="ats-confirmation-progress"><b>{confirmationSkills.length} skill{confirmationSkills.length === 1 ? "" : "s"} need review</b><span>{confirmationSkills.filter((s) => skillDrafts[s.skill]?.answer === "has_it").length} selected</span></div>
+                  {unresolvedRequiredCount > 0 && (
+                    <p className="ats-gap-warning">
+                      {unresolvedRequiredCount} required skill{unresolvedRequiredCount === 1 ? "" : "s"} unsupported
+                      — they will remain gaps and will not block generation.
+                    </p>
+                  )}
+                  <div className="ats-confirmation-actions">
+                    <button className="button primary" disabled={!confirmationSkills.some((s) => skillDrafts[s.skill]?.answer === "has_it")} onClick={startEvidenceConfirmation}>Select skills I have</button>
+                    <button className="button secondary" onClick={() => denyAllMissingSkills()}>I don&apos;t have any of these skills</button>
                   </div>
-                ))}
-                {!verifiedSkills.length && <p className="ats-skill-meta">No requirements are verified from the resume yet.</p>}
-              </div>
-
-              <h4>Weak or Indirect Evidence — Confirmation Recommended</h4>
-              <div className="ats-skill-list">
-                {weakSkills.map((skillInfo) => (
-                  <SkillConfirmationCard
-                    key={skillInfo.skill}
-                    skillInfo={skillInfo}
-                    isPreferred={skillInfo.requirement_type === "PREFERRED"}
-                    draft={skillDrafts[skillInfo.skill] || {}}
-                    onChange={(draft) => updateDraft(skillInfo.skill, draft)}
-                    resumeEmployments={missingSkillsGroups?.resume_employments}
-                  />
-                ))}
-                {!weakSkills.length && <p className="ats-skill-meta">No weak or indirect skills need confirmation.</p>}
-              </div>
-
-              <h4>Missing — Evidence Required (Mandatory)</h4>
-              <div className="ats-skill-list">
-                {mandatorySkills.map((skillInfo) => (
-                  <SkillConfirmationCard
-                    key={skillInfo.skill}
-                    skillInfo={skillInfo}
-                    draft={skillDrafts[skillInfo.skill] || {}}
-                    onChange={(draft) => updateDraft(skillInfo.skill, draft)}
-                    resumeEmployments={missingSkillsGroups?.resume_employments}
-                  />
-                ))}
-                {!mandatorySkills.length && <p className="ats-skill-meta">No mandatory skills are missing.</p>}
-              </div>
-
-              <h4>Optional / Preferred</h4>
-              <div className="ats-skill-list">
-                {preferredSkills.map((skillInfo) => (
-                  <SkillConfirmationCard
-                    key={skillInfo.skill}
-                    skillInfo={skillInfo}
-                    isPreferred
-                    draft={skillDrafts[skillInfo.skill] || {}}
-                    onChange={(draft) => updateDraft(skillInfo.skill, draft)}
-                    resumeEmployments={missingSkillsGroups?.resume_employments}
-                  />
-                ))}
-                {!preferredSkills.length && <p className="ats-skill-meta">No preferred skills are missing.</p>}
-              </div>
+                  {unresolvedRequiredCount === 0 && canContinueToOptimization && (
+                    <p className="ats-improvement-note">All required confirmations are resolved. Preferred items are optional.</p>
+                  )}
+                </section>
+              ) : (
+                <section className="ats-evidence-confirmation">
+                  <div className="ats-section-heading"><div><h3>Tell us about the skills you selected</h3><p>Add evidence in your own words. No values are inferred or generated.</p></div><button className="text-button" onClick={() => setConfirmationStage(1)}>Edit skill selection</button></div>
+                  {confirmationSkills.filter((s) => skillDrafts[s.skill]?.answer === "has_it").map((skillInfo) => (
+                    <CompactEvidenceRow key={skillInfo.skill} skillInfo={skillInfo} draft={skillDrafts[skillInfo.skill] || {}} onChange={(draft) => updateDraft(skillInfo.skill, draft)} />
+                  ))}
+                  {!confirmationSkills.some((s) => skillDrafts[s.skill]?.answer === "has_it") && <p className="ats-skill-meta">No skills selected. Your answers will be saved as unavailable for this job.</p>}
+                  <p className="ats-confirmation-progress">{answeredDrafts.length} of {confirmationSkills.length} skills reviewed ({notFoundSkills.length} not found in resume, {weakSkills.length} possible evidence)</p>
+                </section>
+              )}
 
               <button
                 className="button primary"
-                disabled={!canSaveConfirmations || busy === "ats-skills"}
+                disabled={confirmationStage !== 2 || !canSaveConfirmations || busy === "ats-skills"}
                 onClick={handleSaveConfirmations}
               >
                 {busy === "ats-skills" ? "Saving…" : "Save Evidence"}
               </button>
+              {confirmationStage === 2 && <button className="button secondary" onClick={() => setStep(4)}>Skip for now</button>}
               <button
                 className="button secondary"
                 disabled={!canContinueToOptimization}
-                title={!canContinueToOptimization ? "Answer every mandatory skill (evidence, learning only, or I do not have this skill) first." : ""}
+                title={!canContinueToOptimization ? "Analyze a job with a valid resume first." : ""}
                 onClick={() => setStep(4)}
               >
                 Continue to Resume Generation
               </button>
             </>
+          )}
+          </>
           )}
         </Panel>
       )}
@@ -946,28 +1586,127 @@ export default function AtsAnalyzerPage() {
             <p>Not possessed: <b>{summaryCounts.notPossessed}</b></p>
             <p>Incomplete evidence: <b>{summaryCounts.incomplete}</b></p>
           </div>
-          <p>Saved evidence:</p>
+
+          <h4>Current verified from resume</h4>
           <ul className="ats-list">
-            {confirmedSkills.length
-              ? confirmedSkills.map((row) => (
-                  <li key={row.id}>
-                    {row.skill} — {row.evidence_status}
-                    <button className="text-button" onClick={() => deleteConfirmedSkill(selectedJob.id, row.id)}>Remove Confirmation</button>
+            {verifiedSkills.length
+              ? verifiedSkills.map((item) => <li key={item.skill || item.normalized_skill}>{item.skill}</li>)
+              : <li>None</li>}
+          </ul>
+
+          <h4>Current user-confirmed evidence</h4>
+          {userConfirmedEvidence.length ? (
+            <ul className="ats-evidence-rows">
+              {userConfirmedEvidence.map((row) => (
+                <li key={row.id || `${row.skill}-${row.evidence_status}`} className="ats-evidence-row">
+                  <div className="ats-evidence-copy">
+                    <b>{row.skill}</b>
+                    <span>{evidenceStatusLabel(row.evidence_status)}</span>
+                  </div>
+                  {row.id && (
+                    pendingRemove?.id === row.id ? (
+                      <div className="ats-evidence-confirm" role="group" aria-label={`Confirm removal of ${row.skill}`}>
+                        <p>
+                          Remove <b>{row.skill}</b> confirmation? This will remove your user-provided
+                          evidence for this skill and may change your ATS score.
+                        </p>
+                        <div className="ats-evidence-confirm-actions">
+                          <button
+                            type="button"
+                            className="button secondary"
+                            onClick={() => setPendingRemove(null)}
+                          >
+                            Cancel
+                          </button>
+                          <button
+                            type="button"
+                            className="button danger"
+                            disabled={busy === "ats-skills"}
+                            onClick={confirmRemoveEvidence}
+                          >
+                            {busy === "ats-skills" ? "Removing…" : "Remove"}
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        className="button danger"
+                        onClick={() => setPendingRemove({ id: row.id, skill: row.skill })}
+                        aria-label={`Remove confirmation for ${row.skill}`}
+                      >
+                        Remove Confirmation
+                      </button>
+                    )
+                  )}
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <ul className="ats-list"><li>None</li></ul>
+          )}
+
+          <h4>Unsupported requirements (Remaining Gaps)</h4>
+          <ul className="ats-list">
+            {currentUnresolvedRequired.length
+              ? currentUnresolvedRequired.map((row) => (
+                  <li key={row.id || row.normalized_skill || row.skill}>
+                    <b>{row.skill}</b>
+                    {row.evidence_status ? ` — ${evidenceStatusLabel(row.evidence_status)}` : ""}
+                    {row.reason ? ` — ${row.reason}` : " — No verified or user-confirmed professional evidence was found."}
                   </li>
                 ))
-              : <li>No additional skills confirmed — scoring will rely on the uploaded resume only.</li>}
+              : <li>None</li>}
           </ul>
+
+          <h4>Optional / preferred evidence</h4>
+          <ul className="ats-list">
+            {(optionalEvidence.length
+              ? optionalEvidence
+              : activeEvidence.filter((row) => (row.requirement_type || "").toUpperCase() === "PREFERRED")
+            ).length
+              ? (optionalEvidence.length
+                ? optionalEvidence
+                : activeEvidence.filter((row) => (row.requirement_type || "").toUpperCase() === "PREFERRED")
+              ).map((row) => (
+                <li key={row.id || row.skill}>
+                  <b>{row.skill}</b>
+                  {row.evidence_status ? ` — ${evidenceStatusLabel(row.evidence_status)}` : ""}
+                </li>
+              ))
+              : <li>None (preferred items never block generation)</li>}
+          </ul>
+
           <p>Still missing (kept out of the optimized resume, will reduce the reachable score):</p>
           <ul className="ats-list">
-            {mandatorySkills
-              .filter((s) => skillDrafts[s.skill]?.answer === "not_possessed")
-              .map((s) => <li key={s.skill}>{s.skill}</li>)}
+            {activeEvidence
+              .filter((row) => row.evidence_status === "REJECTED")
+              .map((row) => <li key={row.id || row.skill}>{row.skill}</li>)}
+            {!activeEvidence.some((row) => row.evidence_status === "REJECTED") && <li>None</li>}
           </ul>
+
+          {evidenceHistory.length > 0 && (
+            <details className="ats-evidence-history">
+              <summary>Previous evidence history (does not affect generation)</summary>
+              <ul className="ats-list">
+                {evidenceHistory.map((row) => (
+                  <li key={`hist-${row.id || row.skill}-${row.evidence_status}`}>
+                    {row.skill} — {row.evidence_status}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+
+          {stepTransitionError && (
+            <p className="ats-required-warning" role="alert">{stepTransitionError}</p>
+          )}
           <button
+            type="button"
             className="button primary"
             disabled={!canContinueToOptimization}
-            title={!canContinueToOptimization ? "Answer every mandatory skill first." : ""}
-            onClick={() => setStep(5)}
+            title={!canContinueToOptimization ? "Analyze a job with a valid resume first." : ""}
+            onClick={enterOptimizationStep}
           >
             Continue to Optimization
           </button>
@@ -975,219 +1714,138 @@ export default function AtsAnalyzerPage() {
       )}
 
       {step === 5 && (
-        <Panel title="Step 5 · Generate Optimized Resume">
-          <p className="ats-improvement-note">
-            Your final score is based on verified resume evidence and the current skills you confirmed.
-            Selecting a skill without supporting details will not increase your score.
-          </p>
-          <button
-            className="button primary"
-            disabled={Boolean(disabledReason) || busy === "ats"}
-            onClick={() => selectedJob && analyzeAndOptimize(selectedJob.id).then(() => setStep(6))}
-          >
-            {busy === "ats" ? "Processing…" : "Generate Optimized Resume"}
-          </button>
-          {status && <PipelineProgress status={status} />}
-        </Panel>
-      )}
-
-      {result && majorMismatch && (
-        <section className="ats-major-warning" role="alert">
-          <h3>Major role mismatch detected</h3>
-          <p>The uploaded resume is primarily aligned with {listText(resumeRoles)}, while this job requires {targetRole || "a different core role"} experience.</p>
-          <p>This optimizer will not add unsupported technologies or experience.</p>
-          <p>{result.warning || result.original_analysis?.warning_message}</p>
-        </section>
-      )}
-
-      {step === 6 && (
-        <Panel title={`Step 6 · Validate Resume · ${result?.final_validation?.status || "—"}`}>
-          {!result ? (
-            <EmptyState title="No validation yet" text="Generate the optimized resume in Step 5 first." />
-          ) : (
-            <div className="document-grid">
-              <Panel title="Final Validation">
-                <ul className="ats-list">
-                  {warnings.map((item, index) => <li key={`w-${index}`}>{item}</li>)}
-                  {(result.final_validation?.errors || []).map((item, index) => (
-                    <li key={`e-${index}`} className="ats-error">{item}</li>
-                  ))}
-                  {!warnings.length && !result.final_validation?.errors?.length && <li>No validation warnings.</li>}
-                </ul>
-              </Panel>
-              <Panel title="Technology Validation">
-                <p><b>Selected:</b> {listText(result.technology_validation?.selectedTechnologies)}</p>
-                <p><b>Rejected:</b> {listText(result.technology_validation?.rejectedTechnologies)}</p>
-              </Panel>
-              <Panel title="Client Validation">
-                <p><b>Domain:</b> {result.client_validation?.detectedClientDomain || "—"}</p>
-              </Panel>
+        <div className="rw-step5">
+          <header className="rw-step5-intro">
+            <div>
+              <h2>Step 5 · Generate / Edit / Score / Download</h2>
+              <p>
+                Generate a truthful, job-aligned resume, then edit it in a professional document workspace.
+                Original and optimized scores use the same ATS engine — unsupported requirements stay in Remaining Gaps.
+              </p>
             </div>
+            {!isComplete && (
+              <div className="ats-confirmation-actions">
+                <button
+                  type="button"
+                  className="button primary"
+                  disabled={Boolean(disabledReason) || busy === "ats" || !canContinueToOptimization}
+                  title={
+                    !canContinueToOptimization
+                      ? (disabledReason || "Analyze a job with a valid resume first.")
+                      : ""
+                  }
+                  onClick={runGenerateOptimizedResume}
+                >
+                  {busy === "ats" ? "Generating optimized resume…" : "Generate Optimized Resume"}
+                </button>
+              </div>
+            )}
+          </header>
+
+          {stepTransitionError && (
+            <p className="ats-required-warning" role="alert">{stepTransitionError}</p>
           )}
-          <button className="button primary" disabled={status !== "COMPLETED"} onClick={() => setStep(7)}>
-            Continue to Score Comparison
-          </button>
-        </Panel>
-      )}
-
-      {step === 7 && (!result ? (
-        <EmptyState
-          title="No ATS result yet"
-          text="Complete Step 5 (Generate Optimized Resume) first."
-        />
-      ) : (
-        <>
-          <Panel title="Step 7 · Compare Scores">
-            <div className="ats-score-row">
-              <ScoreCard label="Original Resume Match" score={originalScore} />
-              <ScoreCard label="Optimized Resume Match" score={optimizedScore} tone="good" />
-              <div className="ats-score-card accent">
-                <span>Improvement</span>
-                <b>{Number.isFinite(Number(improvement)) ? `${Number(improvement) >= 0 ? "+" : ""}${Math.round(Number(improvement))}` : "—"}</b>
-              </div>
-            </div>
-
-            {optimizationStatus === "NO_MEANINGFUL_CHANGE" && (
-              <div className="ats-gap-banner" role="alert">
-                The generated resume is identical to the original resume. No unsupported keywords or claims
-                were added, so the score could not change. Confirm more current skills with evidence in Step 3
-                to unlock further truthful improvements.
-              </div>
-            )}
-            {contentChanged && confirmedSkillsUsed.length > 0 && (
-              <div className="ats-gap-banner ats-gap-banner-info">
-                Score includes user-confirmed experience not present in the uploaded resume: {listText(confirmedSkillsUsed)}.
-              </div>
-            )}
-            {whyNot95 && (
-              <div className="ats-why-not-95">
-                <b>Why not 95%?</b>
-                <p>{whyNot95}</p>
-              </div>
-            )}
-
-            <ImprovementReportPanel report={improvementReport} />
-
-            <Panel title="Why this score?">
-              <div className="ats-score-explanation">
-                <p><b>Match label:</b> {scoreStatus || "—"}</p>
-                <p><b>Role alignment:</b> {listText(resumeRoles)} versus {targetRole || "—"} — {roleAlignment || "—"}</p>
-                <p><b>Core matched skills:</b> {listText(matchedCore)}</p>
-                <p><b>Transferable matched skills:</b> {listText(matchedTransferable)}</p>
-                <p><b>Missing mandatory skills:</b> {listText(missingMandatory)}</p>
-                <p><b>Score cap:</b> {scoreCap ? `${scoreCap}% — ${scoreCapReason}` : "No eligibility cap applied"}</p>
-                <p><b>Recommendation:</b> {result.final_recommendation || result.original_analysis?.recommendation || "—"}</p>
-              </div>
-            </Panel>
-            <p className="ats-improvement-note">
-              Improvement = optimized score − original score (percentage points). Scores are never forced upward — truthfulness wins.
+          {busy === "ats" && <p className="ats-generation-indicator">Generating optimized resume…</p>}
+          {generationLabel && (
+            <p className="ats-generation-indicator" title={fallbackReason || undefined}>
+              {generationLabel}
+              {fallbackReason ? ` · ${fallbackReason}` : ""}
             </p>
-            {result.error_message && <Notice>{result.error_message}</Notice>}
-            <button
-              className="button secondary"
-              onClick={() => selectedJob && analyzeAndOptimize(selectedJob.id, true)}
-              disabled={Boolean(disabledReason) || busy === "ats"}
-            >
-              Recalculate Scores
-            </button>
-          </Panel>
+          )}
+          {canContinueToOptimization && (
+            <RemainingGapsPanel items={isComplete ? authoritativeRemainingGaps : currentUnresolvedRequired} />
+          )}
+          {!canContinueToOptimization && (
+            <p className="ats-required-warning">
+              {disabledReason || "Upload a resume and analyze a job before generating."}
+            </p>
+          )}
+          {messages.ats && result?.workflow_status && result.workflow_status !== "COMPLETED" && busy !== "ats"
+            && ["FAILED", "VALIDATION_FAILED"].includes(String(result.workflow_status))
+            && !(canContinueToOptimization && /evidence incomplete/i.test(String(messages.ats))) && (
+            <p className="ats-required-warning">{/timed out waiting/i.test(String(messages.ats)) ? "Resume generation could not be completed." : messages.ats}</p>
+          )}
+          {status && !isComplete
+            && !(status === "FAILED" && /evidence incomplete/i.test(String(result?.error_message || messages.ats || "")))
+            && <PipelineProgress status={status} />}
 
-          <div className="ats-tabs">
-            {[
-              ["keywords", "Matched Keywords"],
-              ["missing", "Missing Keywords"],
-              ["suggestions", "Suggestions"],
-              ["resume", "Optimized Resume"],
-            ].map(([key, label]) => (
-              <button
-                key={key}
-                type="button"
-                className={`button ${activeTab === key ? "primary" : "secondary"}`}
-                onClick={() => setActiveTab(key)}
-              >
-                {label}
-              </button>
-            ))}
-          </div>
-
-          {activeTab === "keywords" && (
-            <div className="document-grid">
-              <Panel title="Original Matched Keywords"><p>{listText(matchedBefore)}</p></Panel>
-              <Panel title="Optimized Matched Keywords"><p>{listText(matchedAfter)}</p></Panel>
-              <Panel title="Newly Matched Keywords"><p>{listText(newlyMatched)}</p></Panel>
-            </div>
+          {result && majorMismatch && (
+            <section className="ats-major-warning" role="alert">
+              <h3>Major role mismatch detected</h3>
+              <p>The uploaded resume is primarily aligned with {listText(resumeRoles)}, while this job requires {targetRole || "a different core role"} experience.</p>
+              <p>This optimizer will not add unsupported technologies or experience.</p>
+              <p>{result.warning || result.original_analysis?.warning_message}</p>
+            </section>
           )}
 
-          {activeTab === "missing" && (
-            <div className="document-grid">
-              <Panel title="Original Missing Keywords"><p>{listText(missingBefore)}</p></Panel>
-              <Panel title="Remaining Missing Keywords"><p>{listText(missingAfter)}</p></Panel>
-              <Panel title="Unsupported Keywords Not Added">
-                <p>{listText(unsupported)}</p>
-                {unsupported?.length > 0 && (
-                  <p className="ats-improvement-note">
-                    Truthfulness warning: these keywords were not added because the original resume does not provide verified experience.
-                  </p>
-                )}
-              </Panel>
-            </div>
-          )}
-
-          {activeTab === "suggestions" && (
-            <Panel title="Suggestions">
-              <ul className="ats-list">
-                {(result.final_suggestions || result.recommendations || result.optimization_notes || result.original_suggestions || []).map((item, index) => (
-                  <li key={`s-${index}`}>{item}</li>
-                ))}
-              </ul>
-              {result.final_recommendation && <p><b>Recommendation:</b> {result.final_recommendation}</p>}
-            </Panel>
-          )}
-
-          {activeTab === "resume" && (
+          {isComplete && (
             <>
-              <div className="ats-resume-toolbar">
-                <button
-                  className={`button ${viewMode === "original" ? "primary" : "secondary"}`}
-                  onClick={() => setViewMode("original")}
-                >
-                  View Original Resume
-                </button>
-                <button
-                  className={`button ${viewMode === "optimized" ? "primary" : "secondary"}`}
-                  onClick={() => setViewMode("optimized")}
-                >
-                  Preview Optimized Resume
-                </button>
-                {isComplete && result.workflow_id && (
-                  <a
-                    className="button secondary"
-                    href={getAtsDownloadUrl(result.workflow_id)}
-                    target="_blank"
-                    rel="noreferrer"
-                  >
-                    {safeToApply ? "Download Optimized Resume" : "Download Truth-Preserving Version"}
-                  </a>
-                )}
-              </div>
-              <Panel title={viewMode === "original" ? "Original Resume" : safeToApply ? "ATS-Optimized Resume" : "Transferable Skills Resume — Major Gaps Remain"}>
-                <div className="text-preview tall">
-                  {viewMode === "original"
-                    ? result.original_resume || latestResume?.text_preview || "Original resume text unavailable."
-                    : generatedPreview || "Optimized resume text unavailable."}
+              {optimizationStatus === "NO_MEANINGFUL_CHANGE" && (
+                <div className="ats-gap-banner" role="alert">
+                  Your resume is already strongly aligned with this job. No additional evidence-backed
+                  changes were available to safely increase the score.
                 </div>
-              </Panel>
+              )}
+              {optimizationStatus === "NO_IMPROVEMENT" && (
+                <div className="ats-gap-banner" role="alert">
+                  Content was updated, but the ATS score did not increase under truthfulness constraints.
+                  Confirm additional genuine skills with evidence or edit the resume below.
+                </div>
+              )}
+              {whyNot95 && (
+                <div className="ats-why-not-95">
+                  <b>Why not 95%?</b>
+                  <p>{whyNot95}</p>
+                </div>
+              )}
+
+              {(workspaceDocument || editableResume || generatedPlain) ? (
+                <ResumeWorkspace
+                  key={result.optimized_resume_id || "workspace"}
+                  initialDocument={workspaceDocument}
+                  initialText={editableResume?.final_text || generatedPlain || generatedPreview || ""}
+                  originalScore={originalScore}
+                  initialCurrentScore={editResult?.edited_score ?? optimizedScore}
+                  initialScore={editResult?.score || editableResume?.score || optimizedScoreView || null}
+                  improvementReport={improvementReport}
+                  resultMeta={{
+                    content_changed: contentChanged,
+                    confirmed_skills_used: confirmedSkillsUsed,
+                    unsupported_keywords_not_added: unsupported,
+                  }}
+                  gapsUnsupported={gapItemsFromScoreView(optimizedScoreView || editResult?.score, result).map((item) => item.skill)}
+                  gapsPreferred={
+                    (optimizedScoreView?.remaining_gaps?.preferred_gaps
+                      || optimizedScoreView?.preferred_requirements?.missing
+                      || result?.optimized_analysis?.missing_preferred_skills
+                      || [])
+                  }
+                  confirmedSkillsIncorporated={confirmedSkillsUsed}
+                  generationLabel={generationLabel}
+                  fallbackReason={fallbackReason}
+                  downloadDocxUrl={
+                    result.optimized_resume_id && (editResult?.safe_to_download ?? result?.validation_passed ?? isComplete)
+                      ? getFinalResumeDownloadUrl(currentUser.user_id, selectedJob.id, result.optimized_resume_id, "docx")
+                      : null
+                  }
+                  downloadPdfUrl={
+                    result.optimized_resume_id && (editResult?.safe_to_download ?? result?.validation_passed ?? isComplete)
+                      ? getFinalResumeDownloadUrl(currentUser.user_id, selectedJob.id, result.optimized_resume_id, "pdf")
+                      : null
+                  }
+                  onSave={saveWorkspace}
+                  onScore={scoreWorkspace}
+                  onImprove={improveWorkspaceSnippet}
+                  onRegenerate={runGenerateOptimizedResume}
+                  generating={busy === "ats"}
+                />
+              ) : (
+                <EmptyState title="Resume workspace loading" text="Preparing your editable optimized resume…" />
+              )}
             </>
           )}
-
-          {jobInfo?.job_url && majorMismatch && (
-            <div className="ats-risk-ack">
-              <label><input type="checkbox" checked={riskAcknowledged} onChange={(event) => setRiskAcknowledged(event.target.checked)} /> I understand that my resume does not currently meet the core role requirements.</label>
-              <a className={`button secondary ${riskAcknowledged ? "" : "disabled"}`} href={riskAcknowledged ? jobInfo.job_url : undefined} target="_blank" rel="noreferrer" aria-disabled={!riskAcknowledged}>View Job / Apply</a>
-            </div>
-          )}
-        </>
-      ))}
+        </div>
+      )}
     </Page>
   );
 }

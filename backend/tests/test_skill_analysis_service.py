@@ -26,7 +26,9 @@ class SkillAnalysisServiceTests(unittest.TestCase):
         result = get_skill_evidence("Maven", resume_text)
         self.assertEqual(result["resume_status"], "VERIFIED")
         self.assertTrue(result["found"])
-        self.assertFalse(result["needs_evidence"])
+        # Skills-list-only keyword is found (not missing) but may need confirmation.
+        self.assertEqual(result["evidence_strength"], "weak")
+        self.assertTrue(result["needs_user_confirmation"])
 
     def test_b_apache_maven_alias_verified(self):
         resume_text = "Build tools include Apache Maven and Gradle"
@@ -149,7 +151,7 @@ class SkillAnalysisServiceTests(unittest.TestCase):
         self.assertTrue({"maven", "apache maven", "mvn"}.issubset(MAVEN_ALIASES))
         self.assertEqual(normalize_skill_name("mvn"), "maven")
         self.assertEqual(normalize_skill_name("Apache Maven"), "maven")
-        self.assertEqual(SKILL_ANALYSIS_VERSION, "2")
+        self.assertEqual(SKILL_ANALYSIS_VERSION, "8-capability-contextual-evidence")
 
     def test_find_skill_evidence_api(self):
         result = find_skill_evidence("Maven", "Used Maven for dependency management")
@@ -175,6 +177,19 @@ class SkillAnalysisServiceTests(unittest.TestCase):
         result = get_skill_evidence("Java", "Technical Skills\nJavaScript")
         self.assertEqual(result["resume_status"], "MISSING")
 
+    def test_requested_canonical_aliases_are_verified_not_missing(self):
+        cases = {
+            "JPA": "Used jakarta.persistence for entity mapping.",
+            "JavaScript": "Technical Skills: JS",
+            "TypeScript": "Built the frontend with TS.",
+            "Kubernetes": "Deployed services to K8s.",
+        }
+        for skill, resume in cases.items():
+            with self.subTest(skill=skill):
+                evidence = get_skill_evidence(skill, resume)
+                self.assertEqual(evidence["resume_status"], "VERIFIED")
+                self.assertIn(evidence["match_type"], {"ALIAS", "CONTEXTUAL"})
+
     def test_special_terms_are_boundary_safe(self):
         resume = "C++, C#, .NET, Node.js and CI/CD"
         for skill in ["C++", "C#", ".NET", "Node.js", "CI/CD"]:
@@ -195,8 +210,117 @@ class SkillAnalysisServiceTests(unittest.TestCase):
         )
         saved = db.add.call_args[0][0]
         payload = json.loads(saved.analysis_json)
-        self.assertEqual(payload["cache_identity"]["analysis_version"], "2")
+        self.assertEqual(payload["cache_identity"]["analysis_version"], "8-capability-contextual-evidence")
         self.assertEqual(payload["cache_identity"]["resume_id"], 8)
+
+    def test_broad_action_verbs_promote_professional_evidence(self):
+        # These verbs are common in DevOps/SRE/platform bullets but were previously
+        # absent from the narrow usage-context whitelist, silently degrading strength.
+        preamble = "Jane Candidate\n\n"
+        cases = {
+            "Linux": preamble + "Professional Experience\nAcme | Engineer | 2020 - Present\n- Administered Linux servers for production workloads.",
+            "AWS": preamble + "Professional Experience\nAcme | Engineer | 2020 - Present\n- Provisioned AWS infrastructure for the platform team.",
+            "Jenkins": preamble + "Professional Experience\nAcme | Engineer | 2020 - Present\n- Automated build pipelines using Jenkins.",
+            "Kubernetes": preamble + "Professional Experience\nAcme | Engineer | 2020 - Present\n- Migrated workloads to Kubernetes across regions.",
+        }
+        for skill, resume in cases.items():
+            with self.subTest(skill=skill):
+                evidence = get_skill_evidence(skill, resume)
+                self.assertEqual(evidence["resume_status"], "VERIFIED")
+                self.assertEqual(evidence["evidence_strength"], "strong")
+
+    def test_build_tools_category_label_is_not_a_false_usage_signal(self):
+        """Regression guard: 'Build Tools: Maven, Gradle' is a category label, not
+        evidence that the candidate 'built' something — must stay ALIAS, not be
+        mislabeled CONTEXTUAL just because the word 'Build' appears."""
+        result = get_skill_evidence("Maven", "Build tools include Apache Maven and Gradle")
+        self.assertEqual(result["resume_status"], "VERIFIED")
+        self.assertEqual(result["match_type"], "ALIAS")
+
+    def test_monitoring_category_label_is_not_strong_usage(self):
+        resume = "Technical Skills\nMonitoring: Prometheus, Grafana, Datadog"
+        evidence = get_skill_evidence("Datadog", resume)
+        self.assertEqual(evidence["resume_status"], "VERIFIED")
+        self.assertEqual(evidence["evidence_strength"], "weak")
+        self.assertNotEqual(evidence["match_type"], "CONTEXTUAL")
+
+    def test_non_standard_experience_headings_yield_strong_evidence(self):
+        for heading in ["Work History", "Career History", "Relevant Experience", "Employment"]:
+            resume = (
+                f"Jane Candidate\n\n{heading}\nAcme | DevOps Engineer | Jan 2020 - Present\n"
+                "- Built CI/CD pipelines using Jenkins and deployed services to Kubernetes."
+            )
+            with self.subTest(heading=heading):
+                evidence = get_skill_evidence("Kubernetes", resume)
+                self.assertEqual(evidence["resume_status"], "VERIFIED")
+                self.assertEqual(evidence["evidence_strength"], "strong")
+
+    def test_headingless_resume_still_yields_strong_evidence(self):
+        resume = (
+            "Jane Candidate\n\n"
+            "DevOps Engineer with cloud experience.\n\n"
+            "Skills: AWS, Terraform, Kubernetes\n\n"
+            "Senior DevOps Engineer | Acme Corp | Jan 2021 - Present\n"
+            "- Provisioned AWS infrastructure using Terraform for production workloads.\n"
+            "- Orchestrated deployments on Kubernetes across multiple environments.\n"
+        )
+        for skill in ["AWS", "Terraform", "Kubernetes"]:
+            with self.subTest(skill=skill):
+                evidence = get_skill_evidence(skill, resume)
+                self.assertEqual(evidence["resume_status"], "VERIFIED")
+                self.assertEqual(evidence["evidence_strength"], "strong")
+
+    def test_skills_list_only_mention_remains_weak_not_missing(self):
+        """A skill with no professional usage context must be distinguished from a
+        skill that is genuinely absent — 'weak' means found-needs-confirmation, not
+        not-found."""
+        resume = "Technical Skills\nDatadog, Splunk, Java, AWS"
+        evidence = get_skill_evidence("Datadog", resume)
+        self.assertEqual(evidence["resume_status"], "VERIFIED")
+        self.assertEqual(evidence["evidence_strength"], "weak")
+        self.assertTrue(evidence["found"])
+        self.assertTrue(evidence["needs_user_confirmation"])
+        self.assertTrue(evidence["needs_evidence"])
+
+    def test_genuinely_absent_skill_is_missing(self):
+        resume = "Technical Skills\nDatadog, Splunk, Java, AWS"
+        evidence = get_skill_evidence("ArgoCD", resume)
+        self.assertEqual(evidence["resume_status"], "MISSING")
+        self.assertFalse(evidence["found"])
+
+    def test_skills_list_plus_usage_outside_skills_is_strong(self):
+        """Regression: skills-section hits must not force WEAK when usage-verb bullets
+        prove the same skill — even if PDF parsing folds those bullets into Skills."""
+        resume = """
+Jane Candidate
+
+Technical Skills
+AWS, Kubernetes, Docker, Terraform
+Acme Corp | Engineer | Jan 2020 - Present
+- Provisioned AWS infrastructure using Terraform for production workloads.
+- Deployed containerized services to Kubernetes with Docker.
+"""
+        for skill in ["AWS", "Kubernetes", "Docker", "Terraform"]:
+            with self.subTest(skill=skill):
+                evidence = get_skill_evidence(skill, resume)
+                self.assertEqual(evidence["resume_status"], "VERIFIED")
+                self.assertEqual(evidence["evidence_strength"], "strong")
+                self.assertFalse(evidence["needs_user_confirmation"])
+
+    def test_compact_pdf_style_resume_with_usage_is_strong(self):
+        resume = (
+            "Jane Doe DevOps Engineer jane@example.com\n"
+            "Senior engineer skilled in AWS Kubernetes Docker Terraform\n"
+            "Acme Corp | Senior DevOps Engineer | Jan 2020 - Present\n"
+            "Provisioned AWS infrastructure using Terraform modules\n"
+            "Deployed applications to Kubernetes using Helm\n"
+            "Containerized services with Docker\n"
+        )
+        for skill in ["AWS", "Kubernetes", "Docker", "Terraform"]:
+            with self.subTest(skill=skill):
+                evidence = get_skill_evidence(skill, resume)
+                self.assertEqual(evidence["resume_status"], "VERIFIED")
+                self.assertEqual(evidence["evidence_strength"], "strong")
 
 
 if __name__ == "__main__":

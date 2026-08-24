@@ -75,6 +75,10 @@ def contains_keyword(text: str, keyword: str) -> bool:
     if key == "angular":
         scrubbed = re.sub(r"angularjs", " ", lowered, flags=re.I)
         return bool(_boundary_pattern("angular").search(scrubbed))
+    if key == "azure":
+        # Do not treat Azure DevOps as Azure cloud platform evidence/requirement.
+        scrubbed = re.sub(r"azure\s*devops", " ", lowered, flags=re.I)
+        return bool(_boundary_pattern("azure").search(scrubbed))
     return bool(_boundary_pattern(canonical).search(text))
 
 
@@ -97,7 +101,8 @@ def extract_job_keywords(job_title: str, job_description: str, skills_required: 
 
     required = []
     # Skills field terms are treated as required/preferred signal
-    for part in re.split(r"[,;/\n|]+", skills_field):
+    # Do not split on '/' — that would turn CI/CD into CI and CD.
+    for part in re.split(r"[,;\n|]+", skills_field):
         part = part.strip()
         if len(part) < 2:
             continue
@@ -150,12 +155,35 @@ def select_supported_keywords(
     resume_text: str,
     verified_skills: list[str] | None = None,
 ) -> dict:
-    verified = [normalize_keyword(s) for s in (verified_skills or []) if s]
+    """JD keywords present in resume text or accepted verified/confirmed skill aliases."""
+    from app.services.skill_analysis_service import normalize_skill_name
+
+    verified_forms: set[str] = set()
+    for skill in verified_skills or []:
+        if not skill:
+            continue
+        display = normalize_keyword(skill)
+        verified_forms.update({
+            skill,
+            str(skill).lower(),
+            display,
+            str(display).lower(),
+            normalize_skill_name(skill),
+            normalize_skill_name(display),
+        })
     supported = []
     unsupported = []
     for keyword in jd_keywords:
         canonical = normalize_keyword(keyword)
-        if contains_keyword(resume_text, canonical) or canonical in verified:
+        forms = {
+            keyword,
+            str(keyword).lower(),
+            canonical,
+            str(canonical).lower(),
+            normalize_skill_name(keyword),
+            normalize_skill_name(canonical),
+        }
+        if contains_keyword(resume_text, canonical) or (forms & verified_forms):
             if canonical not in supported:
                 supported.append(canonical)
         else:

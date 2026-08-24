@@ -1,0 +1,8 @@
+Test Candidate
+
+Technical Skills
+Java, Maven, AWS
+
+Professional Experience
+Example Company | Java Engineer | 2021 - Present
+- Built Java services and used Maven for dependency management.

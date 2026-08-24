@@ -1,0 +1,14 @@
+[run]
+branch = True
+source = app
+omit =
+    */__init__.py
+
+[report]
+show_missing = True
+skip_covered = False
+fail_under = 85
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    if __name__ == .__main__.:

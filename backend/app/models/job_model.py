@@ -21,6 +21,6 @@ class Job(Base):
     skills_required = Column(Text, nullable=False)
 
     source = Column(String(100), nullable=False, default="Mock Data")
-    job_url = Column(String(500), nullable=True)
+    job_url = Column(Text, nullable=True)
 
     discovered_at = Column(DateTime(timezone=True), server_default=func.now())

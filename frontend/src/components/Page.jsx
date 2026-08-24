@@ -71,6 +71,8 @@ export function Panel({ title, subtitle, actions, children, className = "" }) {
   </section>;
 }
 
-export function Notice({ children }) {
-  return children ? <div className="notice">{children}</div> : null;
+export function Notice({ children, tone }) {
+  if (!children) return null;
+  const toneClass = tone === "error" ? " error" : tone === "warning" ? " warning" : "";
+  return <div className={`notice${toneClass}`}>{children}</div>;
 }

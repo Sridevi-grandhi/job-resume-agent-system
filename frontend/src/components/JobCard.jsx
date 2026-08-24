@@ -1,5 +1,6 @@
 import { useNavigate } from "react-router-dom";
 import { useApp } from "../context/AppContext";
+import MatchScoreBadge from "./MatchScoreBadge";
 import StatusBadge from "./StatusBadge";
 
 const genericSearchSources = new Set([
@@ -60,13 +61,13 @@ export default function JobCard({ job, compact = false, selected = false, onRemo
     <div className="company-mark">{(job.company || job.source || "J")[0].toUpperCase()}</div>
     <div className="job-copy">
       <div className="job-title-row">
-        <div>
+        <div className="job-title-copy">
           <h3>{job.title || "Job opportunity"}</h3>
           <p>{job.company || job.source || "Unknown company"} · {job.location || "Location not listed"}</p>
         </div>
         <div className="job-match-badges">
           {originalMatch != null && isRealJob && (
-            <StatusBadge tone="neutral">Resume Match {Math.round(originalMatch)}%</StatusBadge>
+            <MatchScoreBadge score={originalMatch} />
           )}
           {genericSearchSources.has(job.source) && (
             <StatusBadge tone="neutral">Match unavailable</StatusBadge>
@@ -105,7 +106,12 @@ export default function JobCard({ job, compact = false, selected = false, onRemo
           {isRemotive ? "Optimize Resume for This Job" : "Optimize and Compare Scores"}
         </button>
         {selected && (
-          <button className="button danger" onClick={onRemove} disabled={removing}>
+          <button
+            className="button danger"
+            onClick={onRemove}
+            disabled={removing}
+            aria-label={`Remove job ${job.title || ""}`.trim()}
+          >
             {removing ? "Removing..." : "Remove Job"}
           </button>
         )}

@@ -17,33 +17,39 @@ from app.models.ats_optimization_workflow_model import AtsOptimizationWorkflow
 from app.models.job_model import Job
 from app.models.resume_model import Resume
 from app.models.user_model import User
+from app.models.user_preference_model import UserPreference
 from app.services.ats_optimization_workflow_service import (
     execute_workflow,
     run_workflow_job,
     start_or_get_workflow,
     workflow_to_dict,
+    optimization_eligibility,
+    role_aware_optimization_eligibility,
 )
+from app.services.ats_scoring import ANALYSIS_VERSION, calculate_weighted_ats_score, classify_role
 from app.services.job_eligibility import is_generic_search_link_job, job_is_analyzable
 from app.services.requirement_extraction_service import (
     extract_job_requirement_analysis,
     group_requirements_vs_resume,
+    group_canonical_score_evidence,
     load_requirement_analysis,
     merge_with_resume_evidence,
     save_requirement_analysis,
 )
-from app.services.resume_optimization_match_service import optimize_and_match
+from app.services.llm_client import generation_timeout_config
 from app.services.resume_structure_parser import parse_resume_structure
 from app.services.skill_confirmation_service import (
-    confirmed_skill_to_dict,
     delete_confirmed_skill,
-    load_confirmed_skills,
+    evaluate_generation_readiness,
+    reconcile_confirmations_with_analysis,
     save_evidence,
+    summarize_active_evidence,
 )
 from app.services.skill_analysis_service import (
-    ANALYSIS_VERSION,
     MAVEN_ALIASES,
     content_hash,
     find_skill_evidence,
+    normalize_skill_name,
 )
 
 
@@ -80,19 +86,32 @@ def _latest_resume(db: Session, user_id: int) -> Resume | None:
     )
 
 
-def _analysis_identity(user_id: int, job: Job, resume: Resume | None) -> dict:
+def _analysis_identity(db: Session, user_id: int, job: Job, resume: Resume | None) -> dict:
     resume_text = (resume.parsed_text if resume else "") or ""
+    preference = db.query(UserPreference).filter(UserPreference.user_id == user_id).first()
     job_text = "\n".join([
         job.title or "", job.description or "", job.skills_required or "",
         job.location or "", job.work_mode or "", job.job_type or "",
+        # Context-only cache discriminator. This value is never passed to the
+        # resume classifier or scorer as candidate evidence.
+        getattr(preference, "job_title", "") or "",
+        getattr(preference, "skills", "") or "",
+        str(getattr(preference, "updated_at", "") or getattr(preference, "created_at", "") or ""),
     ])
+    resume_hash = content_hash(resume_text)
+    job_hash = content_hash(job_text)
+    resume_id = resume.id if resume else None
+    # Stable current-analysis scope key (not only user+job).
+    workflow_run_id = f"{user_id}:{job.id}:{resume_id or 0}:{resume_hash[:12]}:{job_hash[:12]}:{ANALYSIS_VERSION}"
     return {
         "user_id": user_id,
         "job_id": job.id,
-        "resume_id": resume.id if resume else None,
-        "resume_hash": content_hash(resume_text),
-        "job_hash": content_hash(job_text),
+        "resume_id": resume_id,
+        "resume_hash": resume_hash,
+        "job_hash": job_hash,
         "analysis_version": ANALYSIS_VERSION,
+        "analysis_id": workflow_run_id,
+        "workflow_run_id": workflow_run_id,
     }
 
 
@@ -105,7 +124,7 @@ def _resolve_requirement_analysis(
     force_refresh: bool = False,
 ) -> tuple[dict, bool]:
     """Return (analysis, cache_used). Regenerates when identity mismatches or force_refresh."""
-    identity = _analysis_identity(user_id, job, resume)
+    identity = _analysis_identity(db, user_id, job, resume)
     if force_refresh:
         analysis = extract_job_requirement_analysis(job)
         save_requirement_analysis(db, analysis=analysis, **{k: identity[k] for k in ("user_id", "job_id", "resume_id", "resume_hash", "job_hash")})
@@ -129,7 +148,7 @@ def _resolve_requirement_analysis(
 def get_job_requirements(user_id: int, job_id: int, db: Session = Depends(get_db)):
     _user, job = _load_user_and_job(db, user_id, job_id)
     resume = _latest_resume(db, user_id)
-    identity = _analysis_identity(user_id, job, resume)
+    identity = _analysis_identity(db, user_id, job, resume)
     analysis = extract_job_requirement_analysis(job)
     save_requirement_analysis(
         db,
@@ -140,7 +159,11 @@ def get_job_requirements(user_id: int, job_id: int, db: Session = Depends(get_db
         resume_hash=identity["resume_hash"],
         job_hash=identity["job_hash"],
     )
-    enriched = merge_with_resume_evidence(analysis, resume.parsed_text if resume else "")
+    if resume:
+        score = calculate_weighted_ats_score(resume.parsed_text or "", job)
+        grouped = group_canonical_score_evidence(score, job.id)
+        return {**identity, **analysis, **grouped}
+    enriched = merge_with_resume_evidence(analysis, "")
     return {**identity, **enriched}
 
 
@@ -165,6 +188,51 @@ def _resume_employments(resume_text: str) -> list[dict]:
     ]
 
 
+def _attach_confirmation_workflow_state(
+    db: Session,
+    *,
+    user_id: int,
+    job_id: int,
+    resume: Resume | None,
+    grouped: dict,
+    workflow_run_id: str | None = None,
+    resume_hash: str | None = None,
+) -> dict:
+    """Reconcile stale confirmations and attach generation readiness to analysis payload."""
+    rows = reconcile_confirmations_with_analysis(
+        db,
+        user_id=user_id,
+        job_id=job_id,
+        resume_id=resume.id if resume else None,
+        grouped_analysis=grouped,
+        workflow_run_id=workflow_run_id or grouped.get("workflow_run_id"),
+        resume_hash=resume_hash or grouped.get("resume_hash"),
+    )
+    readiness = evaluate_generation_readiness(grouped, rows)
+    summary = summarize_active_evidence(grouped, rows)
+    # Evidence gaps never block generation — keep can_generate_resume true for valid analysis.
+    readiness["can_generate_resume"] = True
+    readiness["blocking_reasons"] = []
+    grouped.update(readiness)
+    grouped["evidence_summary"] = summary
+    grouped["evidence"] = summary["evidence"]
+    grouped["evidence_history"] = summary.get("evidence_history") or []
+    grouped["active_confirmation_counts"] = summary["counts"]
+    warnings = readiness.get("generation_warnings") or []
+    if warnings:
+        skills = ", ".join(item["skill"] for item in warnings if item.get("skill"))
+        grouped["generation_warning_message"] = (
+            f"{skills} {'is' if len(warnings) == 1 else 'are'} not supported and will remain "
+            "a gap. Generation can continue; unsupported requirements will be excluded."
+        )
+        # Legacy field: do not phrase as a hard block — UI treats this as a warning.
+        grouped["generation_blocked_message"] = ""
+    else:
+        grouped["generation_warning_message"] = ""
+        grouped["generation_blocked_message"] = ""
+    return grouped
+
+
 @router.get("/missing-skills/{user_id}/{job_id}")
 def get_missing_skills(
     user_id: int,
@@ -175,11 +243,85 @@ def get_missing_skills(
     _user, job = _load_user_and_job(db, user_id, job_id)
     resume = _latest_resume(db, user_id)
     resume_text = (resume.parsed_text if resume else "") or ""
-    identity = _analysis_identity(user_id, job, resume)
+    identity = _analysis_identity(db, user_id, job, resume)
+    jd_text = (job.description or "").strip()
+    skills_field = (job.skills_required or "").strip()
+    jd_length = len(jd_text) + len(skills_field)
+
+    logger.info(
+        "ANALYSIS_START user_id=%s resume_id=%s job_id=%s analysis_id=%s jd_len=%s resume_len=%s",
+        user_id,
+        identity.get("resume_id"),
+        job_id,
+        identity.get("analysis_id"),
+        jd_length,
+        len(resume_text),
+    )
+
     analysis, cache_used = _resolve_requirement_analysis(
         db, user_id=user_id, job=job, resume=resume, force_refresh=force_refresh,
     )
-    grouped = group_requirements_vs_resume(analysis, resume_text)
+    # Keep analysis for observability; scoring regenerates the authoritative requirements.
+    score = calculate_weighted_ats_score(resume_text, job)
+    requirements = score.get("requirements") or {}
+    mandatory_count = len(requirements.get("required_core_skills") or [])
+    preferred_count = len(requirements.get("preferred_skills") or [])
+    or_group_count = len(requirements.get("or_groups") or [])
+
+    # Empty extraction on a non-trivial JD is an analysis failure — never a valid 0/0/0/0 success.
+    if jd_length >= 80 and mandatory_count == 0 and preferred_count == 0:
+        logger.error(
+            "REQUIREMENT_EXTRACTION_EMPTY user_id=%s job_id=%s resume_id=%s jd_len=%s cached_analysis_keys=%s",
+            user_id,
+            job_id,
+            identity.get("resume_id"),
+            jd_length,
+            list((analysis or {}).keys())[:12],
+        )
+        return {
+            **identity,
+            "analysis_status": "REQUIREMENT_EXTRACTION_FAILED",
+            "analysis_error": "We could not extract requirements from this job description. Please retry.",
+            "cache_used": cache_used,
+            "force_refresh": force_refresh,
+            "resume_file_used": getattr(resume, "original_file_name", None) if resume else None,
+            "resume_text_length": len(resume_text),
+            "jd_text_length": jd_length,
+            "verified_resume_skills": [],
+            "weak_or_indirect_skills": [],
+            "missing_mandatory_skills": [],
+            "missing_preferred_skills": [],
+            "skills": [],
+            "summary": {
+                "total_requirements": 0,
+                "verified": 0,
+                "weak_or_indirect": 0,
+                "missing_mandatory": 0,
+                "missing_preferred": 0,
+            },
+            "can_generate_resume": False,
+            "blocking_reasons": [{"skill": "analysis", "reason": "Requirement extraction failed"}],
+            "generation_blocked_message": "We could not extract requirements from this job description. Please retry.",
+            "optimization_allowed": False,
+            "eligibility_blocked_reason": "ANALYSIS_FAILED",
+            "canonical_analysis": score,
+        }
+
+    grouped = group_canonical_score_evidence(score, job.id)
+    summary = grouped.get("summary") or {}
+    if (
+        summary.get("total_requirements", 0) > 0
+        and sum(summary.get(key, 0) for key in ("verified", "weak_or_indirect", "missing_mandatory", "missing_preferred")) == 0
+    ):
+        logger.error(
+            "ANALYSIS_CONSISTENCY_ERROR user_id=%s job_id=%s summary=%s",
+            user_id, job_id, summary,
+        )
+        grouped["analysis_status"] = "ANALYSIS_CONSISTENCY_FAILED"
+        grouped["analysis_error"] = "Analysis produced inconsistent requirement counts. Please retry."
+    else:
+        grouped["analysis_status"] = "SUCCESS"
+
     for item in grouped.get("skills") or []:
         item["found_in_resume"] = bool(item.get("found") or item.get("found_in_resume"))
         item["resume_status"] = item.get("resume_status") or item.get("status")
@@ -188,8 +330,43 @@ def get_missing_skills(
     grouped["force_refresh"] = force_refresh
     grouped["resume_file_used"] = getattr(resume, "original_file_name", None) if resume else None
     grouped["resume_text_length"] = len(resume_text)
+    grouped["jd_text_length"] = jd_length
     grouped["resume_employments"] = _resume_employments(resume_text)
-    return grouped
+    grouped["original_match_percentage"] = score.get("match_percentage")
+    grouped["component_scores"] = score.get("component_details") or score.get("component_scores") or {}
+    grouped["score_explanation"] = {
+        "match_percentage": score.get("match_percentage"),
+        "role_alignment": score.get("role_alignment"),
+        "missing_mandatory_skills": score.get("missing_mandatory_skills") or [],
+        "missing_preferred_skills": score.get("missing_preferred_skills") or [],
+        "why_not_95": score.get("why_not_95"),
+        "component_scores": score.get("component_details") or score.get("component_scores") or {},
+    }
+    logger.info(
+        "ANALYSIS_COMPLETE user_id=%s job_id=%s resume_id=%s mandatory=%s preferred=%s or_groups=%s "
+        "verified=%s possible=%s missing_m=%s missing_p=%s score=%s status=%s",
+        user_id,
+        job_id,
+        identity.get("resume_id"),
+        mandatory_count,
+        preferred_count,
+        or_group_count,
+        summary.get("verified"),
+        summary.get("weak_or_indirect"),
+        summary.get("missing_mandatory"),
+        summary.get("missing_preferred"),
+        score.get("match_percentage"),
+        grouped.get("analysis_status"),
+    )
+    return _attach_confirmation_workflow_state(
+        db,
+        user_id=user_id,
+        job_id=job_id,
+        resume=resume,
+        grouped=grouped,
+        workflow_run_id=identity.get("workflow_run_id"),
+        resume_hash=identity.get("resume_hash"),
+    )
 
 
 @router.get("/debug/skill-evidence/{user_id}/{job_id}")
@@ -203,7 +380,7 @@ def debug_skill_evidence(
     _user, job = _load_user_and_job(db, user_id, job_id)
     resume = _latest_resume(db, user_id)
     resume_text = (resume.parsed_text if resume else "") or ""
-    identity = _analysis_identity(user_id, job, resume)
+    identity = _analysis_identity(db, user_id, job, resume)
     cached = load_requirement_analysis(
         db,
         user_id=identity["user_id"],
@@ -242,11 +419,145 @@ def analyze_requirements(
     return get_missing_skills(user_id=user_id, job_id=job_id, force_refresh=force_refresh, db=db)
 
 
+@router.get("/eligibility/{user_id}/{job_id}")
+def get_optimization_eligibility(user_id: int, job_id: int, db: Session = Depends(get_db)):
+    _user, job = _load_user_and_job(db, user_id, job_id)
+    resume = _latest_resume(db, user_id)
+    if not resume:
+        raise HTTPException(status_code=400, detail="Upload a resume before checking optimization eligibility.")
+    jd_length = len((job.description or "").strip()) + len((job.skills_required or "").strip())
+    score = calculate_weighted_ats_score(resume.parsed_text or "", job)
+    requirements = score.get("requirements") or {}
+    mandatory_count = len(requirements.get("required_core_skills") or [])
+    preferred_count = len(requirements.get("preferred_skills") or [])
+    if jd_length >= 80 and mandatory_count == 0 and preferred_count == 0:
+        logger.error(
+            "REQUIREMENT_EXTRACTION_EMPTY eligibility user_id=%s job_id=%s resume_id=%s jd_len=%s",
+            user_id, job_id, resume.id, jd_length,
+        )
+        return {
+            "optimization_allowed": False,
+            "eligibility_status": "ANALYSIS_FAILED",
+            "eligibility_tier": "ANALYSIS_FAILED",
+            "eligibility_reason": "Analysis could not be completed. We could not extract requirements from this job description.",
+            "reason": "Analysis could not be completed. We could not extract requirements from this job description.",
+            "original_score": None,
+            "analysis_status": "REQUIREMENT_EXTRACTION_FAILED",
+            "resume_id": resume.id,
+            "job_id": job.id,
+            "jd_text_length": jd_length,
+            "missing_mandatory_skills": [],
+            "missing_preferred_skills": [],
+            "component_scores": {},
+            "requirement_evidence": [],
+        }
+    preference = db.query(UserPreference).filter(UserPreference.user_id == user_id).first()
+    preference_role = classify_role("", getattr(preference, "job_title", "") or "")
+    eligibility = role_aware_optimization_eligibility(score["match_percentage"], score.get("role_alignment"))
+    resume_families = score.get("resume_role_families") or ["Other"]
+    job_family = score.get("job_role_family") or "Other"
+    alignment = score.get("role_alignment") or "UNKNOWN"
+    allowed = eligibility["optimization_allowed"]
+    eligibility_status = eligibility["eligibility_status"]
+    if alignment == "EXACT":
+        alignment_reason = f"Both resume and selected job are classified as {job_family}."
+    elif alignment == "STRONG_RELATED":
+        alignment_reason = f"{resume_families[0]} is strongly related to {job_family}."
+    elif alignment == "MISMATCH":
+        alignment_reason = f"{resume_families[0]} and {job_family} are different role families."
+    else:
+        alignment_reason = "Role-family evidence is partial or insufficient for a definitive classification."
+    reason = eligibility["eligibility_reason"]
+    if not allowed and score["match_percentage"] < 65 and alignment in {"EXACT", "STRONG_RELATED"}:
+        if not score.get("missing_mandatory_skills") and score.get("weak_core_skills"):
+            reason = "Your resume contains the required technologies, but much of the evidence is limited to skill-list mentions rather than detailed professional usage."
+        elif not score.get("missing_mandatory_skills"):
+            reason = "The required technologies are present, but other score components such as responsibility or experience evidence remain below their maximums."
+        else:
+            reason = f"Role alignment is {alignment.lower().replace('_', ' ')}, but ATS score is below the 65% threshold."
+    return {
+        **eligibility,
+        "eligibility_reason": reason,
+        "reason": reason,
+        "eligibility_status": eligibility_status,
+        "analysis_status": "SUCCESS",
+        "original_score": score["match_percentage"],
+        "resume_id": resume.id,
+        "job_id": job.id,
+        "resume_role_families": resume_families,
+        "resume_role_family": score.get("resume_role_family_id") or "UNKNOWN",
+        "resume_role_family_display": resume_families[0],
+        "resume_role_confidence": score.get("resume_role_confidence"),
+        "job_role_family": score.get("job_role_family_id") or "UNKNOWN",
+        "job_role_family_display": job_family,
+        "target_job_title": job.title,
+        "job_role_confidence": score.get("job_role_confidence"),
+        "preference_role_family": preference_role["family_id"],
+        "preference_role_confidence": preference_role["confidence"],
+        "role_alignment": alignment,
+        "role_alignment_reason": alignment_reason,
+        "missing_core_skills": score.get("missing_core_skills") or [],
+        "missing_mandatory_skills": score.get("missing_mandatory_skills") or [],
+        "missing_preferred_skills": score.get("missing_preferred_skills") or [],
+        "component_scores": score.get("component_details") or {},
+        "education_category_applicable": score.get("education_category_applicable", True),
+        "strong_evidence_skills": [item["skill"] for item in score.get("requirement_evidence") or [] if item.get("evidence_strength") == "strong"],
+        "weak_evidence_skills": [item["skill"] for item in score.get("requirement_evidence") or [] if item.get("evidence_strength") in {"weak", "medium"}],
+        "score_cap": score.get("score_cap_applied"),
+        "score_cap_reason": score.get("score_cap_reason"),
+        "requirement_evidence": score.get("requirement_evidence") or [],
+        "diagnostic_warnings": score.get("diagnostic_warnings") or [],
+        "major_mismatch_reasons": (
+            score.get("role_mismatch_reasons") or ([score.get("warning_message")] if score.get("warning_message") else [])
+            if alignment == "MISMATCH" else []
+        ),
+        "suggested_role_family": score.get("suggested_role_family") or resume_families[0],
+        "role_classification": score.get("role_classification") or {},
+        "gap_analysis": {
+            "missing_keywords": score.get("missing_keywords") or [],
+            "suggestions": score.get("suggestions") or [],
+        },
+        "jd_text_length": jd_length,
+    }
+
+
 @router.get("/evidence/{user_id}/{job_id}")
 def get_evidence(user_id: int, job_id: int, db: Session = Depends(get_db)):
-    _user, _job = _load_user_and_job(db, user_id, job_id)
-    rows = load_confirmed_skills(db, user_id=user_id, job_id=job_id)
-    return {"user_id": user_id, "job_id": job_id, "evidence": [confirmed_skill_to_dict(r) for r in rows]}
+    _user, job = _load_user_and_job(db, user_id, job_id)
+    resume = _latest_resume(db, user_id)
+    resume_text = (resume.parsed_text if resume else "") or ""
+    identity = _analysis_identity(db, user_id, job, resume)
+    score = calculate_weighted_ats_score(resume_text, job)
+    grouped = group_canonical_score_evidence(score, job.id)
+    grouped.update(identity)
+    grouped = _attach_confirmation_workflow_state(
+        db,
+        user_id=user_id,
+        job_id=job_id,
+        resume=resume,
+        grouped=grouped,
+        workflow_run_id=identity.get("workflow_run_id"),
+        resume_hash=identity.get("resume_hash"),
+    )
+    return {
+        "user_id": user_id,
+        "job_id": job_id,
+        "resume_id": identity.get("resume_id"),
+        "analysis_id": identity.get("analysis_id"),
+        "workflow_run_id": identity.get("workflow_run_id"),
+        "evidence": grouped.get("evidence") or [],
+        "evidence_history": grouped.get("evidence_history") or [],
+        "evidence_summary": grouped.get("evidence_summary") or {},
+        "can_generate_resume": grouped.get("can_generate_resume", False),
+        "blocking_reasons": grouped.get("blocking_reasons") or [],
+        "generation_warnings": grouped.get("generation_warnings") or [],
+        "current_required_confirmations": grouped.get("current_required_confirmations") or [],
+        "current_optional_confirmations": grouped.get("current_optional_confirmations") or [],
+        "preferred_unresolved": grouped.get("preferred_unresolved") or [],
+        "generation_blocked_message": grouped.get("generation_blocked_message") or "",
+        "generation_warning_message": grouped.get("generation_warning_message") or "",
+        "active_confirmation_counts": grouped.get("active_confirmation_counts") or {},
+    }
 
 
 @router.post("/evidence/{user_id}/{job_id}")
@@ -262,15 +573,17 @@ def post_evidence(
     if not isinstance(items, list) or not items:
         raise HTTPException(status_code=400, detail="No evidence items were provided.")
 
-    identity = _analysis_identity(user_id, job, resume)
-    cached_analysis = load_requirement_analysis(db, **identity)
+    identity = _analysis_identity(db, user_id, job, resume)
+    cached_analysis = load_requirement_analysis(
+        db, **{k: identity[k] for k in ("user_id", "job_id", "resume_id", "resume_hash", "job_hash")}
+    )
     analysis = cached_analysis or extract_job_requirement_analysis(job)
     enriched = merge_with_resume_evidence(analysis, resume.parsed_text if resume else "")
     resume_evidence = enriched.get("resume_evidence") or {}
     known_employers = _known_employers(resume.parsed_text if resume else "")
 
     try:
-        saved = save_evidence(
+        saved_rows = save_evidence(
             db,
             user_id=user_id,
             job_id=job_id,
@@ -278,25 +591,94 @@ def post_evidence(
             items=items,
             resume_evidence=resume_evidence,
             known_employers=known_employers,
+            workflow_run_id=identity.get("workflow_run_id"),
         )
     except ValueError as error:
         raise HTTPException(status_code=400, detail=str(error))
 
+    score = calculate_weighted_ats_score(resume.parsed_text if resume else "", job)
+    grouped = group_canonical_score_evidence(score, job.id)
+    grouped.update(identity)
+    grouped = _attach_confirmation_workflow_state(
+        db,
+        user_id=user_id,
+        job_id=job_id,
+        resume=resume,
+        grouped=grouped,
+        workflow_run_id=identity.get("workflow_run_id"),
+        resume_hash=identity.get("resume_hash"),
+    )
+    saved_effective = [
+        {
+            "skill": row.skill_name,
+            "normalized_skill": normalize_skill_name(row.normalized_skill_name or row.skill_name or ""),
+            "effective_status": row.evidence_status,
+            "evidence_id": row.id,
+            "resume_id": row.resume_id,
+            "is_active": bool(getattr(row, "is_active", True)),
+            "workflow_run_id": getattr(row, "workflow_run_id", None),
+        }
+        for row in saved_rows
+    ]
     return {
         "message": "Evidence saved.",
         "user_id": user_id,
         "job_id": job_id,
-        "evidence": [confirmed_skill_to_dict(r) for r in saved],
+        "resume_id": identity.get("resume_id"),
+        "analysis_id": identity.get("analysis_id"),
+        "workflow_run_id": identity.get("workflow_run_id"),
+        "evidence": grouped.get("evidence") or [],
+        "evidence_history": grouped.get("evidence_history") or [],
+        "evidence_summary": grouped.get("evidence_summary") or {},
+        "can_generate_resume": grouped.get("can_generate_resume", False),
+        "blocking_reasons": grouped.get("blocking_reasons") or [],
+        "generation_warnings": grouped.get("generation_warnings") or [],
+        "current_required_confirmations": grouped.get("current_required_confirmations") or [],
+        "current_optional_confirmations": grouped.get("current_optional_confirmations") or [],
+        "preferred_unresolved": grouped.get("preferred_unresolved") or [],
+        "generation_blocked_message": grouped.get("generation_blocked_message") or "",
+        "generation_warning_message": grouped.get("generation_warning_message") or "",
+        "active_confirmation_counts": grouped.get("active_confirmation_counts") or {},
+        "saved": saved_effective,
+        "effective_status": (saved_effective[0]["effective_status"] if len(saved_effective) == 1 else None),
     }
 
 
 @router.delete("/evidence/{user_id}/{job_id}/{evidence_id}")
 def delete_evidence(user_id: int, job_id: int, evidence_id: int, db: Session = Depends(get_db)):
-    _user, _job = _load_user_and_job(db, user_id, job_id)
+    _user, job = _load_user_and_job(db, user_id, job_id)
     removed = delete_confirmed_skill(db, user_id=user_id, job_id=job_id, evidence_id=evidence_id)
     if not removed:
         raise HTTPException(status_code=404, detail="Evidence not found for this user and job.")
-    return {"message": "Evidence removed.", "evidence_id": evidence_id}
+    resume = _latest_resume(db, user_id)
+    identity = _analysis_identity(db, user_id, job, resume)
+    score = calculate_weighted_ats_score((resume.parsed_text if resume else "") or "", job)
+    grouped = group_canonical_score_evidence(score, job.id)
+    grouped.update(identity)
+    grouped = _attach_confirmation_workflow_state(
+        db,
+        user_id=user_id,
+        job_id=job_id,
+        resume=resume,
+        grouped=grouped,
+        workflow_run_id=identity.get("workflow_run_id"),
+        resume_hash=identity.get("resume_hash"),
+    )
+    return {
+        "message": "Evidence removed.",
+        "evidence_id": evidence_id,
+        "evidence": grouped.get("evidence") or [],
+        "evidence_history": grouped.get("evidence_history") or [],
+        "evidence_summary": grouped.get("evidence_summary") or {},
+        "can_generate_resume": grouped.get("can_generate_resume", False),
+        "blocking_reasons": grouped.get("blocking_reasons") or [],
+        "generation_warnings": grouped.get("generation_warnings") or [],
+        "current_required_confirmations": grouped.get("current_required_confirmations") or [],
+        "current_optional_confirmations": grouped.get("current_optional_confirmations") or [],
+        "generation_blocked_message": grouped.get("generation_blocked_message") or "",
+        "generation_warning_message": grouped.get("generation_warning_message") or "",
+        "active_confirmation_counts": grouped.get("active_confirmation_counts") or {},
+    }
 
 
 @router.post("/generate/{user_id}/{job_id}")
@@ -307,6 +689,91 @@ def generate_ats_optimization(
     db: Session = Depends(get_db),
     force: bool = False,
 ):
+    """Start ATS resume generation for the CURRENT user/job/resume/evidence state."""
+    logger.info("GENERATION_REQUEST_RECEIVED user_id=%s job_id=%s force=%s", user_id, job_id, force)
+    _user, job = _load_user_and_job(db, user_id, job_id)
+    resume = _latest_resume(db, user_id)
+    if not resume:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "can_generate_resume": False,
+                "blocking_reasons": [{"code": "RESUME_MISSING", "reason": "Upload a resume before generating."}],
+                "message": "Upload a resume before generating.",
+            },
+        )
+
+    identity = _analysis_identity(db, user_id, job, resume)
+    resume_text = (resume.parsed_text or "") or ""
+    score = calculate_weighted_ats_score(resume_text, job)
+    grouped = group_canonical_score_evidence(score, job.id)
+    grouped.update(identity)
+    grouped = _attach_confirmation_workflow_state(
+        db,
+        user_id=user_id,
+        job_id=job_id,
+        resume=resume,
+        grouped=grouped,
+        workflow_run_id=identity.get("workflow_run_id"),
+        resume_hash=identity.get("resume_hash"),
+    )
+    eligibility = role_aware_optimization_eligibility(
+        score.get("match_percentage") or 0,
+        score.get("role_alignment"),
+    )
+
+    logger.info(
+        "GENERATE REQUEST user_id=%s job_id=%s resume_id=%s analysis_id=%s "
+        "score=%s eligibility=%s can_generate_resume=%s blockers=%s force=%s",
+        user_id,
+        job_id,
+        resume.id,
+        identity.get("analysis_id"),
+        score.get("match_percentage"),
+        eligibility.get("eligibility_status"),
+        grouped.get("can_generate_resume"),
+        [item.get("skill") for item in (grouped.get("blocking_reasons") or [])],
+        force,
+    )
+
+    if not eligibility.get("optimization_allowed"):
+        code = (
+            "INELIGIBLE_LOW_SCORE"
+            if eligibility.get("eligibility_status") == "INELIGIBLE_LOW_SCORE"
+            else "INELIGIBLE_ROLE_ALIGNMENT"
+        )
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "can_generate_resume": False,
+                "blocking_reasons": [{
+                    "code": code,
+                    "reason": eligibility.get("eligibility_reason"),
+                    "original_score": eligibility.get("original_score"),
+                    "minimum_required_score": eligibility.get("minimum_required_score"),
+                }],
+                "eligibility_status": eligibility.get("eligibility_status"),
+                "original_score": eligibility.get("original_score"),
+                "message": (
+                    f"Current score {eligibility.get('original_score')}%. "
+                    f"Minimum required {eligibility.get('minimum_required_score')}%."
+                    if code == "INELIGIBLE_LOW_SCORE"
+                    else (eligibility.get("eligibility_reason") or "Optimization not allowed for this role alignment.")
+                ),
+            },
+        )
+
+    # Mandatory evidence gaps are warnings only — never HTTP 400 blockers.
+    # True blockers remain: missing resume (above), role eligibility (above),
+    # and downstream workflow/system failures.
+    if grouped.get("generation_warnings"):
+        logger.info(
+            "GENERATE WITH GAPS user_id=%s job_id=%s warnings=%s",
+            user_id,
+            job_id,
+            [item.get("skill") for item in grouped.get("generation_warnings") or []],
+        )
+
     try:
         workflow = start_or_get_workflow(
             db,
@@ -316,19 +783,61 @@ def generate_ats_optimization(
         )
     except HTTPException:
         raise
-    except Exception:
-        logger.exception("Failed to start ATS workflow user_id=%s job_id=%s", user_id, job_id)
-        raise HTTPException(status_code=500, detail="Failed to start ATS workflow.")
+    except Exception as error:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        logger.exception(
+            "DATABASE_DATA_ERROR stage=ATS_WORKFLOW_START user_id=%s job_id=%s resume_id=%s",
+            user_id, job_id, resume.id,
+        )
+        orig = getattr(error, "orig", None)
+        pgcode = getattr(orig, "pgcode", None) or getattr(orig, "sqlstate", None)
+        detail = {
+            "error_code": "DATABASE_DATA_ERROR",
+            "stage": "ATS_WORKFLOW_START",
+            "can_generate_resume": True,
+            "message": (
+                "Resume generation could not be saved due to a database data error. "
+                "Please retry Generate Optimized Resume. "
+                f"(DATABASE_DATA_ERROR · ATS_WORKFLOW_START · {type(error).__name__})"
+            ),
+        }
+        if pgcode:
+            detail["db_code"] = str(pgcode)
+        raise HTTPException(status_code=500, detail=detail) from error
 
+    # Always (re)schedule PENDING work. Fresh PENDING after restart must not sit idle.
     if workflow.workflow_status == "PENDING":
         background_tasks.add_task(run_workflow_job, workflow.id)
 
-    job = db.query(Job).filter(Job.id == job_id).first()
+    result = workflow_to_dict(workflow, job)
+    poll = generation_timeout_config()
+    status = "accepted"
+    if workflow.workflow_status == "COMPLETED":
+        status = "generated"
     return {
         "message": "ATS optimization workflow accepted",
+        "status": status,
         "workflow_id": workflow.id,
         "workflow_status": workflow.workflow_status,
-        "result": workflow_to_dict(workflow, job),
+        "poll_interval_ms": poll["poll_interval_ms"],
+        "poll_timeout_seconds": poll["poll_timeout_seconds"],
+        "optimized_resume_id": workflow.optimized_resume_id,
+        "generation_method": workflow.generation_method,
+        "llm_used": bool(workflow.llm_used),
+        "fallback_used": bool(workflow.fallback_used),
+        "validation_status": (result.get("final_validation") or {}).get("status") or "pending",
+        "next_step": "validate_resume" if workflow.workflow_status == "COMPLETED" else "poll_status",
+        "can_generate_resume": True,
+        "blocking_reasons": [],
+        "resume_id": resume.id,
+        "analysis_id": identity.get("analysis_id"),
+        "workflow_run_id": identity.get("workflow_run_id"),
+        "original_score": score.get("match_percentage"),
+        "eligibility_status": eligibility.get("eligibility_status"),
+        "result": result,
     }
 
 
@@ -397,10 +906,13 @@ def retry_workflow(
     if new_workflow.workflow_status == "PENDING":
         background_tasks.add_task(run_workflow_job, new_workflow.id)
     job = db.query(Job).filter(Job.id == new_workflow.job_id).first()
+    poll = generation_timeout_config()
     return {
         "message": "ATS workflow retry started",
         "workflow_id": new_workflow.id,
         "workflow_status": new_workflow.workflow_status,
+        "poll_interval_ms": poll["poll_interval_ms"],
+        "poll_timeout_seconds": poll["poll_timeout_seconds"],
         "result": workflow_to_dict(new_workflow, job),
     }
 
