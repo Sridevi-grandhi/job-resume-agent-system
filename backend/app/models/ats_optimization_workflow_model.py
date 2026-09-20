@@ -41,6 +41,8 @@ class AtsOptimizationWorkflow(Base):
     llm_used = Column(Boolean, nullable=True)
     fallback_used = Column(Boolean, nullable=True)
     fallback_reason = Column(String(80), nullable=True)
+    generation_duration_ms = Column(Integer, nullable=True)
+    generation_diagnostics_json = Column(Text, nullable=True)
     prompt_version = Column(String(80), nullable=True)
     # Must fit current ANALYSIS_VERSION (48+) and future version strings.
     analysis_version = Column(String(120), nullable=True)
@@ -61,4 +63,5 @@ class AtsOptimizationWorkflow(Base):
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    last_activity_at = Column(DateTime(timezone=True), server_default=func.now())
     completed_at = Column(DateTime(timezone=True), nullable=True)

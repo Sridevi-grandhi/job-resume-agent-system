@@ -8,6 +8,8 @@ import secrets
 import time
 from datetime import datetime, timedelta, timezone
 
+import os
+
 import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field
@@ -19,7 +21,7 @@ from app.models.user_model import User
 from app.services.auth_email_service import (
     deliver_password_reset_email,
     frontend_base_url,
-    is_development_environment,
+    show_dev_reset_link,
 )
 
 
@@ -30,7 +32,16 @@ router = APIRouter(
     tags=["Authentication"],
 )
 
-RESET_TOKEN_EXPIRY_MINUTES = 45
+
+def reset_token_expiry_minutes() -> int:
+    """Configurable via PASSWORD_RESET_TOKEN_EXPIRE_MINUTES (default 45,
+    the value this project already used before it was configurable). Read
+    at call time, not module import time, so tests can override it per-case
+    via monkeypatch."""
+    try:
+        return max(1, int(os.getenv("PASSWORD_RESET_TOKEN_EXPIRE_MINUTES") or "45"))
+    except ValueError:
+        return 45
 MIN_PASSWORD_LENGTH = 8
 GENERIC_FORGOT_MESSAGE = (
     "If an account exists for this email, password reset instructions have been sent."
@@ -152,7 +163,7 @@ def create_password_reset_token(db: Session, *, user: User) -> str:
     row = PasswordResetToken(
         user_id=user.id,
         token_hash=_hash_reset_token(raw_token),
-        expires_at=now + timedelta(minutes=RESET_TOKEN_EXPIRY_MINUTES),
+        expires_at=now + timedelta(minutes=reset_token_expiry_minutes()),
         used_at=None,
     )
     db.add(row)
@@ -226,13 +237,15 @@ def forgot_password(
     if user is not None:
         raw_token = create_password_reset_token(db, user=user)
         reset_url = f"{frontend_base_url()}/reset-password?token={raw_token}"
-        delivery = deliver_password_reset_email(
+        deliver_password_reset_email(
             recipient_email=user.email,
             reset_url=reset_url,
-            expires_minutes=RESET_TOKEN_EXPIRY_MINUTES,
+            expires_minutes=reset_token_expiry_minutes(),
         )
-        if is_development_environment() and not delivery.get("sent"):
-            # Local/test only — never included when APP_ENV=production.
+        if show_dev_reset_link():
+            # Explicit opt-in only (APP_ENV=development AND
+            # SHOW_DEV_RESET_LINK=true) — never included otherwise,
+            # regardless of whether SMTP delivery succeeded or not.
             dev_reset_url = reset_url
 
     return {

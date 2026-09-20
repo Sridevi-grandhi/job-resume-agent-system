@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -75,8 +76,23 @@ RUNNING_WORKFLOW_STATUSES = {
     "ANALYZING_OPTIMIZED",
 }
 
-# Intermediate runs older than this are treated as stale and replaced.
-STALE_RUNNING_SECONDS = int(os.getenv("ATS_STALE_WORKFLOW_SECONDS") or "180")
+# Only a fallback_reason that will fail identically on every subsequent
+# attempt (bad/missing model or provider config) should stop later
+# optimization passes from trying the LLM again. Transient reasons
+# (timeout, connection_failed/refused) are deliberately excluded — a single
+# network blip on pass 1 must not force every remaining pass in this
+# workflow run into the deterministic fallback; see execute_workflow.
+_PERMANENT_LLM_FAILURE_REASONS = {"model_not_found", "llm_not_configured", "unsupported_provider"}
+
+# Intermediate runs older than the generation budget (+ buffer) are treated as stale.
+# Must exceed LLM read-timeout so force/retry cannot spawn concurrent Ollama jobs.
+def _stale_running_seconds() -> int:
+    configured = int(os.getenv("ATS_STALE_WORKFLOW_SECONDS") or "0")
+    budgets = generation_timeout_config()
+    return max(configured, budgets.get("stale_running_seconds") or budgets["generation_timeout_seconds"] + 60)
+
+
+STALE_RUNNING_SECONDS = _stale_running_seconds()  # evaluated at import; also re-read in start_or_get_workflow
 
 MINIMUM_ORIGINAL_SCORE = 65.0
 TERMINAL_NO_RETRY_STATUSES = {
@@ -201,13 +217,46 @@ def _latest_resume_for_user(db: Session, user_id: int) -> Resume | None:
     )
 
 
+def _workflow_activity_stamp(workflow: AtsOptimizationWorkflow) -> datetime | None:
+    return (
+        getattr(workflow, "last_activity_at", None)
+        or workflow.updated_at
+        or workflow.created_at
+    )
+
+
 def _workflow_age_seconds(workflow: AtsOptimizationWorkflow) -> float:
-    stamp = workflow.updated_at or workflow.created_at
+    stamp = _workflow_activity_stamp(workflow)
     if not stamp:
         return 0.0
     if stamp.tzinfo is None:
         stamp = stamp.replace(tzinfo=timezone.utc)
     return max(0.0, (_now() - stamp).total_seconds())
+
+
+def _touch_workflow_activity(workflow: AtsOptimizationWorkflow, db: Session | None = None) -> None:
+    workflow.last_activity_at = _now()
+    workflow.updated_at = _now()
+    if db is not None:
+        db.add(workflow)
+        db.commit()
+        db.refresh(workflow)
+
+
+@dataclass
+class WorkflowStartDecision:
+    workflow: AtsOptimizationWorkflow
+    created_new: bool
+    reuse_reason: str | None = None
+
+
+TERMINAL_FORCE_FRESH_STATUSES = {
+    "COMPLETED",
+    "FAILED",
+    "VALIDATION_FAILED",
+}
+
+ORPHANED_STARTUP_STATUSES = RUNNING_WORKFLOW_STATUSES
 
 
 def _now():
@@ -229,6 +278,7 @@ def _loads(value: str | None, default=None):
 
 def _set_status(workflow: AtsOptimizationWorkflow, status: str, db: Session, error: str | None = None):
     workflow.workflow_status = status
+    workflow.last_activity_at = _now()
     workflow.updated_at = _now()
     if error:
         workflow.error_message = error[:500]
@@ -236,6 +286,54 @@ def _set_status(workflow: AtsOptimizationWorkflow, status: str, db: Session, err
     db.commit()
     db.refresh(workflow)
     logger.info("WORKFLOW_STATUS_UPDATED workflow_id=%s status=%s", workflow.id, status)
+
+
+def recover_orphaned_workflows(db: Session) -> int:
+    """Mark in-flight workflows from a prior process as failed so they cannot be reused."""
+    rows = (
+        db.query(AtsOptimizationWorkflow)
+        .filter(AtsOptimizationWorkflow.workflow_status.in_(ORPHANED_STARTUP_STATUSES))
+        .all()
+    )
+    if not rows:
+        return 0
+    message = "Interrupted by server restart; retry generation."
+    for workflow in rows:
+        workflow.workflow_status = "FAILED"
+        workflow.error_message = message[:500]
+        workflow.last_activity_at = _now()
+        workflow.updated_at = _now()
+        db.add(workflow)
+    db.commit()
+    logger.warning(
+        "ATS_ORPHANED_WORKFLOWS_RECOVERED count=%s workflow_ids=%s",
+        len(rows),
+        [row.id for row in rows],
+    )
+    return len(rows)
+
+
+def _mark_workflow_superseded(
+    workflow: AtsOptimizationWorkflow,
+    db: Session,
+    *,
+    reason: str,
+) -> None:
+    workflow.workflow_status = "FAILED"
+    workflow.error_message = reason[:500]
+    workflow.last_activity_at = _now()
+    workflow.updated_at = _now()
+    db.add(workflow)
+    db.commit()
+    db.refresh(workflow)
+
+
+def _is_workflow_actively_running(workflow: AtsOptimizationWorkflow, stale_limit: float) -> bool:
+    if workflow.workflow_status not in RUNNING_WORKFLOW_STATUSES:
+        return False
+    if workflow.workflow_status == "PENDING":
+        return True
+    return _workflow_age_seconds(workflow) < stale_limit
 
 
 def _upsert_match_score(
@@ -341,14 +439,36 @@ def workflow_to_dict(workflow: AtsOptimizationWorkflow, job: Job | None = None) 
     remaining_missing = optimized.get("missing_keywords") or []
     generation_metadata = {
         "generation_method": workflow.generation_method,
+        "generation_provider": workflow.llm_provider,
+        "generation_model": workflow.llm_model,
         "llm_used": bool(workflow.llm_used),
         "llm_provider": workflow.llm_provider,
         "llm_model": workflow.llm_model,
         "llm_service": workflow.llm_service,
         "fallback_used": bool(workflow.fallback_used),
         "fallback_reason": workflow.fallback_reason,
+        "generation_duration_ms": getattr(workflow, "generation_duration_ms", None),
     }
+    diagnostics = _loads(getattr(workflow, "generation_diagnostics_json", None), {})
+    if isinstance(diagnostics, dict):
+        generation_metadata.update({
+            key: diagnostics.get(key)
+            for key in (
+                "llm_attempt_count",
+                "llm_response_received",
+                "schema_validation_passed",
+                "json_repair_used",
+                "schema_repair_retry_used",
+            )
+            if key in diagnostics
+        })
     poll = generation_timeout_config()
+    llm_attempted = workflow.llm_used is not None or bool(workflow.generation_method)
+    llm_failure_reason = None
+    if workflow.fallback_used and workflow.fallback_reason not in {None, "llm_not_configured", "llm_skipped"}:
+        llm_failure_reason = workflow.fallback_reason
+    elif workflow.fallback_reason in {"llm_not_configured", "llm_skipped"}:
+        llm_failure_reason = workflow.fallback_reason
 
     payload = {
         "workflow_id": workflow.id,
@@ -357,12 +477,31 @@ def workflow_to_dict(workflow: AtsOptimizationWorkflow, job: Job | None = None) 
         "job_id": workflow.job_id,
         "optimized_resume_id": workflow.optimized_resume_id,
         "workflow_status": workflow.workflow_status,
+        "status": workflow.workflow_status,
+        "current_step": workflow.workflow_status,
         "poll_interval_ms": poll["poll_interval_ms"],
         "poll_timeout_seconds": poll["poll_timeout_seconds"],
         "original_match_score": workflow.original_match_score,
         "original_score": workflow.original_match_score,
         "optimized_match_score": workflow.optimized_match_score,
+        "optimized_score": workflow.optimized_match_score,
         "score_improvement": workflow.score_improvement,
+        "llm_attempted": bool(llm_attempted and workflow.generation_method != "deterministic_fallback")
+            or bool(workflow.llm_used)
+            or (bool(workflow.fallback_used) and workflow.fallback_reason not in {None, "llm_not_configured"}),
+        "llm_provider": workflow.llm_provider,
+        "llm_model": workflow.llm_model,
+        "llm_failure_reason": llm_failure_reason,
+        "fallback_attempted": bool(workflow.fallback_used),
+        "fallback_succeeded": bool(
+            workflow.fallback_used and workflow.workflow_status == "COMPLETED"
+        ),
+        "fallback_failure_reason": (
+            workflow.error_message
+            if workflow.fallback_used and workflow.workflow_status in {"FAILED", "VALIDATION_FAILED"}
+            else None
+        ),
+        "generation_method": workflow.generation_method,
         "original_matched_keywords": original_matched,
         "optimized_matched_keywords": optimized_matched,
         "newly_matched_keywords": newly_matched,
@@ -388,9 +527,6 @@ def workflow_to_dict(workflow: AtsOptimizationWorkflow, job: Job | None = None) 
             "plain_text": workflow.generated_resume_plain_text or "",
             "formatted_preview": workflow.generated_resume_markdown or "",
         },
-        "llm_provider": workflow.llm_provider,
-        "llm_model": workflow.llm_model,
-        "generation_method": workflow.generation_method,
         "llm_used": bool(workflow.llm_used),
         "llm_service": workflow.llm_service,
         "fallback_used": bool(workflow.fallback_used),
@@ -417,7 +553,9 @@ def workflow_to_dict(workflow: AtsOptimizationWorkflow, job: Job | None = None) 
         "source_file_type": optimized.get("source_file_type"),
         "template_note": optimized.get("template_note"),
         "editable": workflow.workflow_status == "COMPLETED" and bool(workflow.optimized_resume_id),
-        "validation_passed": (validation.get("final_validation") or {}).get("status") == "passed",
+        "validation_passed": (validation.get("final_validation") or {}).get("status") in {
+            "passed", "passed_with_warnings",
+        },
         "why_not_95": optimized.get("why_not_95") or "",
         "confirmed_skills_used": optimized.get("confirmed_skills_used") or [],
         "confirmed_skills_incorporated": (
@@ -496,6 +634,18 @@ def start_or_get_workflow(
     job_id: int,
     force: bool = False,
 ) -> AtsOptimizationWorkflow:
+    return start_or_get_workflow_with_decision(
+        db, user_id=user_id, job_id=job_id, force=force,
+    ).workflow
+
+
+def start_or_get_workflow_with_decision(
+    db: Session,
+    *,
+    user_id: int,
+    job_id: int,
+    force: bool = False,
+) -> WorkflowStartDecision:
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
@@ -530,18 +680,47 @@ def start_or_get_workflow(
         .first()
     )
 
+    stale_limit = _stale_running_seconds()
+
+    # force=true on a terminal row always starts a fresh attempt (never reuse COMPLETED metadata).
+    if existing and force and existing.workflow_status in TERMINAL_FORCE_FRESH_STATUSES:
+        logger.info(
+            "ATS_WORKFLOW_FORCE_FRESH existing_id=%s status=%s user_id=%s job_id=%s",
+            existing.id, existing.workflow_status, user_id, job_id,
+        )
+        existing = None
+
+    # Never start a second concurrent LLM generation while one is genuinely active.
+    if existing and existing.workflow_status in RUNNING_WORKFLOW_STATUSES:
+        age = _workflow_age_seconds(existing)
+        if _is_workflow_actively_running(existing, stale_limit):
+            logger.info(
+                "ATS_WORKFLOW_REUSE_IN_FLIGHT existing_id=%s status=%s age_s=%.0f "
+                "force=%s user_id=%s job_id=%s",
+                existing.id, existing.workflow_status, age, force, user_id, job_id,
+            )
+            return WorkflowStartDecision(
+                workflow=existing,
+                created_new=False,
+                reuse_reason="in_flight_active",
+            )
+        logger.warning(
+            "Replacing stale workflow id=%s status=%s age_s=%.0f user_id=%s job_id=%s",
+            existing.id, existing.workflow_status, age, user_id, job_id,
+        )
+        _mark_workflow_superseded(
+            existing,
+            db,
+            reason="Superseded: previous generation exceeded the stale-running limit.",
+        )
+        existing = None
+
     if existing and not force:
         if existing.workflow_status == "COMPLETED" and existing.content_hash == hash_value:
-            return existing
-        if existing.workflow_status in RUNNING_WORKFLOW_STATUSES:
-            age = _workflow_age_seconds(existing)
-            # Reuse only fresh in-flight runs. Stale mid-states (e.g. server restart
-            # during GENERATING_RESUME) must not block forever.
-            if existing.workflow_status == "PENDING" or age < STALE_RUNNING_SECONDS:
-                return existing
-            logger.warning(
-                "Replacing stale workflow id=%s status=%s age_s=%.0f user_id=%s job_id=%s",
-                existing.id, existing.workflow_status, age, user_id, job_id,
+            return WorkflowStartDecision(
+                workflow=existing,
+                created_new=False,
+                reuse_reason="completed_unchanged",
             )
         # INELIGIBLE_*/FAILED/VALIDATION_FAILED always start a fresh run so a later
         # corrected score/evidence state is never blocked by stale terminal rows.
@@ -591,6 +770,7 @@ def start_or_get_workflow(
         analysis_version=ANALYSIS_VERSION,
         error_message=error_message,
         missing_job_fields=_dumps(missing_fields) if missing_fields else None,
+        last_activity_at=_now(),
         # Clear any stale eligibility fields on new runs.
         optimization_allowed=None,
         eligibility_reason=None,
@@ -621,7 +801,7 @@ def start_or_get_workflow(
         "ATS workflow started id=%s user_id=%s job_id=%s resume_id=%s status=%s evidence_fp=%s",
         workflow.id, user_id, job_id, resume.id, status, evidence_fp,
     )
-    return workflow
+    return WorkflowStartDecision(workflow=workflow, created_new=True, reuse_reason=None)
 
 
 def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
@@ -739,6 +919,30 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
         db.add(workflow)
         db.commit()
 
+        # Persist the original (resume-as-uploaded) match score to MatchScore
+        # as soon as it's computed — never deferred to the end of the
+        # workflow. Previously this only happened alongside the optimized
+        # score, right before COMPLETED; every other exit from this function
+        # (INELIGIBLE_LOW_SCORE/INELIGIBLE_ROLE_ALIGNMENT below,
+        # VALIDATION_FAILED, or the catch-all FAILED at the bottom) returned
+        # before ever reaching that point, silently discarding an original
+        # score that had already been correctly calculated — the exact cause
+        # of Selected Jobs cards showing no Resume Match score at all despite
+        # a real, complete job description and a real computed score sitting
+        # unused on the workflow row. This does not change what gets
+        # computed or how — only guarantees the already-correct original
+        # score is never lost. The optimized-resume MatchScore upsert stays
+        # exactly where it was: an optimized resume genuinely does not exist
+        # until generation, injection, and validation all succeed.
+        _upsert_match_score(
+            db,
+            user_id=workflow.user_id,
+            resume_id=workflow.resume_id,
+            job_id=workflow.job_id,
+            score_result=original,
+            resume_version="original",
+        )
+
         if not workflow.optimization_allowed:
             workflow.optimization_status = eligibility["eligibility_status"]
             workflow.completed_at = _now()
@@ -835,6 +1039,17 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
                 generated_sections=candidate.get("sections") or [],
                 unsupported_keywords=unsupported_requirements,
                 selected_technologies=injection_plan.get("supportedKeywords") or [],
+                allowed_confirmed_skills=supported.get("confirmed_skill_names") or [],
+                confirmed_evidence_text="\n".join(
+                    str(
+                        (item or {}).get("usage_description")
+                        or (item or {}).get("work_completed")
+                        or (item or {}).get("description")
+                        or ""
+                    )
+                    for item in (generation_evidence or {}).values()
+                ),
+                workflow_id=workflow.id,
             )
             return plain_text, markdown_text, {"client": client_val, "final": final_val}
 
@@ -852,10 +1067,14 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
         deadline = time.monotonic() + budgets["generation_timeout_seconds"]
         skip_llm = False
         logger.info(
-            "GENERATION_STARTED workflow_id=%s llm_timeout_s=%s overall_timeout_s=%s",
+            "ATS_GENERATION_STARTED workflow_id=%s resume_id=%s job_id=%s "
+            "llm_timeout_s=%s overall_timeout_s=%s poll_timeout_s=%s",
             workflow.id,
+            workflow.resume_id,
+            workflow.job_id,
             budgets["llm_timeout_seconds"],
             budgets["generation_timeout_seconds"],
+            budgets["poll_timeout_seconds"],
         )
 
         for pass_index in range(MAX_OPTIMIZATION_PASSES):
@@ -877,7 +1096,12 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
                     correction += " The previous output was identical to the original resume."
                 elif improvement <= 0:
                     correction += " The previous optimized score did not beat the original score."
+                logger.info(
+                    "SUMMARY_GENERATION_RETRY workflow_id=%s pass_index=%s previous_improvement=%s",
+                    workflow.id, pass_index, improvement,
+                )
 
+            _touch_workflow_activity(workflow, db)
             candidate = generate_with_llm_or_fallback(
                 resume_text=resume_text,
                 job=job,
@@ -888,10 +1112,17 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
                 verified_resume_skills=verified_resume_skills,
                 correction_instructions=correction,
                 skip_llm=skip_llm,
+                workflow_id=workflow.id,
             )
-            if candidate.get("fallback_used") and candidate.get("fallback_reason") in {
-                "timeout", "connection_failed", "connection_refused", "model_not_found", "llm_skipped",
-            }:
+            _touch_workflow_activity(workflow, db)
+            if candidate.get("fallback_used") and candidate.get("fallback_reason") in _PERMANENT_LLM_FAILURE_REASONS:
+                # Only a genuinely unrecoverable-within-this-run reason (bad
+                # model/provider config) should stop future passes from
+                # trying the LLM again. A single transient timeout or
+                # connection blip must not permanently doom the rest of this
+                # workflow run to the deterministic fallback — the
+                # time-budget checks above (remaining <= 8 / < llm_timeout+5)
+                # already handle skipping once the deadline is genuinely close.
                 skip_llm = True
             if not candidate or not str(candidate.get("plain_text") or "").strip():
                 raise RuntimeError("Resume generation returned empty content after LLM/fallback")
@@ -902,31 +1133,74 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
             generated = candidate
 
             if final_validation.get("status") == "failed" and pass_index == 0:
-                # One validation-repair attempt before scoring comparison.
-                repair = (
-                    "Your previous output failed validation with these errors: "
-                    + "; ".join(final_validation.get("errors") or [])
-                    + ". Fix these specific issues without inventing any new facts."
+                structural_markers = (
+                    "Protected field",
+                    "Section order",
+                    "Company name",
+                    "Employment dates",
+                    "Protected section",
                 )
-                repaired = generate_with_llm_or_fallback(
-                    resume_text=resume_text,
-                    job=job,
-                    injection_plan=injection_plan,
-                    structure=structure,
-                    confirmed_evidence=generation_evidence,
-                    denied_skills=denied_skills,
-                    verified_resume_skills=verified_resume_skills,
-                    correction_instructions=repair,
-                    skip_llm=skip_llm or (deadline - time.monotonic() < budgets["llm_timeout_seconds"] + 5),
+                errors = list(final_validation.get("errors") or [])
+                only_structural = bool(errors) and all(
+                    any(marker in err for marker in structural_markers) for err in errors
                 )
-                if repaired.get("fallback_used") and repaired.get("fallback_reason") in {
-                    "timeout", "connection_failed", "connection_refused", "model_not_found", "llm_skipped",
-                }:
-                    skip_llm = True
-                plain, markdown, checks = _run_validation(repaired)
-                final_validation = checks["final"]
-                client_validation = checks["client"]
-                generated = repaired
+                if only_structural and candidate.get("generation_method") == "llm":
+                    # Protected-field / structure failures are repaired locally — do not
+                    # spend another OpenAI call for a deterministic assembly problem.
+                    from app.services.resume_assembly_service import assemble_optimized_resume
+
+                    logger.info(
+                        "DETERMINISTIC_STRUCTURE_REPAIR workflow_id=%s errors=%s",
+                        workflow.id,
+                        errors,
+                    )
+                    repaired_payload = assemble_optimized_resume(
+                        resume_text=resume_text,
+                        structure=structure,
+                        llm_result={
+                            "generated_resume_plain_text": candidate.get("plain_text") or "",
+                            "rewritten_summary": "",
+                            "rewritten_bullets": [],
+                        },
+                        confirmed_evidence=generation_evidence,
+                        denied_skills=denied_skills,
+                        unsupported_keywords=unsupported_requirements,
+                    )
+                    repaired = {
+                        **candidate,
+                        "plain_text": repaired_payload["plain_text"],
+                        "sections": repaired_payload.get("sections") or [],
+                        "assembly_method": repaired_payload.get("assembly_method"),
+                    }
+                    plain, markdown, checks = _run_validation(repaired)
+                    final_validation = checks["final"]
+                    client_validation = checks["client"]
+                    generated = repaired
+                else:
+                    # Content-level validation issues may need another AI rewrite.
+                    repair = (
+                        "Your previous output failed validation with these errors: "
+                        + "; ".join(errors)
+                        + ". Fix these specific issues without inventing any new facts."
+                    )
+                    repaired = generate_with_llm_or_fallback(
+                        resume_text=resume_text,
+                        job=job,
+                        injection_plan=injection_plan,
+                        structure=structure,
+                        confirmed_evidence=generation_evidence,
+                        denied_skills=denied_skills,
+                        verified_resume_skills=verified_resume_skills,
+                        correction_instructions=repair,
+                        skip_llm=skip_llm or (deadline - time.monotonic() < budgets["llm_timeout_seconds"] + 5),
+                        workflow_id=workflow.id,
+                    )
+                    if repaired.get("fallback_used") and repaired.get("fallback_reason") in _PERMANENT_LLM_FAILURE_REASONS:
+                        skip_llm = True
+                    plain, markdown, checks = _run_validation(repaired)
+                    final_validation = checks["final"]
+                    client_validation = checks["client"]
+                    generated = repaired
 
             if final_validation.get("status") == "failed":
                 break
@@ -937,6 +1211,9 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
                 plain,
                 job,
                 confirmed_skills=scoring_evidence,
+                original_resume_text=resume_text,
+                denied_skills=denied_skills,
+                evidence_gated=True,
             )
             improvement = int(optimized["match_percentage"]) - int(original["match_percentage"])
             logger.info(
@@ -989,6 +1266,19 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
         workflow.llm_used = bool(generated.get("llm_used"))
         workflow.fallback_used = bool(generated.get("fallback_used"))
         workflow.fallback_reason = generated.get("fallback_reason")
+        workflow.generation_duration_ms = generated.get("generation_duration_ms")
+        meta = generated.get("generation_metadata") or {}
+        workflow.generation_diagnostics_json = _dumps({
+            key: meta.get(key)
+            for key in (
+                "llm_attempt_count",
+                "llm_response_received",
+                "schema_validation_passed",
+                "json_repair_used",
+                "schema_repair_retry_used",
+            )
+            if meta.get(key) is not None
+        }) if meta else None
         workflow.prompt_version = generated.get("prompt_version")
         workflow.generated_resume_plain_text = plain
         workflow.generated_resume_markdown = markdown
@@ -1042,6 +1332,9 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
                 plain,
                 job,
                 confirmed_skills=scoring_evidence,
+                original_resume_text=resume_text,
+                denied_skills=denied_skills,
+                evidence_gated=True,
             )
             improvement = int(optimized["match_percentage"]) - int(original["match_percentage"])
         # Attach validator warnings into optimized analysis display fields
@@ -1153,6 +1446,7 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
         workflow.optimized_analysis_json = _dumps(optimized)
         workflow.workflow_status = "COMPLETED"
         workflow.completed_at = _now()
+        workflow.last_activity_at = _now()
         workflow.error_message = None
         workflow.updated_at = _now()
         db.add(workflow)
@@ -1171,6 +1465,12 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
             workflow.score_improvement,
             generated.get("generation_mode"),
         )
+        logger.info(
+            "ATS_GENERATION_COMPLETED workflow_id=%s generation_method=%s fallback_used=%s",
+            workflow.id,
+            workflow.generation_method,
+            bool(workflow.fallback_used),
+        )
         return workflow
 
     except Exception as error:
@@ -1184,6 +1484,7 @@ def run_workflow_job(workflow_id: int) -> None:
     """Background entrypoint using a fresh DB session."""
     from app.database import SessionLocal
 
+    logger.info("ATS_BACKGROUND_TASK_STARTED workflow_id=%s", workflow_id)
     db = SessionLocal()
     try:
         execute_workflow(db, workflow_id)

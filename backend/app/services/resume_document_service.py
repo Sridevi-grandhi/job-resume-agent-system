@@ -259,8 +259,8 @@ def document_to_plain_text(document: dict[str, Any] | None) -> str:
             for item in section.get("items") or []:
                 meta = " | ".join(
                     part for part in [
-                        (item.get("title") or "").strip(),
                         (item.get("company") or "").strip(),
+                        (item.get("title") or "").strip(),
                         (item.get("location") or "").strip(),
                         (item.get("dates") or "").strip(),
                     ] if part
@@ -315,3 +315,157 @@ def merge_presentation(document: dict[str, Any], presentation: dict[str, Any] | 
         if key in presentation and presentation[key] is not None:
             updated[key] = presentation[key]
     return updated
+
+
+def document_sections_for_validation(document: dict[str, Any] | None) -> list[dict[str, str]]:
+    """Build heading/content pairs from the editor document for final validation.
+
+    Prefer the document's own section list over re-parsing plain text so section
+    order/heading checks are not false-failed by parser heuristics.
+    """
+    if not document:
+        return []
+    sections: list[dict[str, str]] = []
+    for section in document.get("sections") or []:
+        heading = (section.get("heading") or "Section").strip()
+        stype = section.get("type") or _section_type(heading)
+        parts: list[str] = []
+        if stype == "summary":
+            content = (section.get("content") or "").strip()
+            if content:
+                parts.append(content)
+        elif stype == "skills":
+            skills = section.get("skills") or []
+            if skills:
+                parts.append(", ".join(str(skill) for skill in skills if skill))
+            elif section.get("content"):
+                parts.append(str(section.get("content")).strip())
+        elif stype in {"experience", "projects"}:
+            for item in section.get("items") or []:
+                if stype == "experience":
+                    meta = " | ".join(
+                        part for part in [
+                            (item.get("company") or "").strip(),
+                            (item.get("title") or "").strip(),
+                            (item.get("dates") or "").strip(),
+                        ] if part
+                    )
+                else:
+                    meta = " | ".join(
+                        part for part in [
+                            (item.get("name") or "").strip(),
+                            (item.get("dates") or "").strip(),
+                        ] if part
+                    )
+                if meta:
+                    parts.append(meta)
+                desc = (item.get("description") or "").strip()
+                if desc:
+                    parts.append(desc)
+                for bullet in item.get("bullets") or []:
+                    text = (bullet.get("text") if isinstance(bullet, dict) else str(bullet)).strip()
+                    if text:
+                        parts.append(f"- {text}")
+                parts.append("")
+        else:
+            # `content` (from plain_text_to_document) already carries the full
+            # raw section text; `bullets` is only a derived per-line view of
+            # that same text. Appending both duplicated every line (e.g. an
+            # Education entry rendered as itself AND a "- " bulleted repeat),
+            # which false-failed the protected_section truthfulness check
+            # against the original's un-duplicated content. Use content when
+            # present; fall back to bullets only when there is no raw content.
+            content = (section.get("content") or "").strip()
+            if content:
+                parts.append(content)
+            else:
+                for bullet in section.get("bullets") or []:
+                    text = (bullet.get("text") if isinstance(bullet, dict) else str(bullet)).strip()
+                    if text:
+                        parts.append(f"- {text}")
+        sections.append({
+            "heading": heading,
+            "content": "\n".join(parts).strip(),
+        })
+    return sections
+
+
+def download_basename(candidate_name: str | None) -> str:
+    """Build a safe FirstName_LastName_Optimized_Resume file stem."""
+    raw = re.sub(r"[^A-Za-z0-9]+", " ", (candidate_name or "").strip())
+    if not raw:
+        return "Optimized_Resume"
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "_", raw).strip("_")
+    if not cleaned:
+        return "Optimized_Resume"
+    return f"{cleaned}_Optimized_Resume"
+
+
+_INTERNAL_STATUS_PATTERNS = [
+    re.compile(r"(?i)\(\s*user\s+confirmed\s*\)"),
+    re.compile(r"(?i)\bUSER_CONFIRMED(?:_PROFESSIONAL|_PROJECT|_CERTIFICATION|_TRAINING)?\b"),
+    re.compile(r"(?i)\bREJECTED\b"),
+    re.compile(r"(?i)\bNOT_POSSESSED\b"),
+    re.compile(r"(?i)\bINCOMPLETE\b"),
+    re.compile(r"(?i)\bevidence[_\s-]?id\b"),
+    re.compile(r"(?i)^\s*client:\s*status\s+meetings\.?\s*$"),
+    # Resume-workspace editor UI labels/badges/buttons (AI Improve modal,
+    # inline change badges) — never editor chrome, only ever whole-line
+    # matches so ordinary resume prose containing these common words
+    # ("Conducted code review...", "Managed vendor rejects...") is untouched.
+    re.compile(r"(?i)^[\s\-•*]*✨?\s*AI\s+Improved\s*$"),
+    re.compile(r"(?i)^[\s\-•*]*✨?\s*AI\s+Generated\s*$"),
+    re.compile(r"(?i)^[\s\-•*]*AI\s+Improve\s*$"),
+    re.compile(r"(?i)^[\s\-•*]*✓?\s*Accepted\s*$"),
+    re.compile(r"(?i)^[\s\-•*]*Edited\s+manually\s*$"),
+    re.compile(r"(?i)^[\s\-•*]*Review\s*$"),
+    re.compile(r"(?i)^[\s\-•*]*Accept\s*$"),
+    re.compile(r"(?i)^[\s\-•*]*Reject\s*$"),
+    re.compile(r"(?i)^[\s\-•*]*Try\s+Again\s*$"),
+    re.compile(r"(?i)^[\s\-•*]*Delete\s*$"),
+    re.compile(r"(?i)^[\s\-•*]*No\s+change\s+recommended\.?\s*$"),
+]
+
+
+def sanitize_resume_public_text(text: str) -> str:
+    """Remove internal workflow/evidence labels that must never appear on a resume."""
+    lines = []
+    seen_bullets: set[str] = set()
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            lines.append("")
+            continue
+        if any(pattern.search(line) for pattern in _INTERNAL_STATUS_PATTERNS):
+            continue
+        normalized = re.sub(r"^[-•*]\s+", "", line).strip().lower()
+        normalized = re.sub(r"\s+", " ", normalized)
+        if normalized and normalized in seen_bullets:
+            continue
+        if normalized:
+            seen_bullets.add(normalized)
+        lines.append(raw_line.rstrip())
+    cleaned = "\n".join(lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
+def dedupe_experience_employers(employments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep one block per employer; merge bullets when duplicates appear."""
+    merged: list[dict[str, Any]] = []
+    index_by_company: dict[str, int] = {}
+    for emp in employments or []:
+        company = re.sub(r"\s+", " ", (emp.get("company") or "").strip()).lower()
+        if company and company in index_by_company:
+            target = merged[index_by_company[company]]
+            existing = {re.sub(r"\s+", " ", str(b).strip().lower()) for b in (target.get("bullets") or [])}
+            for bullet in emp.get("bullets") or []:
+                key = re.sub(r"\s+", " ", str(bullet).strip().lower())
+                if key and key not in existing:
+                    target.setdefault("bullets", []).append(bullet)
+                    existing.add(key)
+            continue
+        merged.append(dict(emp))
+        if company:
+            index_by_company[company] = len(merged) - 1
+    return merged

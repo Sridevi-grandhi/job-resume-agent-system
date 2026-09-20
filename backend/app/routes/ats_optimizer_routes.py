@@ -20,8 +20,10 @@ from app.models.user_model import User
 from app.models.user_preference_model import UserPreference
 from app.services.ats_optimization_workflow_service import (
     execute_workflow,
+    recover_orphaned_workflows,
     run_workflow_job,
     start_or_get_workflow,
+    start_or_get_workflow_with_decision,
     workflow_to_dict,
     optimization_eligibility,
     role_aware_optimization_eligibility,
@@ -775,12 +777,13 @@ def generate_ats_optimization(
         )
 
     try:
-        workflow = start_or_get_workflow(
+        decision = start_or_get_workflow_with_decision(
             db,
             user_id=user_id,
             job_id=job_id,
             force=force,
         )
+        workflow = decision.workflow
     except HTTPException:
         raise
     except Exception as error:
@@ -808,9 +811,35 @@ def generate_ats_optimization(
             detail["db_code"] = str(pgcode)
         raise HTTPException(status_code=500, detail=detail) from error
 
+    logger.info(
+        "ATS_GENERATE_REQUEST workflow_id=%s user_id=%s job_id=%s resume_id=%s "
+        "created_new=%s reuse_reason=%s force=%s status=%s",
+        workflow.id,
+        user_id,
+        job_id,
+        resume.id,
+        decision.created_new,
+        decision.reuse_reason or "none",
+        force,
+        workflow.workflow_status,
+    )
+
     # Always (re)schedule PENDING work. Fresh PENDING after restart must not sit idle.
     if workflow.workflow_status == "PENDING":
+        logger.info("ATS_BACKGROUND_TASK_SUBMITTED workflow_id=%s", workflow.id)
         background_tasks.add_task(run_workflow_job, workflow.id)
+    elif not decision.created_new and workflow.workflow_status in {
+        "ANALYZING_ORIGINAL",
+        "GENERATING_RESUME",
+        "VALIDATING_RESUME",
+        "ANALYZING_OPTIMIZED",
+    }:
+        logger.info(
+            "ATS_GENERATE_REUSED_IN_FLIGHT workflow_id=%s status=%s reuse_reason=%s",
+            workflow.id,
+            workflow.workflow_status,
+            decision.reuse_reason,
+        )
 
     result = workflow_to_dict(workflow, job)
     poll = generation_timeout_config()
@@ -821,6 +850,8 @@ def generate_ats_optimization(
         "message": "ATS optimization workflow accepted",
         "status": status,
         "workflow_id": workflow.id,
+        "created_new": decision.created_new,
+        "reuse_reason": decision.reuse_reason,
         "workflow_status": workflow.workflow_status,
         "poll_interval_ms": poll["poll_interval_ms"],
         "poll_timeout_seconds": poll["poll_timeout_seconds"],
@@ -851,16 +882,20 @@ def get_workflow_status(workflow_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/result/{user_id}/{job_id}")
-def get_result_by_job(user_id: int, job_id: int, db: Session = Depends(get_db)):
-    workflow = (
-        db.query(AtsOptimizationWorkflow)
-        .filter(
-            AtsOptimizationWorkflow.user_id == user_id,
-            AtsOptimizationWorkflow.job_id == job_id,
-        )
-        .order_by(AtsOptimizationWorkflow.id.desc())
-        .first()
+def get_result_by_job(
+    user_id: int,
+    job_id: int,
+    workflow_id: int | None = None,
+    db: Session = Depends(get_db),
+):
+    query = db.query(AtsOptimizationWorkflow).filter(
+        AtsOptimizationWorkflow.user_id == user_id,
+        AtsOptimizationWorkflow.job_id == job_id,
     )
+    if workflow_id is not None:
+        workflow = query.filter(AtsOptimizationWorkflow.id == workflow_id).first()
+    else:
+        workflow = query.order_by(AtsOptimizationWorkflow.id.desc()).first()
     if not workflow:
         raise HTTPException(status_code=404, detail="No ATS workflow result found for this job")
     job = db.query(Job).filter(Job.id == job_id).first()

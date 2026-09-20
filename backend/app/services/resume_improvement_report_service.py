@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.services.bullet_rewrite_service import is_near_identical
 from app.services.resume_structure_parser import parse_resume_structure
 
 
@@ -95,6 +96,82 @@ def build_meters(
     }
 
 
+_MAX_BULLET_CHANGES_RETURNED = 40
+
+
+def _labeled_bullets(structure: dict) -> list[tuple[str, str]]:
+    """Same traversal order as _all_bullets, paired with a stable section
+    label so bullet_changes can say WHICH employment/project a change is in."""
+    labeled: list[tuple[str, str]] = []
+    for emp in structure.get("employments") or []:
+        label = " ".join(
+            part for part in [emp.get("title"), emp.get("company")] if part
+        ) or "Professional Experience"
+        for bullet in emp.get("bullets") or []:
+            labeled.append((label, bullet))
+    for proj in structure.get("projects") or []:
+        label = proj.get("name") or "Projects"
+        for bullet in proj.get("bullets") or []:
+            labeled.append((label, bullet))
+    return labeled
+
+
+def _bullet_level_changes(original_structure: dict, optimized_structure: dict) -> list[dict[str, str]]:
+    """Pairs bullets by position within each employment/project (generation
+    rewrites wording in place; it does not reorder bullets within an entry)
+    and returns only the pairs whose text actually changed — the real,
+    reviewable "what did AI change" list, not just a count."""
+    original_labeled = _labeled_bullets(original_structure)
+    optimized_labeled = _labeled_bullets(optimized_structure)
+
+    changes: list[dict[str, str]] = []
+    for index, (label, generated_text) in enumerate(optimized_labeled):
+        generated_norm = generated_text.strip()
+        if index < len(original_labeled):
+            original_label, original_text = original_labeled[index]
+            original_norm = original_text.strip()
+        else:
+            # More bullets after optimization than before — genuinely new
+            # content (e.g. incorporated confirmed evidence as its own bullet).
+            original_label, original_norm = label, ""
+        if original_norm and is_near_identical(original_norm, generated_norm):
+            # A trivial reword (punctuation, casing, a word or two) is not a
+            # meaningful AI-authored change worth flagging for review.
+            continue
+        if original_norm == generated_norm:
+            continue
+        changes.append({
+            "section": original_label or label,
+            "original_text": original_norm,
+            "generated_text": generated_norm,
+            "change_type": "ADDED_FROM_CONFIRMED_EVIDENCE" if not original_norm else "REWRITTEN",
+        })
+        if len(changes) >= _MAX_BULLET_CHANGES_RETURNED:
+            break
+    return changes
+
+
+_SUMMARY_HEADING_RE = re.compile(r"summary|profile|objective", re.I)
+
+
+def _summary_section_content(structure: dict) -> str:
+    for section in structure.get("sections") or []:
+        if _SUMMARY_HEADING_RE.search(section.get("heading") or ""):
+            return (section.get("content") or "").strip()
+    return ""
+
+
+def _summary_change(original_structure: dict, optimized_structure: dict) -> dict[str, str] | None:
+    """Same idea as _bullet_level_changes but for the single Professional
+    Summary section — lets the editor show an inline "AI Improved" review
+    for the summary the same way it does for bullets."""
+    original = _summary_section_content(original_structure)
+    generated = _summary_section_content(optimized_structure)
+    if not generated or not original or is_near_identical(original, generated):
+        return None
+    return {"original_text": original, "generated_text": generated}
+
+
 def diff_summary(original_text: str, optimized_text: str) -> dict[str, Any]:
     original_structure = parse_resume_structure(original_text or "")
     optimized_structure = parse_resume_structure(optimized_text or "")
@@ -109,11 +186,15 @@ def diff_summary(original_text: str, optimized_text: str) -> dict[str, Any]:
         if (section.get("content") or "").strip() != original_sections.get(section.get("heading"), "")
     ]
 
-    original_bullets = {b.strip() for b in _all_bullets(original_structure)}
-    optimized_bullets = [b.strip() for b in _all_bullets(optimized_structure)]
-    bullets_rewritten = sum(1 for b in optimized_bullets if b not in original_bullets)
+    bullet_changes = _bullet_level_changes(original_structure, optimized_structure)
+    summary_change = _summary_change(original_structure, optimized_structure)
 
-    return {"sections_improved": sections_improved, "bullets_rewritten": bullets_rewritten}
+    return {
+        "sections_improved": sections_improved,
+        "bullets_rewritten": len(bullet_changes),
+        "bullet_changes": bullet_changes,
+        "summary_change": summary_change,
+    }
 
 
 def build_explanation(
@@ -182,6 +263,8 @@ def build_improvement_report(
         "keywords_added": keywords_added,
         "sections_improved": diff["sections_improved"],
         "bullets_rewritten": diff["bullets_rewritten"],
+        "bullet_changes": diff["bullet_changes"],
+        "summary_change": diff["summary_change"],
         "missing_skills_remaining": optimized_score_result.get("missing_mandatory_skills") or [],
         "ats_recommendations": optimized_score_result.get("suggestions") or [],
         "meters": meters,

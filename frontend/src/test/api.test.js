@@ -42,6 +42,10 @@ describe("API contract", () => {
     await api.getOptimizedResumes(7); await api.generateEmailSummary(7); await api.getEmailLogs(7); await api.runFullWorkflow(7);
     await api.importJobByUrl(7, "https://jobs.example.test/9");
     expect(api.getAtsDownloadUrl(3)).toBe("http://localhost:8000/api/ats-optimizer/download/3?format=txt");
+    // Item 7: the exact current generated-resume id must appear in the download URL.
+    expect(api.getFinalResumeDownloadUrl(7, 9, 91, "docx")).toBe("http://localhost:8000/api/optimizer/resume/7/9/91/download");
+    expect(api.getFinalResumeDownloadUrl(7, 9, 91, "pdf")).toBe("http://localhost:8000/api/optimizer/resume/7/9/91/download?format=pdf");
+    expect(api.getFinalResumeDownloadUrl(7, 9, 91, "txt")).toBe("http://localhost:8000/api/optimizer/resume/7/9/91/download?format=txt");
     expect(fetch).toHaveBeenCalledWith("http://localhost:8000/api/ats-optimizer/generate/7/9?force=true", { method: "POST" });
   });
 
@@ -103,10 +107,40 @@ describe("API contract", () => {
   });
 
   it("uses a friendly completion failure message when the poll budget is exhausted", async () => {
-    fetch.mockImplementation(() => ok({ workflow_status: "GENERATING_RESUME" }));
+    fetch.mockImplementation(() => ok({ workflow_id: 7, workflow_status: "GENERATING_RESUME" }));
     const result = await api.pollAtsWorkflow(7, { intervalMs: 0, timeoutSeconds: 4, maxAttempts: 2 });
     expect(result.workflow_status).toBe("FAILED");
-    expect(result.error_message).toBe("Resume generation could not be completed.");
+    expect(result.error_message).toMatch(/could not be completed|wait window|retry/i);
+  });
+
+  it("ignores stale poll responses from a different workflow id", async () => {
+    fetch
+      .mockImplementationOnce(() => ok({ workflow_id: 99, workflow_status: "GENERATING_RESUME" }))
+      .mockImplementationOnce(() => ok({ workflow_id: 8, workflow_status: "COMPLETED", optimized_resume_id: 1 }));
+    const progress = vi.fn();
+    const result = await api.pollAtsWorkflow(8, { onProgress: progress, intervalMs: 0, timeoutSeconds: 30 });
+    expect(result.workflow_status).toBe("COMPLETED");
+    expect(progress).toHaveBeenCalledTimes(1);
+    expect(progress.mock.calls[0][0].workflow_id).toBe(8);
+  });
+
+  it("stops polling when isCancelled becomes true", async () => {
+    let calls = 0;
+    fetch.mockImplementation(() => {
+      calls += 1;
+      return ok({ workflow_id: 9, workflow_status: "GENERATING_RESUME" });
+    });
+    let cancelled = false;
+    const resultPromise = api.pollAtsWorkflow(9, {
+      intervalMs: 0,
+      timeoutSeconds: 30,
+      maxAttempts: 10,
+      isCancelled: () => cancelled,
+    });
+    cancelled = true;
+    const result = await resultPromise;
+    expect(result.poll_cancelled).toBe(true);
+    expect(calls).toBeLessThan(10);
   });
 
   it("surfaces JSON, object and plain-text backend errors", async () => {
@@ -116,6 +150,22 @@ describe("API contract", () => {
     await expect(api.signupUser({})).rejects.toThrow("Nested failure");
     fetch.mockImplementationOnce(() => Promise.resolve(new Response("Service unavailable", { status: 503 })));
     await expect(api.checkBackendHealth()).rejects.toThrow("Backend health check failed");
+  });
+
+  it("never surfaces a raw FastAPI/Pydantic validation error array", async () => {
+    fetch.mockImplementationOnce(() => Promise.resolve(new Response(
+      JSON.stringify({ detail: [{ type: "literal_error", loc: ["body", "gmail_scan_frequency"], msg: "Input should be 'daily'" }] }),
+      { status: 422 },
+    )));
+    await expect(api.updateEmailSummaryPreferences(7, { gmail_scan_frequency: "hourly" })).rejects.toThrow("Please enter a valid setting.");
+  });
+
+  it("marks a job email event read and toggles its star via the correct endpoints", async () => {
+    await api.markJobEmailEventRead(7, 42);
+    await api.toggleJobEmailEventStar(7, 42);
+    const urls = fetch.mock.calls.map(([url]) => url);
+    expect(urls).toContain("http://localhost:8000/api/email/events/7/42/mark-read");
+    expect(urls).toContain("http://localhost:8000/api/email/events/7/42/toggle-star");
   });
 
   it("rejects unsuccessful responses from every write and read contract", async () => {

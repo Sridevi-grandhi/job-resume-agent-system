@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from docx import Document
@@ -299,7 +300,18 @@ def test_edit_endpoint_accepts_document_and_score_only(client, db_session, test_
     db_session.add(optimized)
     db_session.commit()
 
-    pdf = client.get(f"/api/optimizer/resume/{test_user.id}/{java_job.id}/{optimized.id}/download?format=pdf")
+    fake_pdf = tmp_path / "out.pdf"
+    fake_pdf.write_bytes(b"%PDF-1.4\n" + b"0" * 600)
+
+    def _fake_convert(docx_path, destination=None):
+        target = Path(destination) if destination else fake_pdf
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(fake_pdf.read_bytes())
+        return target
+
+    with patch("app.routes.optimizer_edit_routes.convert_docx_to_pdf", side_effect=_fake_convert):
+        with patch("app.routes.optimizer_edit_routes.validate_pdf_export", return_value={"valid": True, "page_count": 1}):
+            pdf = client.get(f"/api/optimizer/resume/{test_user.id}/{java_job.id}/{optimized.id}/download?format=pdf")
     assert pdf.status_code == 200
     assert pdf.headers["content-type"].startswith("application/pdf")
 

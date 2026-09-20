@@ -3,16 +3,12 @@ Provider-independent LLM client.
 
 Configured via environment variables:
   LLM_PROVIDER   - openai | openai_compatible | anthropic | none
-  LLM_MODEL      - model id (e.g. gpt-4o, claude-sonnet-4-20250514, llama3.1:8b)
-  LLM_API_KEY    - secret key (backend only; Ollama accepts any non-empty placeholder)
+  LLM_MODEL      - model id (e.g. gpt-4o, claude-sonnet-4-20250514)
+  LLM_API_KEY    - secret key (backend only)
   LLM_BASE_URL   - optional API base (defaults per provider)
-  LLM_TIMEOUT_SECONDS - read timeout per LLM attempt (default 180; local models may need more)
-  ATS_GENERATION_TIMEOUT_SECONDS - overall generate+fallback budget (default 300)
-  ATS_POLL_INTERVAL_MS - frontend poll interval hint (default 2000)
-  LLM_MAX_RETRIES     - retries for transient/invalid JSON only (default 2)
-  LLM_CONNECT_TIMEOUT_SECONDS - TCP connect timeout (default 5)
+  LLM_TIMEOUT_SECONDS - request timeout (default 60)
+  LLM_MAX_RETRIES     - transient retry count (default 2)
   LLM_TEMPERATURE     - generation temperature (default 0.1)
-  LLM_MAX_TOKENS      - completion cap (default 6144)
 
 Business rules stay outside this module. Validators remain deterministic.
 """
@@ -25,18 +21,17 @@ import os
 import re
 import time
 from typing import Any
-from urllib.parse import urljoin
 
 import requests
 
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VERSION = "ats-optimizer-v2"
+PROMPT_VERSION = "ats-optimizer-v1"
 
 
 class LLMGenerationError(RuntimeError):
-    """Provider failure carrying only a safe, normalized reason."""
+    """Provider failure carrying a safe, normalized reason code."""
 
     def __init__(self, reason: str):
         self.reason = reason
@@ -44,6 +39,7 @@ class LLMGenerationError(RuntimeError):
 
 
 def safe_llm_failure_reason(error: Exception) -> str:
+    """Convert provider exceptions into stable, non-sensitive reason codes."""
     if isinstance(error, LLMGenerationError):
         return error.reason
     if isinstance(error, requests.exceptions.Timeout):
@@ -55,28 +51,34 @@ def safe_llm_failure_reason(error: Exception) -> str:
         return "connection_failed"
     if isinstance(error, (json.JSONDecodeError, ValueError)):
         return "invalid_json"
+
     message = str(error).lower()
     if "model_not_found" in message or "http 404" in message:
         return "model_not_found"
     if "unsupported" in message and "provider" in message:
         return "unsupported_provider"
-    return "provider_error"
+    if "not configured" in message:
+        return "llm_not_configured"
+    return "unexpected_provider_error"
 
 
 def generation_timeout_config() -> dict[str, int]:
-    """Aligned LLM / workflow / frontend poll budgets. Never log secrets."""
-    llm_timeout = int(os.getenv("LLM_TIMEOUT_SECONDS") or "180")
-    connect_timeout = int(os.getenv("LLM_CONNECT_TIMEOUT_SECONDS") or "5")
+    """Return aligned LLM, workflow, and frontend polling time budgets."""
+    llm_timeout = max(1, int(os.getenv("LLM_TIMEOUT_SECONDS") or "180"))
+    connect_timeout = max(1, int(os.getenv("LLM_CONNECT_TIMEOUT_SECONDS") or "5"))
     overall = int(os.getenv("ATS_GENERATION_TIMEOUT_SECONDS") or "300")
-    poll_interval_ms = int(os.getenv("ATS_POLL_INTERVAL_MS") or "2000")
-    # Leave room after one LLM attempt for deterministic fallback + scoring.
+    poll_interval_ms = max(250, int(os.getenv("ATS_POLL_INTERVAL_MS") or "2000"))
     overall = max(overall, llm_timeout + 60)
     return {
-        "llm_timeout_seconds": max(1, llm_timeout),
-        "connect_timeout_seconds": max(1, min(connect_timeout, llm_timeout)),
+        "llm_timeout_seconds": llm_timeout,
+        "connect_timeout_seconds": min(connect_timeout, llm_timeout),
         "generation_timeout_seconds": overall,
-        "poll_interval_ms": max(250, poll_interval_ms),
+        "poll_interval_ms": poll_interval_ms,
         "poll_timeout_seconds": overall,
+        "stale_running_seconds": max(
+            overall + 60,
+            int(os.getenv("ATS_STALE_WORKFLOW_SECONDS") or "600"),
+        ),
     }
 
 
@@ -85,12 +87,9 @@ def llm_config() -> dict[str, Any]:
     model = (os.getenv("LLM_MODEL") or "").strip()
     api_key = (os.getenv("LLM_API_KEY") or "").strip()
     base_url = (os.getenv("LLM_BASE_URL") or "").strip().rstrip("/")
-    budgets = generation_timeout_config()
-    timeout = budgets["llm_timeout_seconds"]
-    connect_timeout = budgets["connect_timeout_seconds"]
+    timeout = int(os.getenv("LLM_TIMEOUT_SECONDS") or "60")
     max_retries = int(os.getenv("LLM_MAX_RETRIES") or "2")
     temperature = float(os.getenv("LLM_TEMPERATURE") or "0.1")
-    max_tokens = int(os.getenv("LLM_MAX_TOKENS") or "6144")
 
     if not base_url:
         if provider in ("openai", "openai_compatible"):
@@ -116,23 +115,58 @@ def llm_config() -> dict[str, Any]:
         "api_key": api_key,
         "base_url": base_url,
         "timeout": timeout,
-        "connect_timeout": connect_timeout,
-        "generation_timeout_seconds": budgets["generation_timeout_seconds"],
-        "poll_interval_ms": budgets["poll_interval_ms"],
-        "poll_timeout_seconds": budgets["poll_timeout_seconds"],
         "max_retries": max_retries,
         "temperature": max(0.0, min(1.0, temperature)),
-        "max_tokens": max(256, max_tokens),
         "enabled": provider not in ("", "none", "off", "disabled") and bool(api_key),
         "prompt_version": PROMPT_VERSION,
     }
 
 
-def _join_url(base: str, path: str) -> str:
-    """Join base + path without duplicating segments like /v1/v1/."""
-    root = (base or "").rstrip("/") + "/"
-    rel = (path or "").lstrip("/")
-    return urljoin(root, rel)
+BULLET_REWRITE_PROMPT_VERSION = "bullet-rewrite-v1"
+
+
+def bullet_rewrite_llm_config() -> dict[str, Any]:
+    """Independent config for the small bullet-level "Try Again" rewrite.
+
+    Deliberately separate from llm_config() (full-resume generation): Try
+    Again is intentionally routed to a local Ollama instance regardless of
+    what LLM_PROVIDER is set to for full generation — full-resume generation
+    and one-bullet rewriting are different-sized tasks with different
+    providers by design. Reuses LLM_BASE_URL/LLM_MODEL/LLM_API_KEY only when
+    the *main* provider is itself already "openai_compatible" (i.e. already
+    pointed at a local/Ollama-style endpoint) — never silently reuses a real
+    hosted-provider API key configured for full generation.
+    """
+    provider = (os.getenv("BULLET_REWRITE_LLM_PROVIDER") or "openai_compatible").strip().lower()
+    base_url = (os.getenv("BULLET_REWRITE_LLM_BASE_URL") or "").strip().rstrip("/")
+    model = (os.getenv("BULLET_REWRITE_LLM_MODEL") or "").strip()
+    api_key = (os.getenv("BULLET_REWRITE_LLM_API_KEY") or "").strip()
+    timeout = max(1, int(os.getenv("BULLET_REWRITE_LLM_TIMEOUT_SECONDS") or "30"))
+    max_retries = max(0, int(os.getenv("BULLET_REWRITE_LLM_MAX_RETRIES") or "1"))
+    temperature = float(os.getenv("BULLET_REWRITE_LLM_TEMPERATURE") or "0.3")
+
+    main_provider = (os.getenv("LLM_PROVIDER") or "").strip().lower()
+    reuse_main = main_provider == "openai_compatible"
+    if not base_url:
+        base_url = (os.getenv("LLM_BASE_URL") or "").strip().rstrip("/") if reuse_main else ""
+        base_url = base_url or "http://localhost:11434/v1"
+    if not model and reuse_main:
+        model = (os.getenv("LLM_MODEL") or "").strip()
+    if not api_key:
+        api_key = (os.getenv("LLM_API_KEY") or "").strip() if reuse_main else ""
+        api_key = api_key or "ollama"
+
+    return {
+        "provider": provider,
+        "model": model or "deterministic-fallback",
+        "api_key": api_key,
+        "base_url": base_url,
+        "timeout": timeout,
+        "max_retries": max_retries,
+        "temperature": max(0.0, min(1.0, temperature)),
+        "enabled": provider not in ("", "none", "off", "disabled") and bool(model),
+        "prompt_version": BULLET_REWRITE_PROMPT_VERSION,
+    }
 
 
 class LLMClient:
@@ -159,27 +193,11 @@ class LLMClient:
             return None
         base_url = str(self.config.get("base_url") or "").lower()
         local_hosts = ("localhost", "127.0.0.1", "host.docker.internal")
-        if "ollama" in base_url or (":11434" in base_url and any(host in base_url for host in local_hosts)):
+        if "ollama" in base_url or (
+            ":11434" in base_url and any(host in base_url for host in local_hosts)
+        ):
             return "ollama"
         return None
-
-    def _request_timeout(self) -> tuple[int, int]:
-        connect = int(self.config.get("connect_timeout") or 5)
-        read = int(self.config.get("timeout") or 180)
-        return (max(1, connect), max(1, read))
-
-    def _should_retry(self, error: Exception) -> bool:
-        reason = safe_llm_failure_reason(error)
-        # Timeouts and refused connections must fall back immediately — do not
-        # burn the overall generation budget on repeated long waits.
-        if reason in {"timeout", "connection_failed", "connection_refused", "model_not_found"}:
-            return False
-        message = str(error).lower()
-        if "transient" in message or "invalid_json" in reason:
-            return True
-        if isinstance(error, (json.JSONDecodeError, ValueError)):
-            return True
-        return reason in {"invalid_json", "provider_error"} and "http 4" not in message
 
     def generate_json(
         self,
@@ -195,74 +213,41 @@ class LLMClient:
         if not self.enabled:
             raise RuntimeError("LLM is not configured (set LLM_PROVIDER and LLM_API_KEY).")
 
-        prompt_chars = len(system_prompt or "") + len(user_prompt or "")
         logger.info(
-            "LLM_ATTEMPT_STARTED provider=%s model=%s service=%s base_url=%s "
-            "timeout_s=%s connect_s=%s prompt_chars=%s",
+            "LLM generation started provider=%s model=%s",
             self.provider,
             self.model,
-            self.service_name or "n/a",
-            self.config.get("base_url"),
-            self.config.get("timeout"),
-            self.config.get("connect_timeout"),
-            prompt_chars,
-        )
-        if self.service_name == "ollama" or ":11434" in str(self.config.get("base_url") or ""):
-            try:
-                health = self._ollama_probe()
-                if not health.get("reachable"):
-                    logger.info("LLM_PROBE_FAILED provider=%s reason=connection_failed", self.provider)
-                    raise LLMGenerationError("connection_failed")
-                if health.get("model_found") is False:
-                    logger.info(
-                        "LLM_PROBE_FAILED provider=%s reason=model_not_found model=%s",
-                        self.provider,
-                        self.model,
-                    )
-                    raise LLMGenerationError("model_not_found")
-            except LLMGenerationError:
-                raise
-            except Exception as error:
-                logger.info(
-                    "LLM_PROBE_FAILED provider=%s reason=%s",
-                    self.provider,
-                    safe_llm_failure_reason(error),
-                )
-                raise LLMGenerationError(safe_llm_failure_reason(error)) from error
-
-        logger.info(
-            "LLM_REQUEST_STARTED provider=%s model=%s prompt_chars=%s",
-            self.provider,
-            self.model,
-            prompt_chars,
         )
         last_error = None
         retries = max(0, int(self.config.get("max_retries") or 0))
         for attempt in range(retries + 1):
             try:
                 raw = self._dispatch(system_prompt, user_prompt, temperature)
-                logger.info("LLM_RESPONSE_RECEIVED provider=%s model=%s", self.provider, self.model)
                 parsed = self._extract_json(raw)
                 if not isinstance(parsed, dict):
                     raise RuntimeError("LLM JSON response was not an object.")
-                logger.info("LLM_PARSE_SUCCESS provider=%s model=%s", self.provider, self.model)
+                logger.info(
+                    "LLM generation succeeded provider=%s model=%s",
+                    self.provider,
+                    self.model,
+                )
                 return parsed
             except Exception as error:
                 last_error = error
-                reason = safe_llm_failure_reason(error)
-                if "Empty LLM" in str(error) or "not an object" in str(error) or "JSON" in str(error):
-                    logger.info("LLM_PARSE_FAILED provider=%s model=%s reason=%s", self.provider, self.model, reason)
                 logger.error(
-                    "LLM_REQUEST_ATTEMPT_FAILED provider=%s model=%s attempt=%s reason=%s",
+                    "LLM attempt failed provider=%s model=%s attempt=%s error=%s",
                     self.provider,
                     self.model,
                     attempt + 1,
-                    reason,
+                    type(error).__name__,
                 )
-                if attempt < retries and self._should_retry(error):
+                if attempt < retries:
                     time.sleep(min(8, 2 ** attempt))
-                    continue
-                break
+        # Preserve the real failure reason (timeout/connection/model_not_found/...)
+        # instead of discarding it into a generic wrapper — callers classify
+        # fallback_reason from this exception, and a mislabeled reason here
+        # both hides the true cause in logs and can defeat the workflow's
+        # retry-skip logic (see ats_optimization_workflow_service.execute_workflow).
         raise LLMGenerationError(safe_llm_failure_reason(last_error))
 
     def _dispatch(self, system_prompt: str, user_prompt: str, temperature: float) -> str:
@@ -271,10 +256,10 @@ class LLMClient:
             return self._openai_compatible(system_prompt, user_prompt, temperature)
         if provider == "anthropic":
             return self._anthropic(system_prompt, user_prompt, temperature)
-        raise LLMGenerationError("unsupported_provider")
+        raise RuntimeError(f"Unsupported LLM_PROVIDER: {provider}")
 
     def _openai_compatible(self, system_prompt: str, user_prompt: str, temperature: float) -> str:
-        url = _join_url(self.config["base_url"], "chat/completions")
+        url = f"{self.config['base_url']}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.config['api_key']}",
             "Content-Type": "application/json",
@@ -282,8 +267,6 @@ class LLMClient:
         payload = {
             "model": self.model,
             "temperature": temperature,
-            "stream": False,
-            "max_tokens": int(self.config.get("max_tokens") or 6144),
             "response_format": {"type": "json_object"},
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -294,7 +277,7 @@ class LLMClient:
             url=url,
             headers=headers,
             json=payload,
-            timeout=self._request_timeout(),
+            timeout=self.config["timeout"],
         )
         if response.status_code == 400 and "response_format" in (response.text or ""):
             payload.pop("response_format", None)
@@ -302,30 +285,29 @@ class LLMClient:
                 url=url,
                 headers=headers,
                 json=payload,
-                timeout=self._request_timeout(),
+                timeout=self.config["timeout"],
             )
-        if response.status_code == 404:
-            raise LLMGenerationError("model_not_found")
+        if response.status_code == 400 and "temperature" in (response.text or "").lower():
+            # Reasoning-tier models (o1/o3/gpt-5 family, ...) reject any
+            # non-default temperature outright. Retry once at the model's
+            # own default rather than treating this as a hard failure —
+            # otherwise every call to such a model 400s permanently.
+            payload.pop("temperature", None)
+            response = requests.post(
+                url=url,
+                headers=headers,
+                json=payload,
+                timeout=self.config["timeout"],
+            )
         if response.status_code == 429 or response.status_code >= 500:
             raise RuntimeError(f"Transient LLM HTTP {response.status_code}")
         if response.status_code != 200:
-            raise RuntimeError(f"LLM HTTP {response.status_code}")
+            raise RuntimeError(f"LLM HTTP {response.status_code}: {(response.text or '')[:300]}")
         data = response.json()
-        choices = data.get("choices") or []
-        if not choices:
-            raise RuntimeError("Empty LLM choices")
-        message = choices[0].get("message") or {}
-        content = message.get("content")
-        if content is None and isinstance(message.get("content"), list):
-            content = "".join(
-                part.get("text", "") for part in message["content"] if isinstance(part, dict)
-            )
-        if not content:
-            raise RuntimeError("Empty LLM response")
-        return content
+        return data["choices"][0]["message"]["content"]
 
     def _anthropic(self, system_prompt: str, user_prompt: str, temperature: float) -> str:
-        url = _join_url(self.config["base_url"], "v1/messages")
+        url = f"{self.config['base_url']}/v1/messages"
         headers = {
             "x-api-key": self.config["api_key"],
             "anthropic-version": "2023-06-01",
@@ -333,7 +315,7 @@ class LLMClient:
         }
         payload = {
             "model": self.model,
-            "max_tokens": int(self.config.get("max_tokens") or 8000),
+            "max_tokens": 8000,
             "temperature": temperature,
             "system": system_prompt,
             "messages": [
@@ -347,10 +329,8 @@ class LLMClient:
             url,
             headers=headers,
             json=payload,
-            timeout=self._request_timeout(),
+            timeout=self.config["timeout"],
         )
-        if response.status_code == 404:
-            raise LLMGenerationError("model_not_found")
         if response.status_code == 429 or response.status_code >= 500:
             raise RuntimeError(f"Transient LLM HTTP {response.status_code}")
         if response.status_code != 200:
@@ -360,29 +340,33 @@ class LLMClient:
         text = "".join(part.get("text", "") for part in parts if isinstance(part, dict))
         return text
 
-    def llm_status(self, *, probe: bool = True) -> dict[str, Any]:
+    def llm_config_status(self) -> dict[str, Any]:
+        """Configuration-only status — never makes a network call. Used by
+        /health, which must respond instantly for liveness/readiness probes
+        rather than round-tripping to an external LLM provider on every
+        check (see llm_status() for the active-probe variant, used
+        elsewhere where a real reachability check is wanted)."""
+        return {
+            "configured": self.enabled,
+            "provider": self.provider,
+            "model": self.model,
+            "reachable": None,
+        }
+
+    def llm_status(self) -> dict[str, Any]:
         status = {
             "configured": self.enabled,
             "provider": self.provider,
             "model": self.model,
-            "base_url": self.config.get("base_url") or "",
-            "service": self.service_name,
-            "timeout_seconds": self.config.get("timeout"),
             "reachable": False,
-            "model_found": None,
         }
-        if not self.enabled or not probe:
+        if not self.enabled:
             return status
         try:
             if self.provider == "openai":
                 status["reachable"] = self._check_openai_health()
             elif self.provider == "openai_compatible":
-                probe_result = self._ollama_probe() if self.service_name == "ollama" or ":11434" in str(self.config.get("base_url") or "") else {
-                    "reachable": self._check_openai_health(),
-                    "model_found": None,
-                }
-                status["reachable"] = bool(probe_result.get("reachable"))
-                status["model_found"] = probe_result.get("model_found")
+                status["reachable"] = self._check_ollama_health()
             elif self.provider == "anthropic":
                 status["reachable"] = self._check_anthropic_health()
         except Exception:
@@ -396,49 +380,28 @@ class LLMClient:
         return base
 
     def _check_openai_health(self) -> bool:
-        url = _join_url(self.config["base_url"], "models")
+        url = f"{self.config['base_url']}/models"
         headers = {
             "Authorization": f"Bearer {self.config['api_key']}",
         }
-        response = requests.get(url, headers=headers, timeout=min(5, int(self.config.get("timeout") or 5)))
+        response = requests.get(url, headers=headers, timeout=min(5, self.config["timeout"]))
         return response.status_code == 200
 
-    def _ollama_probe(self) -> dict[str, Any]:
+    def _check_ollama_health(self) -> bool:
         root = self._service_root()
-        url = _join_url(root, "api/tags")
+        url = f"{root}/api/tags"
         headers = {
             "Authorization": f"Bearer {self.config['api_key']}",
         }
-        response = requests.get(url, headers=headers, timeout=min(5, int(self.config.get("timeout") or 5)))
-        if response.status_code != 200:
-            return {"reachable": False, "model_found": None}
-        try:
-            payload = response.json() or {}
-        except Exception:
-            return {"reachable": True, "model_found": None}
-        names = {
-            str(item.get("name") or item.get("model") or "").strip()
-            for item in (payload.get("models") or [])
-            if isinstance(item, dict)
-        }
-        target = (self.model or "").strip()
-        found = None
-        if target:
-            found = target in names or any(
-                name == target or name.startswith(f"{target}:") or target.startswith(f"{name}:")
-                for name in names
-            )
-        return {"reachable": True, "model_found": found}
-
-    def _check_ollama_health(self) -> bool:
-        return bool(self._ollama_probe().get("reachable"))
+        response = requests.get(url, headers=headers, timeout=min(5, self.config["timeout"]))
+        return response.status_code == 200
 
     def _check_anthropic_health(self) -> bool:
-        url = _join_url(self.config["base_url"], "v1/models")
+        url = f"{self.config['base_url']}/v1/models"
         headers = {
             "x-api-key": self.config["api_key"],
         }
-        response = requests.get(url, headers=headers, timeout=min(5, int(self.config.get("timeout") or 5)))
+        response = requests.get(url, headers=headers, timeout=min(5, self.config["timeout"]))
         return response.status_code == 200
 
     @staticmethod

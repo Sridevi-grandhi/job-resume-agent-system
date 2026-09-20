@@ -146,7 +146,7 @@ Technical Skills
 Java, Spring Boot, React, PostgreSQL, AWS, Docker, Jenkins, Agile
 
 Professional Experience
-Acme Corp | Java Developer | Jan 2018 - Present
+Acme Corp | Java Full Stack Developer | Jan 2018 - Present
 - Developed REST APIs using Java and Spring Boot for account workflows.
 - Built React components for customer portals.
 - Deployed services with Docker and Jenkins on AWS.

@@ -121,6 +121,8 @@ describe("ATS optimizer", () => {
   it("shows Ollama only when backend explicitly identifies it", async () => {
     app.atsResult = {
       workflow_status: "COMPLETED", job,
+      validation_passed: true,
+      final_validation: { status: "passed", warnings: [] },
       generation_metadata: {
         generation_method: "llm", llm_used: true, fallback_used: false,
         llm_provider: "openai_compatible", llm_model: "llama3.1:8b", llm_service: "ollama",
@@ -128,7 +130,23 @@ describe("ATS optimizer", () => {
     };
     renderRoute(<AtsAnalyzerPage />, "/optimizer/42", "/optimizer/:jobId");
     fireEvent.click(screen.getByText(/Generate, Review/i));
-    expect(screen.getAllByText("Generation: Ollama · llama3.1:8b").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("AI Optimized · llama3.1:8b").length).toBeGreaterThan(0);
+  });
+
+  it("does not show AI Optimized when workflow validation failed", async () => {
+    app.atsResult = {
+      workflow_status: "VALIDATION_FAILED", job,
+      validation_passed: false,
+      final_validation: { status: "failed", errors: ["Protected field changed or missing: name"] },
+      generation_metadata: {
+        generation_method: "llm", llm_used: true, fallback_used: false,
+        llm_provider: "openai", llm_model: "gpt-5-mini",
+      },
+    };
+    renderRoute(<AtsAnalyzerPage />, "/optimizer/42", "/optimizer/:jobId");
+    fireEvent.click(screen.getByText(/Generate, Review/i));
+    expect(screen.getByText(/AI generation completed, but final resume validation failed/i)).toBeInTheDocument();
+    expect(screen.queryByText(/AI Optimized · gpt-5-mini/)).not.toBeInTheDocument();
   });
 
   it("shows deterministic fallback without mislabeling provider as Ollama", async () => {
@@ -142,9 +160,8 @@ describe("ATS optimizer", () => {
     };
     renderRoute(<AtsAnalyzerPage />, "/optimizer/42", "/optimizer/:jobId");
     fireEvent.click(screen.getByText(/Generate, Review/i));
-    expect(screen.getByText(/Generation: Deterministic fallback/)).toBeInTheDocument();
-    expect(screen.getByText(/Ollama was unavailable; deterministic optimization was used/)).toBeInTheDocument();
-    expect(screen.queryByText(/Generation: Ollama/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Optimized locally · AI response could not be safely applied/)).toBeInTheDocument();
+    expect(screen.queryByText(/AI Optimized/)).not.toBeInTheDocument();
   });
 
   it("exposes only five wizard steps and a Step 5 workspace for completed results", async () => {
@@ -180,6 +197,7 @@ describe("ATS optimizer", () => {
             sections: [{ id: "s1", type: "summary", heading: "Professional Summary", content: "Generated safe resume" }],
           },
           generated_score: 79, edited_score: 79, validation_status: "passed",
+          safe_to_download: true,
           score: {
             jd_match: 79,
             keyword_coverage: { matched: 5, required: 6 },
@@ -203,17 +221,87 @@ describe("ATS optimizer", () => {
     expect(screen.getByText(/Unsupported JD requirements excluded/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /^regenerate$/i })).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: /recalculate score/i }).length).toBeGreaterThan(0);
-    expect(screen.getByRole("link", { name: /download docx/i })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /download pdf/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /download docx/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /download pdf/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /download txt/i })).toBeInTheDocument();
+  });
+
+  it("recalculates score by saving current editor content without calling OpenAI", async () => {
+    app.atsResult = {
+      workflow_id: 9, workflow_status: "COMPLETED", job, optimized_resume_id: 91,
+      original_match_percentage: 70, optimized_match_percentage: 80, score_improvement: 10,
+      safe_to_apply: true, final_validation: { status: "passed", warnings: [] },
+      generated_resume: { plain_text: "Optimized resume body" },
+      validation_passed: true,
+    };
+    const patchCalls = [];
+    globalThis.fetch = vi.fn((url, options = {}) => {
+      const href = String(url);
+      if (href.includes("/api/optimizer/resume/") && options.method === "PATCH") {
+        patchCalls.push(JSON.parse(options.body || "{}"));
+        return Promise.resolve(new Response(JSON.stringify({
+          persisted: true,
+          edited_score: 80,
+          previous_edited_score: 80,
+          score_unchanged: true,
+          score_unchanged_reason: "Score remains 80%. Your edits did not change any scored ATS requirements.",
+          safe_to_download: true,
+          validation_passed: true,
+          validation: { status: "passed" },
+          score: {
+            jd_match: 80,
+            component_scores: { mandatory_skills: { earned: 30, max: 35 } },
+            keyword_coverage: { matched: 4, required: 5 },
+            mandatory_requirements: { covered: 3, total: 4, missing: [] },
+            preferred_requirements: { covered: 1, total: 2, missing: [] },
+          },
+          document: {
+            templateId: "professional-ats", pageSize: "letter", fontFamily: "Calibri", fontSize: 11, spacing: "normal", align: "left",
+            header: { name: "Pat", title: "", email: "p@example.com", phone: "", location: "", links: [] },
+            sections: [{ id: "s1", type: "summary", heading: "Professional Summary", content: "Optimized resume body" }],
+          },
+        }), { status: 200 }));
+      }
+      if (href.includes("/api/optimizer/resume/") && href.includes("/91")) {
+        return Promise.resolve(new Response(JSON.stringify({
+          optimized_resume_id: 91,
+          final_text: "Optimized resume body",
+          validation_status: "passed",
+          safe_to_download: true,
+          edited_score: 80,
+          document: {
+            templateId: "professional-ats", pageSize: "letter", fontFamily: "Calibri", fontSize: 11, spacing: "normal", align: "left",
+            header: { name: "Pat", title: "", email: "p@example.com", phone: "", location: "", links: [] },
+            sections: [{ id: "s1", type: "summary", heading: "Professional Summary", content: "Optimized resume body" }],
+          },
+          score: { jd_match: 80, keyword_coverage: { matched: 4, required: 5 }, mandatory_requirements: { covered: 3, total: 4, missing: [] }, preferred_requirements: { covered: 1, total: 2, missing: [] } },
+        }), { status: 200 }));
+      }
+      return Promise.resolve(new Response(JSON.stringify(job), { status: 200 }));
+    });
+    renderRoute(<AtsAnalyzerPage />, "/optimizer/42", "/optimizer/:jobId");
+    fireEvent.click(screen.getByText(/Generate, Review/i));
+    expect(await screen.findByRole("button", { name: /download docx/i })).toBeInTheDocument();
+    const recalculateButtons = screen.getAllByRole("button", { name: /recalculate score/i });
+    await userEvent.click(recalculateButtons[0]);
+    expect(await screen.findByText(/Score remains 80%/i)).toBeInTheDocument();
+    expect(patchCalls.length).toBeGreaterThan(0);
+    expect(patchCalls[0].persist).not.toBe(false);
+    expect(patchCalls[0].score_only).not.toBe(true);
+    expect(patchCalls[0].action).toBe("recalculate");
   });
 
   it("renders failure and retry without separate validation workflow steps", async () => {
-    app.atsResult = { workflow_id: 10, workflow_status: "VALIDATION_FAILED", job, score_status: "NOT_RECOMMENDED", role_alignment: "MISMATCH", safe_to_apply: false, error_message: "Validation failed", final_validation: { status: "failed", warnings: ["Unsupported claim"] } };
+    app.messages = { ats: "Unsupported methodology introduced: Scrum" };
+    app.atsResult = { workflow_id: 10, workflow_status: "VALIDATION_FAILED", job, score_status: "NOT_RECOMMENDED", role_alignment: "MISMATCH", safe_to_apply: false, error_message: "Unsupported methodology introduced: Scrum", final_validation: { status: "failed", warnings: ["Unsupported claim"] } };
     renderRoute(<AtsAnalyzerPage />, "/optimizer/42", "/optimizer/:jobId");
     await userEvent.click(screen.getByRole("button", { name: /retry/i }));
     expect(app.retryAtsWorkflow).toHaveBeenCalledWith(10);
     fireEvent.click(screen.getByText(/Generate, Review/i));
     expect(screen.getByRole("heading", { name: /Step 5/i })).toBeInTheDocument();
+    expect(screen.getAllByText("Unsupported methodology introduced: Scrum")).toHaveLength(1);
+    expect(screen.getByText("Calculating Optimized Match").closest("li")).not.toHaveClass("done");
+    expect(screen.getByText("Completed").closest("li")).not.toHaveClass("done");
   });
 
   it("shows mismatch warning and optimized preview in Step 5", async () => {
@@ -246,7 +334,7 @@ describe("ATS optimizer", () => {
     expect(await screen.findByText("-1")).toBeInTheDocument();
     expect(screen.getByText(/Major role mismatch detected/i)).toBeInTheDocument();
     expect(screen.getByDisplayValue("Truth-preserving resume")).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: /download docx/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /download docx/i })).toBeInTheDocument();
   });
 
   it("allows optimization continue with unsupported required skills as warnings", async () => {
@@ -323,7 +411,7 @@ describe("ATS optimizer", () => {
     expect(screen.getByRole("button", { name: /generate optimized resume/i })).toBeEnabled();
     expect(screen.getByText(/Remaining Gaps \(1\)/i)).toBeInTheDocument();
     expect(screen.getAllByText(/Healthcare/i).length).toBeGreaterThan(0);
-    expect(screen.getByText(/It will not be added to the optimized resume/i)).toBeInTheDocument();
+    expect(screen.getByText(/Mandatory requirement — no supported evidence/i)).toBeInTheDocument();
     expect(screen.queryAllByText(/Healthcare is not supported and will remain a gap/i)).toHaveLength(0);
     expect(screen.queryByText(/^Failed: Required evidence incomplete: Healthcare$/i)).not.toBeInTheDocument();
     expect(screen.getByText(/Ready to generate optimized resume/i)).toBeInTheDocument();
@@ -420,12 +508,12 @@ describe("ATS optimizer", () => {
     expect(within(unresolvedHeading.nextElementSibling).queryByText(/Kubernetes/i)).not.toBeInTheDocument();
     expect(within(unresolvedHeading.nextElementSibling).getByText(/None/i)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /continue to optimization/i })).toBeEnabled();
-    await userEvent.click(screen.getAllByRole("button", { name: /remove confirmation/i })[0]);
+    await userEvent.click(screen.getAllByRole("button", { name: /remove evidence/i })[0]);
     const confirmGroup = screen.getByRole("group", { name: /confirm removal of aws/i });
     expect(confirmGroup).toBeInTheDocument();
     await userEvent.click(within(confirmGroup).getByRole("button", { name: /^cancel$/i }));
     expect(app.deleteConfirmedSkill).not.toHaveBeenCalled();
-    await userEvent.click(screen.getAllByRole("button", { name: /remove confirmation/i })[0]);
+    await userEvent.click(screen.getAllByRole("button", { name: /remove evidence/i })[0]);
     const confirmGroupAgain = screen.getByRole("group", { name: /confirm removal of aws/i });
     await userEvent.click(within(confirmGroupAgain).getByRole("button", { name: /^remove$/i }));
     expect(app.deleteConfirmedSkill).toHaveBeenCalled();
@@ -677,7 +765,7 @@ describe("ATS optimizer", () => {
     ).toBeInTheDocument();
   });
 
-  it("styles Remove Confirmation as a danger button with friendly evidence labels", async () => {
+  it("styles Remove Evidence as a danger button with friendly evidence labels", async () => {
     app.missingSkillsGroups = {
       ...groups,
       can_generate_resume: true,
@@ -695,7 +783,8 @@ describe("ATS optimizer", () => {
     expect(screen.getByText("Cucumber")).toBeInTheDocument();
     expect(screen.getByText(/Professional experience confirmed/i)).toBeInTheDocument();
     expect(screen.queryByText(/USER_CONFIRMED_PROFESSIONAL/i)).not.toBeInTheDocument();
-    const removeBtn = screen.getByRole("button", { name: /remove confirmation for cucumber/i });
+    const removeBtn = screen.getByRole("button", { name: /remove evidence for cucumber/i });
     expect(removeBtn).toHaveClass("button", "danger");
+    expect(removeBtn).toHaveTextContent("Remove Evidence");
   });
 });

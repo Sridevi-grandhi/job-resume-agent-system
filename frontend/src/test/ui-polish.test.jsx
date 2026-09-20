@@ -29,7 +29,7 @@ describe("match score presentation", () => {
     expect(screen.getByText(/Resume Match/i)).toBeInTheDocument();
   });
 
-  it("renders the redesigned badge on selected job cards", () => {
+  it("renders the circular match score and neutral optimizer action on selected job cards", () => {
     app = makeApp({
       latestResume: { id: 1, file_name: "resume.txt" },
       matches: [{ job_id: 42, match_percentage: 67, resume_version: "original" }],
@@ -52,8 +52,31 @@ describe("match score presentation", () => {
     );
     expect(screen.getByText("67%")).toBeInTheDocument();
     expect(screen.getByText("Moderate Match")).toBeInTheDocument();
+    expect(screen.getByLabelText(/Resume match 67 percent — Moderate Match/i)).toHaveClass("match-score-ring", "tone-moderate");
     expect(screen.queryByText(/Resume Match 67%/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /optimize and compare scores/i })).toHaveClass("button", "secondary");
+    expect(screen.getByRole("button", { name: /optimize and compare scores/i })).not.toHaveClass("primary");
     expect(screen.getByRole("button", { name: /remove job/i })).toHaveClass("button", "danger");
+  });
+
+  it("hides the selected-job score ring when no match score exists", () => {
+    app = makeApp({ latestResume: { id: 1, file_name: "resume.txt" } });
+    render(
+      <JobCard
+        job={{
+          id: 43,
+          title: "Backend Engineer",
+          company: "Acme",
+          source: "User Selected Job",
+          description: "A complete backend engineering job description with enough detail for analysis.",
+          job_url: "https://jobs.example.test/43",
+        }}
+        selected
+        onRemove={() => {}}
+      />,
+    );
+
+    expect(screen.queryByLabelText(/Resume Match/i)).toBeNull();
   });
 });
 

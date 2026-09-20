@@ -96,6 +96,30 @@ def test_monitoring_tools_conflict_resolved_by_resume_support():
     assert "Splunk" in result["rejectedTechnologies"]
 
 
+def test_e2e_testing_tools_conflict_resolved_by_resume_support():
+    """Regression: 'Selenium OR Playwright OR Cypress' in a JD must not
+    cause all three to be force-added — only the one the candidate's own
+    resume actually supports."""
+    result = validate_technology_consistency(
+        jd_keywords=["Selenium", "Playwright", "Cypress"],
+        resume_text="Automated regression suites using Selenium and TestNG.",
+        supported_keywords=["Selenium", "Playwright", "Cypress"],
+    )
+    assert result["selectedTechnologies"] == ["Selenium"]
+    assert "Playwright" in result["rejectedTechnologies"]
+    assert "Cypress" in result["rejectedTechnologies"]
+
+
+def test_message_queue_conflict_resolved_by_resume_support():
+    result = validate_technology_consistency(
+        jd_keywords=["Kafka", "RabbitMQ"],
+        resume_text="Built event-driven pipelines using Kafka producers and consumers.",
+        supported_keywords=["Kafka", "RabbitMQ"],
+    )
+    assert "Kafka" in result["selectedTechnologies"]
+    assert "RabbitMQ" in result["rejectedTechnologies"]
+
+
 def test_empty_inputs_return_empty_results():
     result = validate_technology_consistency(jd_keywords=[], resume_text="", supported_keywords=[])
     assert result == {"selectedTechnologies": [], "rejectedTechnologies": [], "conflictWarnings": []}

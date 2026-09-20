@@ -21,6 +21,14 @@ def is_development_environment() -> bool:
     return env in {"", "development", "dev", "local", "test"}
 
 
+def show_dev_reset_link() -> bool:
+    """Both conditions required — APP_ENV alone is not enough. Production
+    must never expose the raw reset URL; local dev must opt in explicitly
+    rather than getting it automatically just because SMTP isn't set up."""
+    flag = (os.getenv("SHOW_DEV_RESET_LINK") or "false").strip().lower()
+    return is_development_environment() and flag in {"1", "true", "yes", "on"}
+
+
 def smtp_configured() -> bool:
     return bool((os.getenv("SMTP_HOST") or "").strip() and (os.getenv("SMTP_FROM_EMAIL") or "").strip())
 
@@ -124,8 +132,11 @@ def deliver_password_reset_email(*, recipient_email: str, reset_url: str, expire
         reset_url=reset_url,
         expires_minutes=expires_minutes,
     )
-    if is_development_environment() or not smtp_configured():
-        # Safe local/dev observability — never logs the user's password.
+    dev_logged = show_dev_reset_link()
+    if dev_logged:
+        # Explicit opt-in only (APP_ENV=development AND SHOW_DEV_RESET_LINK=true)
+        # — the raw token-bearing URL is a bearer credential; it is never
+        # logged by default, in any environment.
         logger.info(
             "AUTH_PASSWORD_RESET_URL_DEV to=%s expires_minutes=%s url=%s",
             recipient_email,
@@ -140,5 +151,5 @@ def deliver_password_reset_email(*, recipient_email: str, reset_url: str, expire
     )
     return {
         **result,
-        "dev_logged": is_development_environment() or not smtp_configured(),
+        "dev_logged": dev_logged,
     }

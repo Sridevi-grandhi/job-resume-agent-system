@@ -35,6 +35,9 @@ TABLE_COLUMN_DDL = {
         "llm_used": "ALTER TABLE ats_optimization_workflows ADD COLUMN llm_used BOOLEAN",
         "fallback_used": "ALTER TABLE ats_optimization_workflows ADD COLUMN fallback_used BOOLEAN",
         "fallback_reason": "ALTER TABLE ats_optimization_workflows ADD COLUMN fallback_reason VARCHAR(80)",
+        "generation_duration_ms": "ALTER TABLE ats_optimization_workflows ADD COLUMN generation_duration_ms INTEGER",
+        "generation_diagnostics_json": "ALTER TABLE ats_optimization_workflows ADD COLUMN generation_diagnostics_json TEXT",
+        "last_activity_at": "ALTER TABLE ats_optimization_workflows ADD COLUMN last_activity_at TIMESTAMP WITH TIME ZONE",
     },
     "user_confirmed_skills": {
         "requirement_type": "ALTER TABLE user_confirmed_skills ADD COLUMN requirement_type VARCHAR(20)",
@@ -62,6 +65,17 @@ TABLE_COLUMN_DDL = {
         "workflow_run_id": "ALTER TABLE user_confirmed_skills ADD COLUMN workflow_run_id VARCHAR(120)",
         "is_active": "ALTER TABLE user_confirmed_skills ADD COLUMN is_active BOOLEAN DEFAULT TRUE",
         "superseded_at": "ALTER TABLE user_confirmed_skills ADD COLUMN superseded_at TIMESTAMP WITH TIME ZONE",
+    },
+    "discovered_jobs": {
+        # ACTIVE | EXPIRED | UNKNOWN — see DiscoveredJob model +
+        # job_availability_service. Existing rows must default to UNKNOWN
+        # (never ACTIVE) since they were never actually checked.
+        "availability_status": "ALTER TABLE discovered_jobs ADD COLUMN availability_status VARCHAR(20) NOT NULL DEFAULT 'UNKNOWN'",
+        "availability_checked_at": "ALTER TABLE discovered_jobs ADD COLUMN availability_checked_at TIMESTAMP WITH TIME ZONE",
+        "availability_reason": "ALTER TABLE discovered_jobs ADD COLUMN availability_reason VARCHAR(300)",
+        # "provider" | "enrichment" | NULL — see DiscoveredJob model +
+        # job_enrichment_service. Diagnostics only.
+        "direct_url_source": "ALTER TABLE discovered_jobs ADD COLUMN direct_url_source VARCHAR(20)",
     },
     "optimized_resumes": {
         "generated_resume_text": "ALTER TABLE optimized_resumes ADD COLUMN generated_resume_text TEXT",

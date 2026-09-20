@@ -1,9 +1,32 @@
-:root{--navy:#06162e;--navy2:#0b2142;--blue:#1768e8;--blue2:#2c7cf2;--green:#10b981;--amber:#f59e0b;--purple:#7959ed;--muted:#6f7f98;--line:#dfe6f0;--soft:#f6f8fc;--shadow:0 8px 30px rgba(28,48,78,.08)}
+:root{--navy:#06162e;--navy2:#0b2142;--blue:#1768e8;--blue2:#2c7cf2;--green:#10b981;--amber:#f59e0b;--purple:#7959ed;--muted:#5f708b;--line:#dfe6f0;--soft:#f6f8fc;--shadow:0 8px 30px rgba(28,48,78,.08);--font-xs:.75rem;--font-sm:.8125rem;--font-body-sm:.875rem;--font-body:.9375rem;--font-base:1rem;--font-medium:1.0625rem;--font-lg:1.125rem;--font-xl:1.25rem;--font-2xl:1.5rem;--font-3xl:1.75rem}
 .shell{min-height:100vh;display:grid;grid-template-columns:230px 1fr;padding:14px;background:#f3f6fb}.shell>main{min-width:0;background:#fff;border-radius:0 16px 16px 0;box-shadow:var(--shadow)}
 .sidebar{height:calc(100vh - 28px);position:sticky;top:14px;padding:22px 14px;background:linear-gradient(165deg,#07172f,#041226);color:#fff;display:flex;flex-direction:column;border-radius:16px 0 0 16px;z-index:20}.brand{display:flex;align-items:center;gap:10px;padding:0 7px 22px;font-size:16px}.brand>span,.auth-brand>span,.auth-mini-brand>span{display:grid;place-items:center;width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,#3789ff,#1154d4);box-shadow:0 6px 18px #1768e866;font-size:12px;font-weight:800}.brand em{font-style:normal;color:#65a8ff}.sidebar nav{display:grid;gap:5px}.sidebar nav a{display:flex;align-items:center;gap:13px;padding:11px 12px;text-decoration:none;color:#c5d1e5;font-size:13px;border-radius:9px}.sidebar nav a:hover{background:#ffffff12;color:#fff}.sidebar nav a.active{color:#fff;background:linear-gradient(100deg,#1557cd,#1b66ef);box-shadow:0 8px 20px #064bb544}.sidebar nav svg{width:18px}.upgrade{margin-top:auto;padding:15px;border-radius:12px;background:linear-gradient(120deg,#164f9c,#6331a4);font-size:12px}.upgrade div{color:#ffd54a;font-size:20px}.upgrade p{color:#cbd6f1;margin:5px 0 0;line-height:1.45;font-size:11px}.user-menu{margin-top:14px;border:1px solid #ffffff20;background:transparent;color:#fff;border-radius:10px;padding:9px;display:flex;align-items:center;gap:9px;text-align:left;cursor:pointer}.user-menu>span,.top-avatar{display:grid;place-items:center;width:34px;height:34px;border-radius:50%;background:#513795}.user-menu div{min-width:0;flex:1}.user-menu b,.user-menu small{display:block;overflow:hidden;text-overflow:ellipsis}.user-menu b{font-size:12px}.user-menu small{color:#91a1ba;font-size:9px;margin-top:3px}.user-menu i{font-style:normal;color:#8fa0ba}
-.topbar{min-height:84px;padding:18px 34px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #edf0f5}.topbar h1{margin:0;font-size:22px;letter-spacing:-.6px}.topbar h1 span{font-size:18px}.topbar p{margin:5px 0 0;color:var(--muted);font-size:12px}.top-actions{display:flex;align-items:center;gap:13px}.backend{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:999px;padding:8px 12px;font-size:10px;font-weight:700}.backend i{width:7px;height:7px;background:var(--green);border-radius:50%}.backend.offline i{background:#ef4444}.notification{position:relative;width:35px;height:35px;border:1px solid var(--line);background:#fff;border-radius:50%}.notification b{position:absolute;right:-3px;top:-4px;background:#ef4444;color:#fff;font-size:8px;padding:2px 5px;border-radius:10px}.top-avatar{color:#fff;font-size:13px}.mobile-menu{display:none}
+.topbar{min-height:84px;padding:18px 34px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid #edf0f5}.topbar h1{margin:0;font-size:22px;letter-spacing:-.6px}.topbar h1 span{font-size:18px}.topbar p{margin:5px 0 0;color:var(--muted);font-size:12px}.top-actions{display:flex;align-items:center;gap:13px}.backend{display:flex;align-items:center;gap:8px;border:1px solid var(--line);border-radius:999px;padding:8px 12px;font-size:10px;font-weight:700}.backend i{width:7px;height:7px;background:var(--green);border-radius:50%}.backend.offline i{background:#ef4444}.notification-wrap{position:relative}.notification{position:relative;width:35px;height:35px;border:1px solid var(--line);background:#fff;border-radius:50%;display:grid;place-items:center;color:#41516c;cursor:pointer}.notification:hover{background:var(--soft);border-color:#c7d5ea}.notification[aria-expanded="true"]{background:#eaf3ff;border-color:#9dc2f7;color:var(--blue)}.notification b{position:absolute;right:-3px;top:-4px;background:#ef4444;color:#fff;font-size:8px;padding:2px 5px;border-radius:10px;line-height:1}.top-avatar{color:#fff;font-size:13px}.mobile-menu{display:none}
+.notification-dropdown{position:absolute;top:calc(100% + 10px);right:0;width:320px;max-width:min(320px,calc(100vw - 40px));background:#fff;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);z-index:30;overflow:hidden}
+.notification-dropdown-header{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid #edf0f5;font-size:11px;font-weight:700;color:var(--navy)}
+.notification-mark-all{border:0;background:none;color:var(--blue);font-size:9px;font-weight:700;cursor:pointer;padding:0}
+.notification-list{list-style:none;margin:0;padding:0;max-height:340px;overflow-y:auto}
+.notification-row{display:block;width:100%;text-align:left;border:0;background:none;padding:11px 14px;border-bottom:1px solid #f2f5fa;cursor:pointer}
+.notification-row:last-child{border-bottom:0}
+.notification-row:hover{background:var(--soft)}
+.notification-row.unread{background:#eef5ff}
+.notification-row.unread:hover{background:#e3edfd}
+.notification-row-title{display:flex;align-items:center;gap:6px;font-size:10px;font-weight:700;color:#1a2942}
+.notification-row.unread .notification-row-title::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--blue);flex:0 0 auto}
+.notification-row-message{display:block;margin-top:3px;font-size:9px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.notification-row-time{display:block;margin-top:4px;font-size:8px;color:#9aa8bf}
+.notification-empty{padding:26px 14px;text-align:center;font-size:10px;color:var(--muted)}
 .dashboard,.page{padding:18px 34px 36px}.workflow-progress{border:1px solid var(--line);border-radius:15px;padding:18px 16px;display:grid;grid-template-columns:repeat(8,1fr);box-shadow:0 3px 15px #203c6710}.workflow-progress a{text-decoration:none;text-align:center;position:relative}.flow-icon{margin:0 auto 7px;width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#227cf5,#174dd9);color:#fff;display:grid;place-items:center;box-shadow:0 7px 16px #1768e833}.workflow-progress a.done .flow-icon{background:linear-gradient(135deg,#14b985,#25cc9a)}.workflow-progress b{display:block;font-size:11px}.workflow-progress small{display:block;font-size:9px;color:#71829e;margin-top:3px}.connector{position:absolute;top:20px;left:calc(50% + 28px);width:calc(100% - 56px);border-top:2px dotted #c1d5f6}.metrics{display:grid;grid-template-columns:repeat(5,1fr);gap:15px;margin:16px 0}.metric{display:flex;align-items:center;justify-content:space-between;border:1px solid var(--line);padding:16px;border-radius:12px;box-shadow:var(--shadow)}.metric span{display:block;font-size:10px;font-weight:600;color:#41516c}.metric strong{display:block;font-size:23px;margin:6px 0 1px}.metric small{font-size:9px;color:var(--green)}.metric>i{width:43px;height:43px;border-radius:50%;display:grid;place-items:center;color:var(--blue);background:#eaf3ff}.metric>i.green{background:#e9f8ef;color:#20a44e}.metric>i.amber{background:#fff6e4;color:#eea216}.metric>i.purple{background:#f2ecff;color:#8053e9}.metric>i.sky{background:#eaf6ff;color:#1588eb}
 .dash-grid{display:grid;grid-template-columns:1.25fr 1fr 1fr;gap:16px}.panel{border:1px solid var(--line);border-radius:13px;padding:16px;background:#fff;box-shadow:var(--shadow);min-width:0}.panel>header{display:flex;justify-content:space-between;gap:10px;align-items:flex-start;margin-bottom:14px}.panel>header h3,.results-head h3{margin:0;font-size:14px}.panel>header p,.results-head p{margin:4px 0 0;color:var(--muted);font-size:10px}.text-button{font-size:10px;color:var(--blue);text-decoration:none;border:1px solid var(--line);padding:6px 9px;border-radius:6px}.stack{display:grid;gap:7px}.job-card{border:1px solid var(--line);border-radius:11px;padding:14px;display:flex;gap:12px;background:#fff}.job-card.compact{padding:8px}.company-mark{width:38px;height:38px;flex:0 0 auto;border-radius:9px;background:linear-gradient(135deg,#4e42e8,#2a86f5);display:grid;place-items:center;color:#fff;font-weight:700}.job-copy{min-width:0;flex:1}.job-title-row{display:flex;justify-content:space-between;gap:10px}.job-card h3{margin:0;font-size:12px}.job-card p{margin:3px 0;color:#526783;font-size:9px}.tags{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}.tags span,.badge{padding:4px 7px;border-radius:999px;font-size:8px;font-weight:600;background:#eef3ff;color:#4163ad}.badge.success{background:#e7f8ee;color:#07964c}.badge.warning{background:#fff3db;color:#c27b00}.badge.neutral{background:#f0f3f7;color:#6d7a90}.card-actions{display:flex;gap:8px;margin-top:11px}.button{border:0;border-radius:8px;padding:9px 13px;font-size:10px;font-weight:700;cursor:pointer;text-decoration:none;display:inline-flex;justify-content:center;align-items:center}.button:hover{transform:translateY(-1px)}.button.primary{background:linear-gradient(100deg,#1766df,#1b61ea);color:#fff;box-shadow:0 6px 14px #1768e82e}.button.secondary{background:#fff;border:1px solid var(--line);color:#165ac7}.button.wide{width:100%}
+/* Top Job Matches — fixed-height card with its own internal scroll, so a
+   long match list never grows the whole Dashboard page; only .stack (the
+   job list body) scrolls, the header/View all stay put. Scoped to this one
+   panel only — .panel/.stack themselves stay unchanged for every other use. */
+.top-job-matches-panel{display:flex;flex-direction:column;max-height:420px}
+.top-job-matches-panel>header{flex:0 0 auto}
+.top-job-matches-panel .stack{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:2px}
+.top-job-matches-panel .empty{flex:0 0 auto;margin:0}
+@media(max-width:850px){.top-job-matches-panel{max-height:360px}}
 .score-overview{display:flex;align-items:center;gap:18px}.score-ring{width:118px;height:118px;border-radius:50%;background:conic-gradient(var(--green) 0 var(--score),#2475ea var(--score) 290deg,#e8edf4 290deg);display:grid;place-items:center}.score-ring>span{width:80px;height:80px;border-radius:50%;background:#fff;display:grid;place-content:center;text-align:center}.score-ring b{font-size:21px}.score-ring small{font-size:8px;color:var(--muted)}.legend{flex:1}.legend p,.distribution p{display:flex;align-items:center;gap:6px;font-size:9px;padding:7px 0;margin:0;border-bottom:1px solid #edf0f5}.legend p b,.distribution p b{margin-left:auto}.legend i,.distribution i{width:7px;height:7px;border-radius:2px;background:var(--blue)}.legend i.green,.distribution i.green{background:var(--green)}.legend i.amber,.distribution i.amber{background:var(--amber)}.best-match{display:flex;justify-content:space-between;margin-top:14px;padding:10px;border:1px solid var(--line);border-radius:9px;font-size:9px}.best-match span strong{display:block;font-size:10px;margin-top:3px}.best-match>b{font-size:15px;color:#08a457}.activity>div{display:flex;gap:10px;padding:10px 0;border-bottom:1px solid #edf0f5}.activity i{width:27px;height:27px;border-radius:50%;display:grid;place-items:center;background:#eaf3ff;color:var(--blue);font-style:normal}.activity b,.activity small{display:block;font-size:10px}.activity small{font-size:8px;color:var(--muted);margin-top:3px}
 .page-heading{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px}.page-heading h2{font-size:20px;margin:0}.page-heading p{color:var(--muted);font-size:11px;margin:5px 0 0}.actions{display:flex;gap:8px}.notice{padding:9px 11px;margin:12px 0;background:#ebf4ff;color:#145bc4;border-radius:8px;font-size:10px}.notice.error{background:#fff0f0;color:#c33}.notice.warning{background:#fff7ed;color:#9a3412;border:1px solid #fdba74}.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.form-grid label,.auth-card label{font-size:10px;font-weight:600;color:#34425b}.form-grid input,.form-grid textarea,.auth-card input{display:block;width:100%;margin-top:6px;padding:10px 11px;border:1px solid var(--line);border-radius:7px;background:#fbfcfe;outline:none;font-size:11px;color:#17233a}.form-grid input:focus,.form-grid textarea:focus,.auth-card input:focus{border-color:#6da5f5;box-shadow:0 0 0 3px #1768e812}.form-grid .full,.form-actions{grid-column:1/-1}.form-actions{display:flex;justify-content:flex-end;gap:9px;margin-top:5px}.two-col{display:grid;grid-template-columns:1fr 1fr;gap:18px}.dropzone{min-height:240px;border:1.5px dashed #a8c6ef;border-radius:10px;background:#fbfdff;display:flex;flex-direction:column;align-items:center;justify-content:center;cursor:pointer}.dropzone>div{font-size:34px;color:var(--blue)}.dropzone h3{font-size:12px;margin:10px 0 4px}.dropzone p{color:var(--muted);font-size:10px;margin:0 0 12px}.upload-btn{margin-top:12px}.file-summary{display:flex;align-items:center;gap:12px;background:#f7f9fc;padding:14px;border-radius:9px}.file-summary i{font-size:25px;color:var(--blue)}.file-summary b,.file-summary small{display:block;font-size:11px}.file-summary small{color:var(--muted);margin-top:3px}.resume-info h4{font-size:11px;margin:16px 0 7px}.text-preview{max-height:300px;overflow:auto;white-space:pre-wrap;padding:14px;border:1px solid var(--line);border-radius:9px;background:#f8fafc;color:#4b5b72;font-size:10px;line-height:1.65}.text-preview.tall{max-height:440px}.results-head{margin:20px 0 12px}.results-head span{color:var(--blue);background:#eaf3ff;padding:3px 6px;border-radius:10px;margin-left:4px}.job-grid,.document-grid,.email-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}.selected-layout{grid-template-columns:1.05fr .95fr}
 .empty{text-align:center;border:1px dashed #cbd5e3;border-radius:10px;padding:34px 16px;color:var(--muted)}.empty div{width:38px;height:38px;border-radius:50%;background:#eaf3ff;color:var(--blue);display:grid;place-items:center;margin:0 auto 9px}.empty strong{display:block;color:#293850;font-size:11px}.empty p{font-size:9px;margin:5px 0 0}.match-summary{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:15px}.big-score b{font-size:32px}.big-score span{display:block;font-size:9px;color:var(--green);margin:3px 0 12px}.big-score>div{height:7px;background:#e8edf5;border-radius:10px;overflow:hidden}.big-score i{display:block;height:100%;background:linear-gradient(90deg,#1f73eb,#24c4a0)}.distribution{display:flex;gap:22px;align-items:center}.mini-ring{width:80px;height:80px;border-radius:50%;background:conic-gradient(var(--green) 0 var(--high),var(--blue) var(--high) 290deg,var(--amber) 290deg);position:relative}.mini-ring:after{content:"";position:absolute;inset:18px;border-radius:50%;background:#fff}.distribution>div:last-child{flex:1}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:11px}table{border-collapse:collapse;width:100%;font-size:9px}th{text-align:left;background:#f8fafc;color:#718099;font-size:8px;text-transform:uppercase;letter-spacing:.03em}th,td{padding:12px;border-bottom:1px solid #edf0f5;vertical-align:top;min-width:90px}td b,td small{display:block}td small{color:var(--muted);margin-top:4px}.percent{color:#09a65a}.email-card{border:1px solid var(--line);border-radius:12px;padding:15px;box-shadow:var(--shadow)}.email-card header{display:flex;gap:10px;align-items:center}.mail-icon{width:34px;height:34px;border-radius:50%;display:grid;place-items:center;background:#fff3dd;color:#e58c00}.email-card header>div:nth-child(2){flex:1}.email-card h3{font-size:12px;margin:0}.email-card p{font-size:9px;color:var(--muted);margin:3px 0}.email-preview{margin:14px 0;padding:12px;background:#f8fafc;border-radius:8px;max-height:130px;overflow:auto;white-space:pre-wrap;font-size:9px;line-height:1.6}.email-card footer{font-size:8px;color:var(--muted)}
@@ -16,10 +39,103 @@
 .form-grid select{display:block;width:100%;margin-top:6px;padding:10px 11px;border:1px solid var(--line);border-radius:7px;background:#fbfcfe;outline:none;font-size:11px;color:#17233a}
 .form-grid select:focus{border-color:#6da5f5;box-shadow:0 0 0 3px #1768e812}
 .form-grid textarea{resize:vertical;min-height:76px}
+.selected-jobs-page{min-width:0;overflow:visible}
+/* Desktop: the grid row needs a genuinely DEFINITE height for equal-height
+   stretch to work — a plain implicit grid row's `auto` (or `min-content`)
+   track still sizes to the tallest child's content height regardless of
+   a shorter item's min-height:0 (verified live, twice: an unconstrained
+   row let the right column's full unbounded job list drag the whole row,
+   and the left column with it, past 3000px), so without an EXPLICIT
+   container height, none of this is safe against job count. Giving
+   .selected-layout itself a definite height sidesteps that ambiguity
+   entirely: height:100% on each child is then unambiguous, align-items:
+   stretch makes both cards match it exactly (equal height, bottoms
+   aligned), and only then does the right panel's own
+   flex:1;min-height:0;overflow-y:auto list correctly bound and scroll
+   instead of growing the page.
+
+   That definite height is max(920px, calc(100vh - 195px)) — not a plain
+   viewport calc alone. 195px is the measured distance from the viewport
+   top to this row (topbar + page padding + page heading), same as
+   before; on a generously tall viewport calc(100vh - 195px) is what
+   actually governs, exactly as previously. 920px is the measured natural
+   height of the Import Selected Job card with Job Description at its own
+   fixed, capped height (see .job-description-textarea below) — i.e. a
+   REAL, FIXED upper bound on how tall that card ever needs to be, now
+   that its one variable-length field can no longer grow it (861px
+   measured live, plus headroom for the optional post-fetch status
+   block). max() guarantees the row is never shorter than that, so the
+   Import card's own content — including Save Selected Job and its helper
+   text — can never be clipped by or spill past the shared row, at any
+   zoom level, without needing the form itself to scroll (which stays
+   exactly as forbidden as before — see below). The trade-off is the
+   opposite of before: on a very short viewport the PAGE may need a small
+   amount of ordinary scroll to reach the very bottom of both cards
+   (never just one card spilling outside itself), which is the
+   longstanding, explicitly-accepted fallback used everywhere on this
+   page — not a new one. */
+.selected-jobs-page .selected-layout{grid-template-columns:minmax(0,1.05fr) minmax(0,.95fr);grid-template-rows:minmax(0,1fr);align-items:stretch;min-width:0;height:max(920px, calc(100vh - 195px))}
+.selected-import-panel,.selected-saved-panel,.selected-jobs-scroll{min-width:0}
+/* Import Selected Job stays a plain, non-scrolling card — height:100%
+   only bounds its own box to the shared row for top/bottom alignment with
+   Saved Selected Jobs (item 7). Deliberately NO overflow-y here and NONE
+   on the form itself: the only scrollable region on the left is the Job
+   Description textarea below (.job-description-textarea) — everything
+   else stays in plain document flow, matching the exact behavior asked
+   for here. This is now safe against every zoom level because the shared
+   row (see the comment above) is guaranteed to always be at least as
+   tall as this card's own fixed natural content height. */
+.selected-import-panel{height:100%;min-height:0;display:flex;flex-direction:column}
+.selected-import-panel>header{flex:0 0 auto}
+.selected-saved-panel{height:100%;min-height:0;display:flex;flex-direction:column}
+.selected-saved-panel>header{flex:0 0 auto;flex-wrap:wrap}
+.selected-saved-panel>header>div{min-width:0}
+.selected-saved-panel>.notice{flex:0 0 auto}
+/* No overflow:hidden anywhere in this chain — that was the earlier cause
+   of the invisible page-wide divider/clipping bug, and must not return. */
+.selected-jobs-scroll{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;padding-right:2px}
+.selected-jobs-scroll .empty{margin:0}
+/* Job action buttons (View Job / Optimize and Compare Scores / Remove Job)
+   keep their label on one line at normal card widths — the shared
+   .card-actions/.button rules have no white-space control, so a button
+   narrower than its own text (e.g. three buttons sharing one row) wraps
+   mid-word ("View" / "Job") by default. If the row genuinely can't fit
+   all three at their natural width, the row wraps as a whole (a second
+   line of buttons) instead of shrinking any one label into a wrap.
+   Scoped to Selected Jobs' saved-job cards only — Job Search's identical
+   JobCard markup is untouched. */
+.selected-jobs-scroll .card-actions{flex-wrap:wrap}
+.selected-jobs-scroll .card-actions .button{white-space:nowrap;flex:0 1 auto}
+@media(max-width:1100px){
+  .selected-jobs-page .selected-layout{grid-template-columns:1fr;grid-template-rows:none;height:auto}
+  /* Stacked layout: forcing the two cards to equal height (or a cramped
+     internal scroll list) hurts usability here (item 13) — revert to
+     natural height and let the page itself scroll, same as every other
+     stacked panel on this page. */
+  .selected-import-panel,.selected-saved-panel{height:auto;display:block;min-height:0}
+  .selected-jobs-scroll{overflow:visible}
+}
+/* Job Description is the ONLY scrollable region inside Import Selected
+   Job — a fixed, controlled box with its own internal scroll for long
+   text, so it never grows to expand the panel around it (the panel itself
+   has no overflow-y of its own, by design). resize:none overrides the
+   shared .form-grid textarea rule's resize:vertical deliberately: a
+   manually-dragged-taller textarea would defeat that same fixed-height
+   guarantee. Scoped to this one textarea only — every other field/page
+   using .form-grid textarea (e.g. Preferences' Skills box) is untouched. */
+.selected-jobs-page textarea.job-description-textarea{height:150px;min-height:120px;max-height:160px;overflow-y:auto;resize:none}
 .page-navigation{display:flex;align-items:center;justify-content:flex-end;gap:14px;margin-top:20px;padding-top:18px;border-top:1px solid var(--line)}
 .page-navigation-message{margin:0;color:#a36500;font-size:11px}
 @media(max-width:520px){.page-navigation{align-items:flex-end;flex-direction:column}.page-navigation-message{text-align:right}}
 .job-match-badges{display:flex;align-items:flex-end;flex-direction:column;gap:5px}
+/* Selected Jobs' explicit non-score states (Calculating.../Match
+   unavailable/Unable to calculate) — same pill language as the existing
+   .badge tones, just semantically distinct so an eligible-but-missing
+   score is never confused with a genuinely blank/unhandled area. */
+.match-status-indicator{display:inline-block;padding:4px 8px;border-radius:999px;font-size:9px;font-weight:600;white-space:nowrap}
+.match-status-indicator.calculating{background:#fff6e4;color:#b7791f}
+.match-status-indicator.unavailable{background:#f0f3f7;color:#6d7a90}
+.match-status-indicator.failed{background:#fff0f0;color:#c0392b}
 .matched-skills{color:var(--muted);font-size:10px;line-height:1.5;margin:10px 0 0}
 .import-fetch-actions{grid-column:1/-1;display:flex;gap:9px}.import-job-form>.notice{grid-column:1/-1;margin:0}.import-help{color:var(--muted);font-size:10px;margin:0;text-align:right}
 .import-field-status{border:1px solid #b9ddc8;background:#effaf3;border-radius:8px;color:#267043;padding:10px 12px}.import-field-status.warning{border-color:#f0d49a;background:#fff8e8;color:#8a5a00}.import-field-status p{font-size:10px;margin:3px 0;line-height:1.5}
@@ -27,6 +143,7 @@
 .job-link-row{font-size:11px;line-height:1.5;margin:8px 0 0;word-break:break-all}
 .job-link-row a{color:inherit}
 .job-disabled-reason{margin:8px 0 0;color:#a36500;font-size:10px}
+.job-search-link-help{margin:8px 0 0;color:var(--muted);font-size:10px}
 .ats-job-picker{display:grid;grid-template-columns:1.1fr .9fr;gap:16px;margin:12px 0 18px}
 .ats-job-picker label{font-size:11px;font-weight:600;color:#34425b}
 .ats-job-picker select{display:block;width:100%;margin-top:6px;padding:10px 11px;border:1px solid var(--line);border-radius:7px;background:#fbfcfe;font-size:11px}
@@ -232,7 +349,15 @@
 .rw-what-changed{border:1px solid var(--line);border-radius:10px;padding:8px 10px;background:#fff}
 .rw-what-changed summary{cursor:pointer;font-size:11px;font-weight:700;color:var(--navy)}
 .rw-what-changed ul{margin:8px 0 0;padding-left:16px;font-size:10px;color:#41516c}
-.rw-action-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px;border-top:1px solid var(--line);background:#fff}
+.rw-change-counts{margin:10px 0 0;padding-top:10px;border-top:1px solid #edf0f5}
+.rw-score-stale{display:block;margin-top:4px;font-size:8px;font-weight:700;color:#92400e;text-transform:none}
+.rw-ai-badge{display:inline-flex;align-items:center;gap:6px;margin:2px 0 4px;padding:2px 8px;border-radius:999px;font-size:9px;font-weight:700}
+.rw-ai-badge-pending{background:#eef3ff;color:#4163ad}
+.rw-ai-badge-accepted{background:#e8f7ee;color:#0aa45a}
+.rw-ai-badge-manual{background:#f1f2f5;color:#526783}
+.rw-ai-badge-review{border:none;background:none;padding:0;font-size:9px;font-weight:700;color:#4163ad;text-decoration:underline;cursor:pointer}
+.rw-no-improvement-notice{margin:2px 0 4px;font-size:9px;font-style:italic;color:var(--muted)}
+.rw-action-bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:12px;border-top:1px solid var(--line);background:#fff}.rw-download-error{flex-basis:100%;margin:2px 0 0;font-size:10px;color:#c0392b}
 .rw-download-group{display:flex;gap:8px;margin-left:auto}
 .rw-improve-modal{position:fixed;inset:0;background:rgba(6,22,46,.42);display:grid;place-items:center;z-index:40;padding:16px}
 .rw-improve-card{width:min(560px,100%);background:#fff;border-radius:14px;border:1px solid var(--line);box-shadow:var(--shadow);padding:16px}
@@ -243,6 +368,9 @@
 .rw-improve-compare b{font-size:10px;color:var(--muted)}
 .rw-improve-compare p{margin:8px 0 0;font-size:11px;color:#17233a;line-height:1.5;white-space:pre-wrap}
 .rw-improve-actions{display:flex;gap:8px;flex-wrap:wrap}
+.rw-improve-badge{display:inline-block;margin-left:6px;padding:2px 7px;border-radius:999px;background:#eef3ff;color:#4163ad;font-size:8px;font-weight:700;text-transform:none;vertical-align:middle}
+.rw-improve-status{margin:0 0 10px;font-size:10px;color:var(--muted)}
+.rw-improve-status.error{color:#b91c1c}
 @media(max-width:1100px){
   .rw-body{grid-template-columns:minmax(0,1fr) 260px}
   .rw-page{width:7.8in}
@@ -266,6 +394,8 @@
 .button.danger:focus-visible{outline:2px solid #f04438;outline-offset:2px}
 .button.danger:active{transform:translateY(0);background:#ffecec}
 .button.danger:disabled{opacity:.55;cursor:not-allowed;transform:none}
+.ats-remove-evidence-btn{flex:0 0 auto;white-space:nowrap;min-width:7.5rem;justify-content:center}
+.ats-evidence-row .ats-remove-evidence-btn{align-self:center}
 
 .match-score-badge{display:inline-flex;align-items:center;gap:8px;min-width:92px;padding:7px 10px;border-radius:10px;border:1px solid var(--line);background:#fff;box-shadow:0 1px 2px #10233a0a}
 .match-score-value{font-size:16px;font-weight:800;letter-spacing:-.4px;line-height:1;color:#17233a}
@@ -280,6 +410,19 @@
 .match-score-badge.tone-moderate .match-score-value,.match-score-badge.tone-moderate .match-score-label{color:#b54708}
 .match-score-badge.tone-low{background:#fff5f5;border-color:#f3c1c1}
 .match-score-badge.tone-low .match-score-value,.match-score-badge.tone-low .match-score-label{color:#b42318}
+.match-score-ring{--ring-color:#175cd3;display:grid;justify-items:center;gap:5px;min-width:68px;color:var(--ring-color)}
+.match-score-ring-graphic{width:58px;height:58px;position:relative;display:grid;place-items:center}
+.match-score-ring-graphic svg{position:absolute;inset:0;width:100%;height:100%;transform:rotate(-90deg)}
+.match-score-ring-track,.match-score-ring-progress{fill:none;stroke-width:4}
+.match-score-ring-track{stroke:#e8edf4}
+.match-score-ring-progress{stroke:var(--ring-color);stroke-linecap:round}
+.match-score-ring-graphic strong{font-size:13px;font-weight:800;letter-spacing:-.25px;color:#17233a}
+.match-score-ring-label{font-size:9px;font-weight:700;line-height:1.2;text-align:center;white-space:nowrap;color:var(--ring-color)}
+.match-score-ring.tone-strong{--ring-color:#07964c}
+.match-score-ring.tone-good{--ring-color:#1768e8}
+.match-score-ring.tone-moderate,.match-score-ring.tone-low{--ring-color:#c27b00}
+.match-score-ring.tone-very-low{--ring-color:#b42318}
+.uj-match-score-ring.tone-low{--ring-color:#b42318}
 .job-title-copy{min-width:0;flex:1}
 .job-match-badges{display:flex;flex-direction:column;align-items:flex-end;gap:6px;flex:0 0 auto}
 
@@ -299,3 +442,201 @@
   .ats-evidence-confirm-actions{justify-content:stretch}
   .ats-evidence-confirm-actions .button{flex:1}
 }
+
+/* Updated Job Search — career page / ATS tracker dashboard */
+.uj-summary{margin-bottom:6px}
+.uj-toolbar{display:flex;gap:10px;margin:16px 0 10px}
+.uj-search-input{flex:1;padding:10px 13px;border:1px solid var(--line);border-radius:8px;background:#fbfcfe;font-size:11px;outline:none}
+.uj-search-input:focus{border-color:#6da5f5;box-shadow:0 0 0 3px #1768e812}
+.uj-toolbar select{padding:10px 13px;border:1px solid var(--line);border-radius:8px;background:#fbfcfe;font-size:11px;min-width:150px}
+.uj-filters{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px}
+.uj-filters input,.uj-filters select{padding:8px 11px;border:1px solid var(--line);border-radius:7px;background:#fbfcfe;font-size:10px;min-width:130px;flex:1 1 150px}
+.uj-card{flex-direction:column}
+.uj-company-logo{width:38px;height:38px;border-radius:9px;object-fit:contain;background:#f6f8fc;border:1px solid var(--line);flex:0 0 auto}
+.uj-company-name{font-weight:700;color:#17233a;font-size:10px;margin:2px 0}
+.uj-source-tags{align-items:center}
+.uj-detected-tag{background:#e7f8ee;color:#07964c}
+.uj-gap-count{margin:6px 0 0;font-size:9px;font-weight:700;color:#9a3412}
+.uj-secondary-action{display:inline-block;margin-top:8px}
+@media(max-width:850px){.uj-filters input,.uj-filters select{flex:1 1 100%}.uj-toolbar{flex-direction:column}}
+
+.uj-drawer-overlay{position:fixed;inset:0;background:rgba(6,22,46,.42);display:flex;justify-content:flex-end;z-index:50}
+.uj-drawer{width:min(480px,100vw);height:100vh;height:100dvh;max-width:100vw;background:#fff;box-shadow:-18px 0 50px rgba(15,23,42,.16);display:flex;flex-direction:column;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable;animation:uj-drawer-in .18s ease-out}
+.uj-drawer>*{flex-shrink:0}
+@keyframes uj-drawer-in{from{transform:translateX(24px);opacity:0}to{transform:translateX(0);opacity:1}}
+.uj-drawer-head{position:sticky;top:0;z-index:1;display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:18px 20px;border-bottom:1px solid var(--line);background:#fff}
+.uj-drawer-head h2{margin:0;font-size:16px;color:var(--navy)}
+.uj-drawer-close{border:0;background:transparent;font-size:16px;color:#7187a8;cursor:pointer;padding:4px}
+.uj-drawer-meta{padding:14px 20px;border-bottom:1px solid var(--line);display:grid;gap:5px}
+.uj-drawer-meta p{margin:0;font-size:11px;color:#41516c}
+.uj-drawer-match{padding:16px 20px;border-bottom:1px solid var(--line)}
+.uj-drawer-verdict{margin:10px 0 0;font-size:11px;color:#374151;line-height:1.5}
+.uj-drawer-skills{display:grid;gap:12px;margin-top:14px}
+.uj-drawer-skills h4{margin:0 0 6px;font-size:10px;text-transform:uppercase;letter-spacing:.04em;color:#526783}
+.uj-skill-chips{display:flex;flex-wrap:wrap;gap:6px}
+.uj-skill-chip{border-radius:999px;padding:4px 9px;font-size:9px;font-weight:600}
+.uj-skill-chip.fit{background:#e7f8ee;color:#07964c}
+.uj-skill-chip.gap{background:#fee2e2;color:#b91c1c}
+.uj-drawer-jd{padding:16px 20px;overflow:visible;flex:0 0 auto}
+.uj-drawer-jd h4{margin:0 0 8px;font-size:11px;color:var(--navy)}
+.uj-drawer-jd p{margin:0;font-size:11px;line-height:1.65;color:#374151;white-space:pre-wrap}
+.uj-drawer-actions{display:flex;flex-wrap:wrap;gap:8px;padding:14px 20px;border-top:1px solid var(--line);background:#fbfcfe}
+.uj-drawer-secondary-action{margin:0 20px 14px;font-size:10px}
+.uj-drawer-secondary-action a{color:var(--blue)}
+
+/* Email Summary page — compact/dense layout, scoped to this page only.
+   Deliberately does NOT override the shared .page padding/width above —
+   that override (removed) was the sole cause of Email Summary starting at
+   a different left position than every other page (Updated Job Search
+   included); Email Summary now inherits the exact same .page baseline as
+   the rest of the app instead of a page-specific max-width/margin/padding. */
+.email-summary-page .page-heading{margin-bottom:12px}
+.email-summary-page .panel{padding:12px 16px}
+.email-summary-page .panel>header{margin-bottom:8px}
+.email-summary-page .panel>header h3{font-size:16px}
+.email-summary-page .panel>header p{font-size:10px;margin-top:2px}
+.email-summary-page .email-settings-panel,
+.email-summary-page .tracked-applications-panel{margin-top:10px}
+.email-summary-page .email-settings-panel.panel{padding:10px 16px}
+.email-summary-page .email-settings-panel>header{margin-bottom:6px}
+.emails-section{margin-top:10px}
+
+.gmail-connection-card{margin-bottom:16px;height:100%;display:flex;flex-direction:column;justify-content:center}
+.email-summary-page .gmail-connection-card.panel{padding:10px 14px}
+.gmail-connected-line{display:flex;align-items:center;gap:8px;margin:0 0 4px;font-size:11px;color:#374151}
+.gmail-last-synced{margin:0 0 6px;font-size:10px;color:var(--muted)}
+.email-summary-header-grid{display:grid;grid-template-columns:3fr 7fr;gap:14px;align-items:stretch;margin-bottom:0}
+.email-summary-header-grid .gmail-connection-card{margin-bottom:0}
+.email-summary-page .gmail-connection-card .card-actions{margin-top:3px}
+.email-summary-page .gmail-connection-card .button{padding:8px 12px;font-size:11px}
+
+.email-metric-cards{grid-template-columns:repeat(4,1fr);gap:10px;margin:0;height:100%}
+.email-metric-cards .metric{padding:8px 10px;height:100%;border:1px solid transparent}
+.email-metric-cards .metric:nth-child(1){background:#eaf3ff}
+.email-metric-cards .metric:nth-child(2){background:#e9f8ef}
+.email-metric-cards .metric:nth-child(3){background:#fff3e2}
+.email-metric-cards .metric:nth-child(4){background:#f2ecff}
+.email-metric-cards .metric span{font-size:11px;color:#4b5b74}
+.email-metric-cards .metric strong{font-size:19px;margin:2px 0 0}
+.email-metric-cards .metric small{font-size:9px}
+.email-metric-cards .metric>i{width:28px;height:28px;background:#fff}
+.email-metric-cards .metric>i svg{width:13px;height:13px}
+@media(max-width:900px){.email-summary-header-grid{grid-template-columns:1fr}}
+@media(max-width:640px){.email-metric-cards{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:480px){.email-metric-cards{grid-template-columns:1fr}.email-settings-form .form-actions{margin-left:0;width:100%}.email-settings-form .form-actions .button{width:100%}}
+
+.email-settings-form{display:flex;flex-wrap:wrap;align-items:center;gap:22px}
+.email-settings-form .form-actions{margin:0 0 0 auto;grid-column:auto}
+.email-settings-form .form-actions .button{font-size:11px;padding:8px 16px}
+.toggle-switch-label{display:flex;align-items:center;gap:9px;cursor:pointer}
+.toggle-switch{position:relative;display:inline-block;width:34px;height:19px;flex:0 0 auto}
+.toggle-switch input{position:absolute;inset:0;opacity:0;width:100%;height:100%;margin:0;cursor:pointer;z-index:1}
+.toggle-switch-track{position:absolute;inset:0;background:#dfe6f0;border-radius:999px;transition:background .15s}
+.toggle-switch-track::after{content:"";position:absolute;top:2px;left:2px;width:15px;height:15px;background:#fff;border-radius:50%;box-shadow:0 1px 3px rgba(0,0,0,.25);transition:transform .15s}
+.toggle-switch input:checked+.toggle-switch-track{background:var(--blue)}
+.toggle-switch input:checked+.toggle-switch-track::after{transform:translateX(15px)}
+.toggle-switch-copy{display:flex;flex-direction:column;gap:1px}
+.toggle-switch-copy b{font-size:10px;color:#17233a}
+.toggle-switch-copy small{font-size:8px;color:var(--muted)}
+.email-settings-field{display:flex;flex-direction:column;gap:4px;font-size:9px;font-weight:600;color:#34425b}
+.email-settings-field select{padding:6px 9px;border:1px solid var(--line);border-radius:7px;background:#fbfcfe;font-size:9px}
+.email-settings-types{display:flex;flex-direction:column;gap:4px}
+.email-settings-types-label{display:block;font-size:9px;font-weight:600;color:#34425b}
+/* Compact 2-column arrangement (Job Opportunities / Recruiter Messages on
+   row 1, Application Updates / Interview Invitations on row 2) — matches
+   EMAIL_TYPE_OPTIONS' existing order with no JSX change needed. */
+.email-settings-checkboxes{display:grid;grid-template-columns:repeat(2,minmax(130px,auto));gap:3px 16px}
+.email-settings-checkboxes label{display:flex;align-items:center;gap:5px;font-size:9px;color:#34425b;font-weight:400}
+
+.star-button{border:0;background:transparent;font-size:14px;line-height:1;color:#c7cedb;cursor:pointer;padding:2px}
+.star-button.starred{color:#eea216}
+.uj-drawer-body{padding:0 20px}
+/* View Details full email body — preserves the original line/paragraph
+   breaks (base .email-preview already has white-space:pre-wrap; this just
+   gives the full body more room and a readable size than the compact
+   preview's cramped defaults). The compact list row's own .email-preview
+   (see .email-row .email-preview.email-row-snippet) is untouched. */
+.email-preview-full{max-height:280px;font-size:11px;line-height:1.65}
+.drawer-recruiter-reply{margin-top:16px;padding:16px 20px 0;border-top:1px solid var(--line)}
+.drawer-recruiter-reply .email-card{box-shadow:none;border:0;padding:0}
+
+/* Tabs + search/sort share ONE row and never wrap at normal desktop
+   widths — the row itself carries the underline, not the tabs alone, so
+   the line spans the full toolbar width like the reference. Tabs scroll
+   horizontally in the rare case they overflow rather than wrapping. */
+.email-toolbar-row{display:flex;flex-wrap:nowrap;align-items:center;gap:12px;border-bottom:1px solid var(--line);margin:0 0 8px}
+.email-toolbar-row .email-tabs{border-bottom:0;margin:0;flex:1 1 auto;min-width:0;overflow-x:auto;flex-wrap:nowrap}
+.email-toolbar-row .uj-toolbar{margin:0 0 0 auto;flex:0 0 auto}
+.email-toolbar-row .uj-search-input{flex:0 0 auto;width:180px;padding:7px 11px;font-size:10px}
+.email-toolbar-row .uj-toolbar select{min-width:120px;width:132px;padding:7px 10px;font-size:10px}
+.email-tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin:6px 0 18px;flex-wrap:wrap}
+.email-tab{border:0;background:transparent;padding:7px 9px;font-size:12px;font-weight:700;color:var(--muted);cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap}
+.email-tab:hover{color:#17233a}
+.email-tab.active{color:var(--blue);border-bottom-color:var(--blue)}
+@media(max-width:900px){.email-toolbar-row{flex-wrap:wrap}.email-toolbar-row .uj-toolbar{flex:1 1 100%;margin-left:0}.email-toolbar-row .uj-search-input{flex:1 1 auto;width:auto}}
+
+/* Flat divided list (reference UI) — one continuous bordered container
+   with thin dividers between rows, not individual bordered/shadowed cards.
+   .email-grid keeps its shared grid rule for other pages; .email-row-list
+   overrides display for this page's list only. */
+.email-row-list{display:flex;flex-direction:column;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+.email-row{display:flex;gap:10px;align-items:center;padding:7px 14px;background:#fff}
+.email-row+.email-row{border-top:1px solid var(--line)}
+.email-row .mail-icon{width:26px;height:26px;flex:0 0 auto;font-size:12px}
+.email-row-body{flex:1;min-width:0;display:grid;grid-template-columns:1fr auto;column-gap:10px;row-gap:2px;align-items:center}
+.email-row-subject{grid-column:1;grid-row:1;margin:0;font-size:13px;font-weight:600;color:#17233a;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.email-row-meta{grid-column:2;grid-row:1;display:flex;align-items:center;gap:6px;flex:0 0 auto;justify-self:end}
+.email-row-time{font-size:10px;color:var(--muted);white-space:nowrap}
+.email-row-meta .badge{font-size:10px}
+.email-row-sender{grid-column:1;grid-row:2;margin:0;font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.email-row-actions{grid-column:2;grid-row:2;margin:0;justify-self:end;gap:6px}
+.email-row-actions .button{padding:5px 9px;font-size:11px}
+.email-row .email-preview.email-row-snippet{grid-column:1/-1;grid-row:3;margin:0;padding:0;background:transparent;max-height:none;font-size:11px;line-height:1.4;color:#6c7891;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:block}
+.application-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+.application-card{border:1px solid var(--line);border-radius:12px;padding:15px;box-shadow:var(--shadow)}
+.application-card header{display:flex;justify-content:space-between;align-items:flex-start;gap:10px}
+.application-card h3{margin:0;font-size:12px}
+.application-card p{margin:3px 0 0;font-size:9px;color:var(--muted)}
+.application-meta{font-size:9px;color:var(--muted);margin:10px 0}
+.application-card select{font-size:10px;padding:8px;border:1px solid var(--line);border-radius:7px;background:#fbfcfe}
+.possible-update-card{border-color:#fdba74}
+.possible-update-line{margin:10px 0;font-size:10px;font-weight:700;color:#9a3412}
+.possible-update-target{margin:0 0 10px;font-size:10px;font-weight:600;color:#1e4620}
+.possible-update-no-match{margin:0 0 10px;font-size:10px;color:#6f7f98;font-style:italic}
+.draft-body-textarea{width:100%;margin:12px 0;padding:12px;border:1px solid var(--line);border-radius:8px;font-size:10px;line-height:1.6;font-family:inherit;resize:vertical}
+.draft-tone-row{display:flex;align-items:center;gap:8px;margin:10px 0;font-size:9px;color:var(--muted)}
+.draft-tone-row select{font-size:9px;padding:5px 7px;border:1px solid var(--line);border-radius:6px;background:#fbfcfe}
+.draft-confirmed-line{margin:0 0 10px;font-size:10px;font-weight:600;color:#1e4620}
+.suggested-reply{margin-top:6px;padding-top:12px;border-top:1px solid var(--line)}
+.suggested-reply h4{margin:0 0 8px;font-size:10px;color:var(--navy)}
+.draft-field-label{display:block;font-size:8px;color:var(--muted);text-transform:uppercase;letter-spacing:.03em;margin:8px 0 4px}
+.draft-subject-input{width:100%;padding:9px 11px;border:1px solid var(--line);border-radius:7px;font-size:10px;font-family:inherit}
+.draft-subject-line{margin:0 0 8px;font-size:10px}
+.draft-body-preview{margin:0;padding:12px;background:#f8fafc;border-radius:8px;font-size:10px;line-height:1.6;white-space:pre-wrap}
+.draft-auto-status{font-size:10px;color:var(--muted);font-style:italic}
+.draft-error-line{margin:0 0 8px;font-size:9px;color:#8a3b1f}
+@media(max-width:850px){.application-grid{grid-template-columns:1fr}}
+@media(max-width:520px){.uj-drawer{width:100%}}
+
+/* Application typography: readable at 100% zoom while preserving compact data UI. */
+body{font-size:var(--font-body);line-height:1.5}
+.sidebar nav a{font-size:var(--font-body-sm);line-height:1.35}.upgrade{font-size:var(--font-sm)}.upgrade p{font-size:var(--font-xs)}.user-menu b{font-size:var(--font-sm)}.user-menu small{font-size:var(--font-xs)}
+.topbar h1{font-size:var(--font-2xl);line-height:1.2}.topbar h1 span{font-size:var(--font-xl)}.topbar p{font-size:var(--font-body-sm);line-height:1.45}.backend{font-size:var(--font-xs)}
+.notification-dropdown-header,.notification-row-title{font-size:var(--font-sm)}.notification-row-message,.notification-empty{font-size:var(--font-xs);line-height:1.4}.notification-row-time,.notification-mark-all{font-size:var(--font-xs)}
+.page-heading h2{font-size:var(--font-2xl);line-height:1.2}.page-heading p,.panel>header p,.results-head p{font-size:var(--font-body-sm);line-height:1.45}.panel>header h3,.results-head h3{font-size:var(--font-lg);line-height:1.3}
+.button{font-size:var(--font-body-sm);line-height:1.35}.text-button{font-size:var(--font-sm)}.notice,.page-navigation-message{font-size:var(--font-body-sm);line-height:1.45}
+.form-grid label,.auth-card label,.ats-job-picker label,.ats-skill-form label{font-size:var(--font-body-sm);line-height:1.4}.form-grid input,.form-grid textarea,.form-grid select,.auth-card input,.ats-job-picker select,.ats-skill-form select,.ats-skill-form input,.ats-skill-form textarea{font-size:var(--font-body);line-height:1.4}
+.job-card h3{font-size:var(--font-medium);line-height:1.3}.job-card p{font-size:var(--font-body-sm);line-height:1.45}.tags span,.badge{font-size:var(--font-xs);line-height:1.25}.matched-skills,.job-description{font-size:var(--font-body-sm);line-height:1.55}.job-link-row{font-size:var(--font-sm);overflow-wrap:anywhere}.job-disabled-reason,.job-search-link-help,.import-help{font-size:var(--font-sm);line-height:1.45}
+.match-score-value{font-size:var(--font-medium)}.match-score-caption{font-size:var(--font-xs)}.match-score-label,.match-score-ring-label{font-size:var(--font-xs)}.match-score-ring-graphic strong{font-size:var(--font-body-sm)}
+.metric span{font-size:var(--font-sm)}.metric small{font-size:var(--font-xs)}.workflow-progress b{font-size:var(--font-sm)}.workflow-progress small{font-size:var(--font-xs)}.empty strong{font-size:var(--font-body-sm)}.empty p,.process-list p{font-size:var(--font-sm);line-height:1.5}.process-list b{font-size:var(--font-body-sm)}
+.table-wrap table{font-size:var(--font-sm)}th{font-size:var(--font-xs)}td small{font-size:var(--font-xs)}.email-card h3,.application-card h3{font-size:var(--font-medium)}.email-card p,.application-card p,.application-meta{font-size:var(--font-sm);line-height:1.5}.email-preview{font-size:var(--font-body-sm);line-height:1.6}
+.auth-card>p,.auth-hint,.auth-forgot-link{font-size:var(--font-sm)}.auth-backend{font-size:var(--font-xs)}
+.auth-field-error{display:block;margin-top:6px;color:#b42318;font-size:var(--font-sm);font-weight:600;line-height:1.4}
+.signup-password-field{position:relative}.auth-card .signup-password-field .auth-password-input{padding-right:44px}.password-visibility-toggle{position:absolute;right:6px;top:30px;width:34px;height:34px;border:0;border-radius:6px;background:transparent;color:#526783;display:grid;place-items:center;cursor:pointer}.password-visibility-toggle:hover{background:#eef4ff;color:var(--blue)}.password-visibility-toggle:focus-visible{outline:2px solid #1768e8;outline-offset:1px}.password-visibility-toggle svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.ats-job-meta p,.ats-list,.ats-score-explanation p,.ats-major-warning p,.ats-threshold-warning p,.ats-role-aligned p{font-size:var(--font-body-sm);line-height:1.55}.ats-score-card span,.ats-improvement-note,.ats-pipeline li,.ats-risk-ack label,.ats-evidence-snippet{font-size:var(--font-sm)}.ats-wizard-steps li,.ats-skill-meta,.ats-skill-checkbox,.ats-skill-question,.ats-gap-banner,.ats-why-not-95 p,.ats-evidence-summary p,.ats-quick-confirmation>p,.ats-evidence-confirmation p,.ats-confirmation-progress{font-size:var(--font-sm);line-height:1.45}.ats-skill-card-header b,.ats-verified-skills summary,.ats-compact-evidence-heading{font-size:var(--font-body-sm)}.ats-verified-skill-chips span,.ats-generation-indicator,.ats-template-status,.ats-meter-label{font-size:var(--font-xs)}.ats-evidence-copy b{font-size:var(--font-body-sm)}.ats-evidence-copy span,.ats-evidence-confirm p{font-size:var(--font-sm)}
+/* Preserve the resume document canvas at its prior browser-default 16px base. */
+.rw-page{font-size:1rem}
+/* Resume workspace controls only; .rw-page remains the real document canvas and is intentionally excluded. */
+.rw-step5-intro p,.rw-improve-compare p{font-size:var(--font-body-sm)}.rw-tool,.rw-tool-inline,.rw-save-status,.rw-icon-btn,.rw-mobile-tabs button,.rw-ats-panel-head p,.rw-metric-list>div,.rw-note,.rw-gap-group ul,.rw-what-changed ul,.rw-action-bar .rw-download-error,.rw-improve-card header p,.rw-improve-status{font-size:var(--font-sm)}.rw-ats-panel-head h3,.rw-panel-block h4,.rw-what-changed summary{font-size:var(--font-body-sm)}
+.uj-search-input,.uj-toolbar select{font-size:var(--font-body)}.uj-filters input,.uj-filters select{font-size:var(--font-body-sm)}.uj-company-name,.uj-drawer-meta p,.uj-drawer-verdict,.uj-drawer-jd p{font-size:var(--font-body-sm)}.uj-gap-count,.uj-drawer-skills h4,.uj-skill-chip,.uj-drawer-secondary-action{font-size:var(--font-xs)}.uj-drawer-head h2{font-size:var(--font-xl)}.uj-drawer-jd h4{font-size:var(--font-body-sm)}
+.gmail-connected-line,.email-tab{font-size:var(--font-body-sm)}.application-card select,.draft-body-textarea,.draft-subject-input{font-size:var(--font-body-sm)}.possible-update-line,.possible-update-target,.possible-update-no-match,.draft-confirmed-line,.suggested-reply h4,.draft-subject-line,.draft-auto-status{font-size:var(--font-sm)}.draft-tone-row,.draft-tone-row select,.draft-field-label,.draft-error-line{font-size:var(--font-xs)}.draft-body-preview{font-size:var(--font-body-sm);line-height:1.6}

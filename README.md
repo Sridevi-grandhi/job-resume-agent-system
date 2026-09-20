@@ -25,6 +25,7 @@ The optimizer is role-family based rather than hardcoded to one job title. Class
 - [Ollama / LLM integration](#ollama--llm-integration)
 - [Deterministic fallback](#deterministic-fallback)
 - [Job search](#job-search)
+- [Updated Job Search](#updated-job-search)
 - [Database](#database)
 - [API overview](#api-overview)
 - [Project structure](#project-structure)
@@ -71,7 +72,7 @@ Unsupported JD requirements do not normally block generation. They stay in Remai
 | Preferences        | Per-user title, location, skills, work mode, job type, schedule time, and timezone                                 |
 | Resume upload      | PDF, DOCX, and TXT ingestion; stored files plus extracted text                                                     |
 | Job Search         | Preference-filled LinkedIn / Indeed / Dice / Google Jobs / ZipRecruiter **search links** (not scraped postings)    |
-| Updated Job Search | Remotive public remote-jobs API: normalize, relevance-filter, persist individual postings                          |
+| Updated Job Search | Career-page/ATS tracker: periodic Greenhouse/Lever/Workday/Remotive polling, change detection + dedup, deterministic + AI resume matching, its own dashboard page |
 | Selected jobs      | Manual job entry and HTTP(S) URL preview/import with safety checks                                                 |
 | ATS Optimizer      | Five-step wizard: select job, analyze JD, confirm skills, review evidence, generate/edit/score/download            |
 | Evidence           | Verified, possible, user-confirmed, incomplete, not-possessed, and missing states                                  |
@@ -127,11 +128,12 @@ The in-process APScheduler is started from the FastAPI lifespan. The backend con
 | AI / LLM         | Custom `LLMClient` over HTTP                | OpenAI, Anthropic, or OpenAI-compatible endpoints (including local Ollama)               |
 | Scheduling       | APScheduler                                 | Per-user cron registration inside the API process                                        |
 | Email            | Python `smtplib`                            | Optional SMTP for password-reset mail only                                               |
-| Containers       | Docker Compose                              | Postgres, API, and Nginx frontend with health checks and volumes                         |
+| Background jobs  | Redis + RQ (optional)                       | Recruiter Drafts' async draft-generation queue/worker only — degrades gracefully if unset |
+| Containers       | Docker Compose                              | Postgres, Redis, API, draft worker, and Nginx frontend with health checks and volumes     |
 | Testing          | pytest, Vitest, Testing Library, Playwright | Backend services/routes, frontend unit/UI tests, and a browser flow                      |
 
 
-There is no TypeScript application source. `@types/react` is a frontend editor/dev dependency only. There is no Alembic, Redis, JWT library, or CI workflow in the repository.
+There is no TypeScript application source. `@types/react` is a frontend editor/dev dependency only. There is no Alembic or CI workflow in the repository. Redis is present, but only as an optional queue for Recruiter Drafts' background draft generation (see app/services/draft_queue.py) — nothing else in the app uses it, and the app runs fine without it.
 
 ## Why these technologies
 
@@ -154,7 +156,7 @@ There is no TypeScript application source. `@types/react` is a frontend editor/d
 - **Framework:** React 19 with JSX, bundled by Vite 8.
 - **Routing:** React Router 7 in `App.jsx`.
 - **State:** `AppContext.jsx` holds the logged-in user, jobs, resume, ATS workflow result, evidence, and busy/message flags. There is no Redux.
-- **API:** `src/api.js` wraps `fetch` against `VITE_API_BASE_URL` (default `http://localhost:8000`).
+- **API:** `src/api.js` wraps `fetch` against `VITE_API_BASE_URL` (default `http://localhost:8001` when Compose publishes the backend on 8001 to avoid host port conflicts).
 - **Auth UX:** user object in `localStorage`. `ProtectedRoute` only checks that client state. Requests send `user_id` in the path; there is no session cookie or bearer token.
 
 **Routes**
@@ -192,7 +194,7 @@ There is **no repository layer**. Routes use SQLAlchemy sessions and call servic
 | `app/main.py`     | Lifespan (create tables, additive schema upgrades, scheduler, LLM config log), CORS, health                                     |
 
 
-Startup does **not** probe Ollama on the network. It only logs whether an LLM is configured.
+Startup logs safe LLM diagnostics (provider, model, base URL, timeout, enabled). `GET /health` and `GET /health/llm` expose the same fields without secrets. Ollama connectivity is probed only when generation starts (or when `/health/llm` is called with a live probe), not on every request.
 
 ## ATS optimizer and match engine
 
@@ -275,7 +277,7 @@ Persist optimized resume
 Recalculate ATS score on generated (then edited) text
 ```
 
-The workflow records `generation_method`, `llm_used`, `fallback_used`, and `fallback_reason`. The UI labels Ollama vs. deterministic fallback; fallback is an info state when a valid resume was still produced.
+The workflow records `generation_method`, `llm_used`, `fallback_used`, `fallback_reason`, and `generation_duration_ms`. The UI labels successful Ollama/LLM output as **AI Optimized · {model}** and only shows **Deterministic fallback** when fallback actually produced the resume.
 
 ## Ollama / LLM integration
 
@@ -307,7 +309,7 @@ ATS_POLL_INTERVAL_MS=2000
 
 From Docker, the backend uses `http://host.docker.internal:11434/v1` plus Compose `extra_hosts` so the container can reach Ollama on the host.
 
-**Timeouts:** connect defaults to 5 seconds (`LLM_CONNECT_TIMEOUT_SECONDS`); read timeout defaults to 120 seconds. Connection failures and read timeouts are **not** retried. Transient HTTP 429/5xx and invalid JSON may retry up to `LLM_MAX_RETRIES`. For Ollama, a short `/api/tags` probe runs before the long generate call so a refused connection fails fast.
+**Timeouts:** connect defaults to 5 seconds (`LLM_CONNECT_TIMEOUT_SECONDS`); read timeout defaults to 240 seconds (`LLM_TIMEOUT_SECONDS`). The overall generate+fallback budget defaults to 300 seconds (`ATS_GENERATION_TIMEOUT_SECONDS`). Connection failures and read timeouts are **not** retried. Transient HTTP 429/5xx and invalid JSON may retry up to `LLM_MAX_RETRIES`. For Ollama, a short `/api/tags` probe runs before the long generate call so a refused connection or missing model fails fast with an exact reason (never a generic “timed out” for every failure).
 
 The generate API returns `poll_interval_ms` and `poll_timeout_seconds` so the frontend wait window matches the backend budget (default 180 seconds overall).
 
@@ -319,15 +321,63 @@ Fallback still produces a resume from supported evidence only. It does not guara
 
 ## Job search
 
-Three implemented paths:
+Two implemented paths on the original **Job Search** page (unchanged by the Updated Job Search rebuild below):
 
 1. **Job Search Agent** (`get_mock_jobs`) — builds LinkedIn, Indeed, Dice, Google Jobs, and ZipRecruiter **search URLs** from preferences. These rows are not real postings and are excluded from ATS analysis (`GENERIC_SEARCH_SOURCES`).
-2. **Updated Job Search Agent** — `GET https://remotive.com/api/remote-jobs`, alternative title queries, normalization, relevance filtering, deduplication, ranking, persistence as `source: Remotive API`.
-3. **Selected jobs / URL import** — manual fields or a direct HTTP(S) job page. The importer blocks unsafe destinations, limits redirects and response size, and may require the user to complete title/company/description when extraction is partial. Host labels such as LinkedIn/Dice/Indeed mean **imported page text**, not those vendors’ APIs.
+2. **Selected jobs / URL import** — manual fields or a direct HTTP(S) job page. The importer blocks unsafe destinations, limits redirects and response size, and may require the user to complete title/company/description when extraction is partial. Host labels such as LinkedIn/Dice/Indeed mean **imported page text**, not those vendors' APIs.
 
 There is no LinkedIn, Indeed, Dice, or ZipRecruiter jobs API integration.
 
-The daily scheduler still inserts search-link jobs, then runs ATS only on analyzable jobs (Remotive and complete selected/imported descriptions), capped by `MAX_OPTIMIZATIONS_PER_RUN` (default 3).
+The daily scheduler still inserts search-link jobs, then runs ATS only on analyzable jobs (complete selected/imported descriptions), capped by `MAX_OPTIMIZATIONS_PER_RUN` (default 3).
+
+The old Remotive-only "Updated Job Search Agent" (`app/agents/updated_job_search_agent.py`, `POST /api/jobs/search-updated/{user_id}`) is superseded by the feature below. It is left in place, unreachable from the UI, purely for backward API compatibility (see [Updated Job Search](#updated-job-search)).
+
+## Updated Job Search
+
+A **company-centric** job discovery dashboard (`/updated-jobs`). The user-facing concept is the real employer — "Example Employer," never "Greenhouse" or "Mock Source." Which connector retrieves a company's postings (Greenhouse, Lever, Workday, a company career feed) is an internal implementation detail, resolved per company and never rendered as the job's identity.
+
+```text
+Company Source registry (real employers, operator-configured — never hardcoded)
+  → ConnectorResolver (Greenhouse / Lever / Workday / Remotive)
+  → job normalization (one shared shape; company name comes from configuration, not guessed)
+  → change detection + deduplication (source_job_id, then direct_url, then content fingerprint)
+  → PostgreSQL (discovered_jobs, company_sources, job_sources, job_source_runs)
+  → Stage 1: cheap preference-based relevance filter
+  → Stage 2: deterministic resume-to-JD match score (authoritative, stable)
+  → Stage 3: optional LLM explanation for the top-ranked candidates (advisory only)
+  → job_matches (per user, cached)
+  → Updated Job Search dashboard (Top Job Matches + All Jobs) → Details drawer / Save / Optimize Resume / Apply
+```
+
+**Company registry** (`company_sources` table, `job_source_registry_service.sync_company_sources_from_env`): which real employers to monitor, and via which connector, configured as `"Company Name:slug"` pairs in `GREENHOUSE_COMPANY_SOURCES` / `LEVER_COMPANY_SOURCES` — never hardcoded in code. A company only ever appears once it is listed there **and** successfully retrieved. The architecture scales to many employers without touching matching/change-detection logic; the summary card **Companies Monitored** reflects only what is actually configured and currently visible, not a marketing number.
+
+**Connectors** (`backend/app/job_sources/`, internal only): each implements `fetch_jobs()` / `normalize_job()` / `health_check()` in isolation.
+
+| Connector | Mode | Detail |
+| --- | --- | --- |
+| Greenhouse | **Live** for each company listed in `GREENHOUSE_COMPANY_SOURCES` (public Job Board API) | `boards-api.greenhouse.io/v1/boards/<token>/jobs` |
+| Lever | **Live** for each company listed in `LEVER_COMPANY_SOURCES` (public Postings API) | `api.lever.co/v0/postings/<company>` |
+| Workday | **Never live** | No uniform, unauthenticated public API exists across Workday tenants; this project will not bypass anti-bot/session protections to fake one |
+| Remotive | **Live** | `remotive.com/api/remote-jobs`; company name comes straight from the API's own field (the pre-existing `updated_job_search_agent.py` is unrelated and untouched) |
+| Generic career feed | **Never live** | Placeholder connector slot for a future per-company feed integration |
+
+**No silent mock fallback.** With no company configured for a connector (or a connector, like Workday, with no safe live method at all), that connector contributes **zero jobs** in normal operation — never a fabricated employer or posting. Mock data exists only behind `UPDATED_JOB_DEMO_MODE=true` (local development/demos), uses fictional company names, and is filtered out of every normal (non-demo) API response regardless of what is in the database (`job_discovery_routes._visible_jobs_query`) — so pre-existing dev/test rows never leak to real users. The "Mock Source" label itself is never shown anywhere in the UI, in either mode.
+
+**Change detection** (`job_change_detection_service.py`): identity is `(connector, source_job_id)` when the source provides one; otherwise a fingerprint of the canonical `direct_url`, or failing that, normalized title+company+location. Re-polling the same postings inserts nothing (covered by `test_job_change_detection.py`: 100 jobs → 100 jobs → 0 new → 102 jobs → 2 new). A content change (description, location, work mode, direct URL) updates the existing row and stamps `updated_detected_at` without losing `first_seen_at`. Jobs that stop appearing are never deleted — after `INACTIVE_AFTER_MISSED_POLLS` consecutive misses they flip to `INACTIVE`, so anything a user already saved stays historically accessible. One company or connector failing never stops the others (`test_job_source_adapters.py`, `test_company_source_registry.py`) — each is fetched independently.
+
+**Polling** (`updated_job_scheduler_service.py`): reuses the existing `daily_scheduler` APScheduler instance (no second scheduler) on an `UPDATED_JOB_POLL_INTERVAL_MINUTES` interval, firing once immediately on startup. The **Refresh Jobs** button calls the identical `run_poll_cycle()` used by the scheduler; a module-level lock makes concurrent triggers return the in-flight status instead of starting a duplicate poll. Product wording says "near-real-time discovery" / "recently detected" — this is scheduled polling, not a guaranteed-instant global feed.
+
+**Matching** (`job_match_service.py`): the numeric `match_score` always comes from a deterministic engine — canonical technology names (reusing the shared `technology_catalog` synonym table) evidenced in both the real job description and the resume text, blended with title-token overlap. Same resume + same job content always produces the same score. An LLM (configured independently via `JOB_MATCH_LLM_PROVIDER` / `JOB_MATCH_LLM_MODEL`, falling back to the ATS Optimizer's `LLM_*` settings when unset) only refines `fitting_skills` / `missing_skills` / `verdict` / `role_alignment` for the top-ranked candidates on a page load — any score field it returns is discarded. If the LLM is unset, unreachable, or returns malformed JSON, matching falls back to a deterministic verdict template; job discovery never fails because of it. Results are cached per `(user, discovered_job)` in `job_matches` and only recomputed when the resume, the job's content, or the matcher version changes — not on every page load. Matches are always user-specific; the same job never carries one shared score.
+
+Matching works for any technology role — there is no per-role branching. Cross-role tests (`test_job_match_service.py`) assert a Java resume scores its matching Java JD higher than an unrelated Data Engineer JD, using the same generic skill/title-overlap logic for every role family.
+
+**UI**: "Top Job Matches" (highest-scoring jobs first) above "All Jobs" (everything else, browsable with search/filters/sort). Each card shows the employer's logo (or an initial avatar — never a fabricated logo), title, location, posted/detected dates, top skills, and a match badge. **Details** opens a right-side drawer with the full stored job description, matching/missing skills, verdict, **View Original Posting** (the real `direct_url`), Save, Optimize Resume, and Apply.
+
+**Save Job / Optimize Resume**: both reuse the existing, unmodified Selected Jobs and ATS Optimizer surfaces. Save calls `POST /api/job-discovery/save/{user_id}`, creating a normal `jobs` row (`source: "User Selected Job"`) — the same shape the manual Selected Jobs form produces — so it appears in the existing Selected Jobs page and triggers the existing automatic ATS workflow, unchanged. Clicking Save again returns the existing row instead of creating a duplicate. Optimize Resume performs the same save (if not already saved) and navigates to the existing `/optimizer/:jobId` route — Step 1 of the unmodified ATS Optimizer wizard.
+
+**Apply**: resolves to the authoritative destination via `resolve_application_url` — `application_url` (an explicit apply link, when the connector distinguishes one) → `direct_url` (canonical posting page) → `source_url` (listing page), in that order, using only values actually retrieved from the source. Clicking Apply opens that URL directly in a new tab — never a generic search engine — and fires `POST /api/job-discovery/apply/{user_id}`, recording a `job_apply_events` row (`user_id`, `discovered_job_id`, `application_url`, `apply_started_at`, `status="APPLY_STARTED"`). This records that the user was sent to the employer's real application page; it does not mean, and does not claim, that an application was submitted. No auto-fill or auto-submit of employer forms is implemented.
+
+**Security**: connectors fetch from a small, hardcoded set of known public API hosts only, over HTTP(S), with DNS-resolved-IP validation (rejecting private/internal addresses) and no redirect following (`app/services/url_safety.py`) — independent of, and not a replacement for, the existing job-URL-import safety module.
 
 ## Database
 
@@ -349,11 +399,16 @@ erDiagram
     jobs ||--o{ match_scores : evaluated_against
     jobs ||--o{ ats_optimization_workflows : processed_by
     optimized_resumes ||--o{ match_scores : scored_as
+    users ||--o{ job_matches : matches
+    discovered_jobs ||--o{ job_matches : matched_against
+    resumes ||--o{ job_matches : scored_as
 ```
 
 
 
 Tables: `users`, `user_preferences`, `resumes`, `jobs`, `match_scores`, `optimized_resumes`, `ats_optimization_workflows`, `job_requirement_analyses`, `user_confirmed_skills`, `email_logs`, `password_reset_tokens`.
+
+Updated Job Search adds six tables, additive-only via `ensure_job_discovery_schema()` (same `create_all` + additive `ALTER TABLE ADD COLUMN` convention as `ensure_ats_schema()`, no pre-existing table touched): `discovered_jobs` (global, one row per real-world posting — company identity: `company`, `company_logo_url`; retrieval identity: `source` (connector), `source_mode`; URLs: `direct_url`, `source_url`, `application_url`), `company_sources` (the company registry — real employer + connector + connector-specific identifier, populated only from operator configuration), `job_sources` (connector-level health, internal/diagnostic), `job_source_runs` (one row per connector per poll — fetched/new/updated/duplicates/errors/duration), `job_matches` (per-user cached match score/skills/verdict, deliberately separate from `match_scores` to avoid coupling with protected ATS scoring internals), and `job_apply_events` (Apply-click tracking — see Updated Job Search above).
 
 Models declare `ForeignKey` columns. There are no SQLAlchemy `relationship()` collections. Schema is created with `Base.metadata.create_all`; `ensure_ats_schema()` applies additive column upgrades. There is no Alembic migration history.
 
@@ -366,8 +421,9 @@ Models declare `ForeignKey` columns. There are no SQLAlchemy `relationship()` co
 | Auth         | `POST /api/auth/signup`, `/login`, `/forgot-password`, `/reset-password`                         | Accounts and reset tokens                                          |
 | Preferences  | `POST /api/preferences`, `GET /api/preferences/{user_id}`                                        | Search and schedule preferences                                    |
 | Resume       | `POST /api/resume/upload/{user_id}`, `GET /api/resume/latest/{user_id}`                          | Upload/parse and latest resume                                     |
-| Jobs         | `POST /api/jobs/search/{user_id}`, `/search-updated/{user_id}`, `/import-url`, selected-job CRUD | Search links, Remotive, import, saved jobs                         |
+| Jobs         | `POST /api/jobs/search/{user_id}`, `/search-updated/{user_id}` (deprecated), `/import-url`, selected-job CRUD | Search links, import, saved jobs                       |
 | Matching     | `POST /api/match/calculate/{user_id}`, `GET /api/match/{user_id}`                                | Persist/list match rows                                            |
+| Job discovery | `GET /api/job-discovery/jobs/{user_id}`, `/sources`, `/status`, `POST /refresh/{user_id}`, `/save/{user_id}`, `/apply/{user_id}` | Updated Job Search: company-centric job list + matches, manual refresh, save to Selected Jobs, Apply tracking |
 | ATS analysis | `/api/ats-optimizer/analyze`, `/requirements`, `/missing-skills`, `/evidence`                    | JD analysis and confirmations                                      |
 | ATS workflow | `/api/ats-optimizer/generate`, `/status/{id}`, `/result`, `/retry`, `/download`                  | Background optimize-and-match                                      |
 | Editor       | `/api/optimizer/resume/...`                                                                      | Load, save, improve snippet, rescore, DOCX/PDF download            |
@@ -375,7 +431,7 @@ Models declare `ForeignKey` columns. There are no SQLAlchemy `relationship()` co
 | Scheduler    | `POST /api/scheduler/run/{user_id}`                                                              | Immediate full workflow                                            |
 
 
-OpenAPI: `http://localhost:8000/docs` and `/redoc`.
+OpenAPI: `http://localhost:8001/docs` and `/redoc` (when `BACKEND_PORT=8001`).
 
 ## Project structure
 
@@ -383,11 +439,12 @@ OpenAPI: `http://localhost:8000/docs` and `/redoc`.
 job-resume-agent-system/
 ├── backend/
 │   ├── app/
-│   │   ├── agents/          # job search, Remotive, URL import, email builder
+│   │   ├── agents/          # job search, Remotive (legacy), URL import, email builder
+│   │   ├── job_sources/     # Updated Job Search source adapters (Greenhouse, Lever, Workday, Remotive, generic feed)
 │   │   ├── models/          # SQLAlchemy tables
 │   │   ├── routes/          # FastAPI routers
-│   │   ├── scheduler/       # APScheduler
-│   │   ├── services/        # ATS, LLM, documents, workflow
+│   │   ├── scheduler/       # APScheduler (daily workflow + Updated Job Search poll)
+│   │   ├── services/        # ATS, LLM, documents, workflow, job discovery/matching
 │   │   ├── utils/           # resume file parsing
 │   │   ├── database.py
 │   │   └── main.py
@@ -447,7 +504,7 @@ pip install -r requirements.txt
 python -m uvicorn app.main:app --reload
 ```
 
-API: `http://localhost:8000`. Tables and additive upgrades run at startup.
+API: `http://localhost:8001` (default Compose publish). Tables and additive upgrades run at startup.
 
 ### 4. Frontend
 
@@ -457,7 +514,7 @@ npm ci
 npm run dev
 ```
 
-UI: `http://localhost:5173`. Set `VITE_API_BASE_URL` if the API is not on port 8000.
+UI: `http://localhost:5173`. Set `VITE_API_BASE_URL` to match the published backend port (Compose default `http://localhost:8001`).
 
 ### 5. Ollama (optional)
 
@@ -465,7 +522,7 @@ Install Ollama, pull a model, and point `LLM_*` at `http://localhost:11434/v1` (
 
 ## Docker setup
 
-All three runtime services are containerized:
+All runtime services are containerized:
 
 ```powershell
 Copy-Item .env.example .env
@@ -473,14 +530,16 @@ docker compose up --build
 ```
 
 
-| Service    | Image / build                                             | Default host port   | Persistence                                  |
-| ---------- | --------------------------------------------------------- | ------------------- | -------------------------------------------- |
-| `postgres` | `postgres:17-alpine`                                      | 5432                | volume `postgres_data`                       |
-| `backend`  | `backend/Dockerfile` (Python 3.12, Uvicorn `--workers 1`) | 8000                | volume `resume_uploads` → `/app/app/uploads` |
-| `frontend` | Node build + `nginx:1.27-alpine`                          | 5173 → container 80 | none (static files in image)                 |
+| Service        | Image / build                                             | Default host port   | Persistence                                  |
+| -------------- | --------------------------------------------------------- | ------------------- | -------------------------------------------- |
+| `postgres`     | `postgres:17-alpine`                                      | 5432                | volume `postgres_data`                       |
+| `redis`        | `redis:7-alpine` — Recruiter Drafts' queue only, optional  | `REDIS_PORT` (default 6379) | volume `redis_data`                  |
+| `backend`      | `backend/Dockerfile` (Python 3.12, Uvicorn `--workers 1`) | `BACKEND_PORT` (default **8001**) | volume `resume_uploads` → `/app/app/uploads` |
+| `draft_worker` | same image as `backend`, `python -m app.worker.draft_worker` | none (no HTTP server) | none — scales independently (`--scale draft_worker=N`) |
+| `frontend`     | Node build + `nginx:1.27-alpine`                          | 5173 → container 80 | none (static files in image)                 |
 
 
-`backend` waits for Postgres health; `frontend` waits for backend health. Compose maps `host.docker.internal` for host Ollama.
+`backend` waits for Postgres health; `draft_worker` waits for Postgres and Redis health; `frontend` waits for backend health. Compose maps `host.docker.internal` for host Ollama. Redis/`draft_worker` are optional at the application level — Recruiter Drafts still works without them (Gmail scanning is never affected either way; the manual Generate Reply button runs generation inline instead of via the worker).
 
 ```powershell
 docker compose ps
@@ -501,9 +560,9 @@ POSTGRES_PASSWORD=<password>
 POSTGRES_PORT=5432
 DATABASE_URL=postgresql+psycopg://<user>:<password>@postgres:5432/<database>
 
-BACKEND_PORT=8000
+BACKEND_PORT=8001
 FRONTEND_PORT=5173
-VITE_API_BASE_URL=http://localhost:8000
+VITE_API_BASE_URL=http://localhost:8001
 CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost:5175,http://127.0.0.1:5175,http://localhost:5176,http://127.0.0.1:5176
 APP_TIMEZONE=America/Chicago
 MAX_OPTIMIZATIONS_PER_RUN=3
@@ -517,6 +576,19 @@ LLM_TIMEOUT_SECONDS=120
 LLM_MAX_RETRIES=2
 ATS_GENERATION_TIMEOUT_SECONDS=180
 ATS_POLL_INTERVAL_MS=2000
+
+UPDATED_JOB_TRACKER_ENABLED=true
+UPDATED_JOB_POLL_INTERVAL_MINUTES=15
+JOB_DISCOVERY_MAX_JOBS_PER_SOURCE=100
+INACTIVE_AFTER_MISSED_POLLS=3
+UPDATED_JOB_DEMO_MODE=false
+GREENHOUSE_COMPANY_SOURCES=
+LEVER_COMPANY_SOURCES=
+GENERIC_FEED_ENABLED=false
+JOB_MATCH_LLM_PROVIDER=
+JOB_MATCH_LLM_MODEL=
+OPENAI_API_KEY=<optional-if-job-match-llm-provider-is-openai>
+ANTHROPIC_API_KEY=<optional-if-job-match-llm-provider-is-anthropic>
 
 SMTP_HOST=<smtp-host>
 SMTP_PORT=587
@@ -552,7 +624,7 @@ cd backend
 python -m uvicorn app.main:app --reload
 ```
 
-API: `http://localhost:8000` · OpenAPI: `http://localhost:8000/docs`
+API: `http://localhost:8001` · OpenAPI: `http://localhost:8001/docs`
 
 ### Frontend
 
@@ -578,7 +650,7 @@ Then open `http://localhost:5173`. Postgres, FastAPI, and the Nginx-hosted SPA s
 
 ## Testing
 
-Backend tests (routes, ownership, ATS/cross-role scoring, evidence, parsing, documents, LLM client/fallback, workflows, scheduler, Remotive/import with mocked HTTP) use SQLite and force `LLM_PROVIDER=none` unless a test mocks the client:
+Backend tests (routes, ownership, ATS/cross-role scoring, evidence, parsing, documents, LLM client/fallback, workflows, scheduler, Remotive/import with mocked HTTP, plus Updated Job Search's change detection, source adapters, matching, discovery orchestration, and routes) use SQLite and force `LLM_PROVIDER=none` unless a test mocks the client. All real HTTP for job sources is mocked (`requests.post`/`requests.Session.get`) — no live calls to Greenhouse, Lever, or Remotive during tests:
 
 ```powershell
 cd backend
@@ -608,7 +680,24 @@ There is no GitHub Actions (or other CI) workflow in this repository. Tests are 
 - Claim/structure validation on generated and edited resumes
 - Health endpoints return 503 JSON when the database is down
 
+## Troubleshooting
 
+### Backend returns 404 on port 8000
+
+On some Windows hosts, **Splunk** (or another service) binds `127.0.0.1:8000`. Docker may still publish the FastAPI container on `0.0.0.0:8000`, but IPv4 browser/`curl` traffic to `127.0.0.1:8000` hits Splunk instead of CareerBoost.
+
+**Fix:** publish the API on **8001** (current `.env.example` default):
+
+```env
+BACKEND_PORT=8001
+VITE_API_BASE_URL=http://localhost:8001
+```
+
+Then `docker compose up --build` and open the UI at `http://localhost:5173`. Verify with `GET http://localhost:8001/health`.
+
+### Generation shows Deterministic fallback
+
+Check `GET /health/llm` (no API key is returned): provider, model, base URL, timeout, `reachable`, `model_found`. Confirm Ollama is running and `LLM_BASE_URL` matches the runtime (host vs `host.docker.internal`). Fallback reasons are exact codes such as `timeout`, `connection_refused`, `model_not_found`, `invalid_json` — not a single generic timeout message.
 
 ## Security considerations
 
@@ -647,7 +736,9 @@ Treat Compose as a local/runtime setup, not a hardened production deployment.
 - ATS percentages are heuristic estimates, not employer ATS results or hiring predictions
 - Role taxonomy is finite; unusual titles may land in `Other` or be misclassified
 - Complex layouts, graphics, tables, and scanned PDFs may parse poorly; there is no OCR
-- Remotive is the only live job **API**; other boards are search links or best-effort HTML import and may block extraction
+- Original Job Search: Remotive is not part of it; other boards are search links or best-effort HTML import and may block extraction
+- Updated Job Search: Remotive is always live. Greenhouse and Lever retrieve real jobs only for employers actually listed in `GREENHOUSE_COMPANY_SOURCES` / `LEVER_COMPANY_SOURCES` — with none configured, those connectors contribute nothing (never a fabricated company). Workday and the generic career feed can never retrieve real jobs at all. **Companies Monitored** on the dashboard reflects only what is actually configured and visible — this project does not claim to monitor "tens of thousands of companies." Mock jobs (`UPDATED_JOB_DEMO_MODE=true` only) never carry a `direct_url`/`application_url` and never reach normal (non-demo) API responses regardless of what is in the database
+- Updated Job Search's deterministic matcher recognizes technologies from the shared synonym catalog; a resume/JD pair using vocabulary outside that catalog will under-detect skill overlap
 - Local LLM quality and latency depend on the installed model and hardware; hosted providers receive the configured prompt payload
 - Deterministic fallback is conservative and may yield little or no score gain
 - Job-match emails are generated and stored; they are not sent through SMTP

@@ -47,14 +47,14 @@ const navigationByPath = {
   },
 };
 
-export function Page({ title, subtitle, actions, children }) {
+export function Page({ title, subtitle, actions, children, className = "" }) {
   const app = useApp();
   const { pathname } = useLocation();
   const navigation = navigationByPath[pathname];
   const stateValue = navigation?.stateKey ? app[navigation.stateKey] : null;
   const canContinue = navigation?.canContinue ?? (Array.isArray(stateValue) ? stateValue.length > 0 : Boolean(stateValue));
 
-  return <div className="page">
+  return <div className={`page ${className}`.trim()}>
     <div className="page-heading">
       <div><h2>{title}</h2><p>{subtitle}</p></div>
       {actions && <div className="actions">{actions}</div>}

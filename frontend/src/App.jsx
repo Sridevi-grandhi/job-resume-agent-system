@@ -8,6 +8,7 @@ import DashboardPage from "./pages/DashboardPage";
 import PreferencesPage from "./pages/PreferencesPage";
 import ResumePage from "./pages/ResumePage";
 import JobSearchPage from "./pages/JobSearchPage";
+import UpdatedJobSearchPage from "./pages/UpdatedJobSearchPage";
 import SelectedJobsPage from "./pages/SelectedJobsPage";
 import AtsAnalyzerPage from "./pages/AtsAnalyzerPage";
 import EmailSummaryPage from "./pages/EmailSummaryPage";
@@ -28,6 +29,7 @@ export default function App() {
               <Route path="/preferences" element={<PreferencesPage />} />
               <Route path="/resume" element={<ResumePage />} />
               <Route path="/jobs" element={<JobSearchPage />} />
+              <Route path="/updated-jobs" element={<UpdatedJobSearchPage />} />
               <Route path="/selected-jobs" element={<SelectedJobsPage />} />
               <Route path="/ats-analyzer" element={<AtsAnalyzerPage />} />
               <Route path="/optimizer/:jobId" element={<AtsAnalyzerPage />} />

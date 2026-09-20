@@ -1062,10 +1062,57 @@ def _is_accepted_evidence_row(row: UserConfirmedSkill) -> bool:
     if status == "VERIFIED_FROM_RESUME":
         return True
     if status in _USER_CONFIRMED_STATUSES or status == "LEARNING_ONLY":
-        # Only accept explicit user-input evidence paths. Historical/unknown sources stay out.
-        source = (row.evidence_source or "").strip().lower()
+        # Unset source defaults to user_selection; legacy_unknown stays excluded.
+        source = (row.evidence_source or "user_selection").strip().lower()
         return source in {"user_input", "user_selection"}
     return False
+
+
+def build_effective_evidence_decisions(
+    confirmation_rows: list[UserConfirmedSkill] | None,
+) -> dict[str, str]:
+    """Map skill aliases to the effective Step 3 evidence_status for scoring warnings."""
+    from app.services.keyword_utils import normalize_keyword
+
+    decisions: dict[str, str] = {}
+    for row in _effective_rows_by_normalized(confirmation_rows or []).values():
+        status = str(row.evidence_status or "").upper()
+        label = str(row.skill_name or row.normalized_skill_name or "").strip()
+        if not label:
+            continue
+        aliases = {
+            label,
+            label.lower(),
+            _row_normalized(row),
+            normalize_keyword(label),
+            str(normalize_keyword(label)).lower(),
+            normalize_skill_name(label),
+        }
+        for alias in aliases:
+            if alias:
+                current = decisions.get(alias)
+                if current is None or _status_rank(status) > _status_rank(current):
+                    decisions[alias] = status
+    return decisions
+
+
+def load_effective_evidence_for_job(
+    db: Session,
+    *,
+    user_id: int,
+    job_id: int,
+    resume_id: int | None,
+    workflow_run_id: str | None = None,
+) -> list[UserConfirmedSkill]:
+    """Authoritative evidence rows scoped to user/job/resume for Step 5 scoring."""
+    return get_current_effective_evidence(
+        db,
+        user_id=user_id,
+        job_id=job_id,
+        resume_id=resume_id,
+        workflow_run_id=workflow_run_id,
+        persist_rebinds=True,
+    )
 
 
 def to_scoring_evidence(rows: list[UserConfirmedSkill]) -> dict[str, dict[str, Any]]:
@@ -1145,6 +1192,12 @@ def build_canonical_supported_evidence(
             (row.skill_name or row.normalized_skill_name)
             for row in (confirmation_rows or [])
             if row.evidence_status in _USER_CONFIRMED_STATUSES
+            and getattr(row, "is_active", True) is not False
+        }),
+        "denied_skill_names": sorted({
+            (row.skill_name or row.normalized_skill_name)
+            for row in (confirmation_rows or [])
+            if row.evidence_status in {"REJECTED", "NOT_POSSESSED"}
             and getattr(row, "is_active", True) is not False
         }),
     }

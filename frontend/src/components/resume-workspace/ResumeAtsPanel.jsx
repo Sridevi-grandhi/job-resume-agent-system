@@ -1,6 +1,7 @@
 export default function ResumeAtsPanel({
   originalScore,
   currentScore,
+  scoreStale = false,
   improvement,
   score,
   scoring,
@@ -9,7 +10,10 @@ export default function ResumeAtsPanel({
   confirmedSkillsIncorporated = [],
   generationLabel = null,
   fallbackReason = null,
+  scoreNote = null,
   whatChanged = [],
+  sectionsModifiedCount = 0,
+  changeCounts = { modified: 0, accepted: 0, rejected: 0, pending: 0, manual: 0 },
   onRecalculate,
   collapsed,
   onToggle,
@@ -78,6 +82,7 @@ export default function ResumeAtsPanel({
             <div className="current">
               <span>Current</span>
               <b>{scoring ? "…" : (currentScore != null ? `${Math.round(Number(currentScore))}%` : "—")}</b>
+              {!scoring && scoreStale && <em className="rw-score-stale">Needs recalculation</em>}
             </div>
             <div className="delta">
               <span>Improvement</span>
@@ -99,6 +104,18 @@ export default function ResumeAtsPanel({
           <button type="button" className="button primary rw-full" disabled={scoring} onClick={onRecalculate}>
             {scoring ? "Recalculating…" : "Recalculate Score"}
           </button>
+          {scoreNote && <p className="rw-note rw-score-note">{scoreNote}</p>}
+
+          {(score?.skill_credit_warnings || []).length > 0 && (
+            <section className="rw-panel-block rw-skill-warnings" aria-label="Skill credit warnings">
+              <h4>Skill credit notices</h4>
+              <ul>
+                {(score.skill_credit_warnings || []).map((item) => (
+                  <li key={item}>{item}</li>
+                ))}
+              </ul>
+            </section>
+          )}
 
           <dl className="rw-metric-list">
             <div><dt>JD Match</dt><dd>{score?.jd_match != null ? `${Math.round(Number(score.jd_match))}%` : (currentScore != null ? `${Math.round(Number(currentScore))}%` : "—")}</dd></div>
@@ -166,6 +183,17 @@ export default function ResumeAtsPanel({
             <ul>
               {whatChanged.map((item, index) => <li key={`wc-${index}`}>{item}</li>)}
             </ul>
+            {changeCounts.modified > 0 && (
+              <dl className="rw-metric-list rw-change-counts">
+                <div><dt>Sections modified</dt><dd>{sectionsModifiedCount}</dd></div>
+                <div><dt>Bullets improved</dt><dd>{changeCounts.modified}</dd></div>
+                <div><dt>Accepted</dt><dd>{changeCounts.accepted}</dd></div>
+                <div><dt>Rejected</dt><dd>{changeCounts.rejected}</dd></div>
+                <div><dt>Pending review</dt><dd>{changeCounts.pending}</dd></div>
+                <div><dt>Manually edited</dt><dd>{changeCounts.manual}</dd></div>
+              </dl>
+            )}
+            <p className="rw-note">Review each AI suggestion where it appears in the resume below.</p>
           </details>
         </>
       )}

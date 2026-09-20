@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { addBullet, addExperienceItem, addProjectItem } from "./resumeDocumentUtils";
+import { addBullet, addExperienceItem, addProjectItem, SUMMARY_CHANGE_KEY } from "./resumeDocumentUtils";
 
 function Inline({ value, onChange, className = "", placeholder = "", multiline = false, "aria-label": ariaLabel }) {
   if (multiline) {
@@ -40,12 +40,50 @@ function SectionChrome({ index, total, onMove, onAddItem, onRemove, onImprove, i
   );
 }
 
+/** Subtle inline indicator shown beside a bullet/summary that carries a
+ * tracked AI change — this replaces the old large sidebar bullet-review
+ * list; the review happens right where the text lives. */
+function ChangeBadge({ entry, onReview }) {
+  if (!entry) return null;
+  if (entry.status === "accepted") {
+    return <span className="rw-ai-badge rw-ai-badge-accepted">✓ Accepted</span>;
+  }
+  if (entry.status === "manual_edit") {
+    return <span className="rw-ai-badge rw-ai-badge-manual">Edited manually</span>;
+  }
+  if (entry.status === "rejected") {
+    return null;
+  }
+  // "AI Improved" = OpenAI reworded existing candidate content during
+  // generation. "AI Generated" = new content created strictly from valid
+  // confirmed professional evidence that wasn't on the original resume.
+  const label = entry.changeType === "ADDED_FROM_CONFIRMED_EVIDENCE" ? "✨ AI Generated" : "✨ AI Improved";
+  return (
+    <span className="rw-ai-badge rw-ai-badge-pending">
+      {label}
+      <button type="button" className="rw-ai-badge-review" onClick={onReview}>Review</button>
+    </span>
+  );
+}
+
+/** Transient, non-blocking note for when a fresh AI Improve request (or
+ * opening Review) had nothing meaningfully different to offer — shown
+ * inline instead of ever opening an Accept/Reject modal on identical text. */
+function NoImprovementNotice({ notice, itemKey }) {
+  if (!notice || notice.key !== itemKey) return null;
+  return <p className="rw-no-improvement-notice">{notice.message}</p>;
+}
+
 export default function ResumeDocumentCanvas({
   document,
   fitMode,
   onChange,
   onImprove,
   improvingKey,
+  changeMap = new Map(),
+  onReviewChange,
+  onManualEdit,
+  noImprovementNotice = null,
 }) {
   const [dragIndex, setDragIndex] = useState(null);
   if (!document) return null;
@@ -117,8 +155,8 @@ export default function ResumeDocumentCanvas({
                       : null
               }
               onRemove={() => updateSections(document.sections.filter((_, i) => i !== index))}
-              onImprove={section.type === "summary" ? () => onImprove({ path: ["sections", index, "content"], text: section.content || "", context: "summary" }) : null}
-              improveLabel={improvingKey === `sections.${index}.content` ? "Improving…" : "AI Improve"}
+              onImprove={section.type === "summary" ? () => onImprove({ key: SUMMARY_CHANGE_KEY, text: section.content || "", context: "summary" }) : null}
+              improveLabel={improvingKey === SUMMARY_CHANGE_KEY ? "Improving…" : "AI Improve"}
             >
               <Inline
                 className="rw-heading"
@@ -129,14 +167,21 @@ export default function ResumeDocumentCanvas({
               />
 
               {section.type === "summary" && (
-                <Inline
-                  multiline
-                  className="rw-summary"
-                  value={section.content}
-                  onChange={(content) => updateSection(index, { content })}
-                  placeholder="Professional summary"
-                  aria-label="Professional summary"
-                />
+                <>
+                  <ChangeBadge entry={changeMap.get(SUMMARY_CHANGE_KEY)} onReview={() => onReviewChange?.(SUMMARY_CHANGE_KEY)} />
+                  <NoImprovementNotice notice={noImprovementNotice} itemKey={SUMMARY_CHANGE_KEY} />
+                  <Inline
+                    multiline
+                    className="rw-summary"
+                    value={section.content}
+                    onChange={(content) => {
+                      updateSection(index, { content });
+                      onManualEdit?.(SUMMARY_CHANGE_KEY, content);
+                    }}
+                    placeholder="Professional summary"
+                    aria-label="Professional summary"
+                  />
+                </>
               )}
 
               {section.type === "skills" && (
@@ -187,41 +232,48 @@ export default function ResumeDocumentCanvas({
                     }} placeholder="Dates" aria-label="Dates" />
                   </div>
                   <ul className="rw-bullets">
-                    {(item.bullets || []).map((bullet, bulletIndex) => (
-                      <li key={bullet.id || bulletIndex}>
-                        <Inline
-                          multiline
-                          value={typeof bullet === "string" ? bullet : bullet.text}
-                          onChange={(text) => {
-                            const items = section.items.map((row, i) => {
-                              if (i !== itemIndex) return row;
-                              const bullets = row.bullets.map((entry, bi) => (
-                                bi === bulletIndex ? { ...(typeof entry === "object" ? entry : { id: `b-${bi}` }), text } : entry
+                    {(item.bullets || []).map((bullet, bulletIndex) => {
+                      const bulletId = typeof bullet === "object" ? bullet.id : null;
+                      const bulletText = typeof bullet === "string" ? bullet : bullet.text;
+                      return (
+                        <li key={bullet.id || bulletIndex}>
+                          <ChangeBadge entry={changeMap.get(bulletId)} onReview={() => onReviewChange?.(bulletId)} />
+                          <NoImprovementNotice notice={noImprovementNotice} itemKey={bulletId} />
+                          <Inline
+                            multiline
+                            value={bulletText}
+                            onChange={(text) => {
+                              const items = section.items.map((row, i) => {
+                                if (i !== itemIndex) return row;
+                                const bullets = row.bullets.map((entry, bi) => (
+                                  bi === bulletIndex ? { ...(typeof entry === "object" ? entry : { id: `b-${bi}` }), text } : entry
+                                ));
+                                return { ...row, bullets };
+                              });
+                              updateSection(index, { items });
+                              if (bulletId) onManualEdit?.(bulletId, text);
+                            }}
+                            placeholder="Achievement bullet"
+                            aria-label="Experience bullet"
+                          />
+                          <div className="rw-bullet-actions">
+                            <button type="button" onClick={() => onImprove({
+                              key: bulletId,
+                              text: bulletText,
+                              context: "bullet",
+                            })}>
+                              {improvingKey === bulletId ? "Improving…" : "AI Improve"}
+                            </button>
+                            <button type="button" onClick={() => {
+                              const items = section.items.map((row, i) => (
+                                i === itemIndex ? { ...row, bullets: row.bullets.filter((_, bi) => bi !== bulletIndex) } : row
                               ));
-                              return { ...row, bullets };
-                            });
-                            updateSection(index, { items });
-                          }}
-                          placeholder="Achievement bullet"
-                          aria-label="Experience bullet"
-                        />
-                        <div className="rw-bullet-actions">
-                          <button type="button" onClick={() => onImprove({
-                            path: ["sections", index, "items", itemIndex, "bullets", bulletIndex, "text"],
-                            text: typeof bullet === "string" ? bullet : bullet.text,
-                            context: "bullet",
-                          })}>
-                            {improvingKey === `sections.${index}.items.${itemIndex}.bullets.${bulletIndex}.text` ? "Improving…" : "AI Improve"}
-                          </button>
-                          <button type="button" onClick={() => {
-                            const items = section.items.map((row, i) => (
-                              i === itemIndex ? { ...row, bullets: row.bullets.filter((_, bi) => bi !== bulletIndex) } : row
-                            ));
-                            updateSection(index, { items });
-                          }}>Delete</button>
-                        </div>
-                      </li>
-                    ))}
+                              updateSection(index, { items });
+                            }}>Delete</button>
+                          </div>
+                        </li>
+                      );
+                    })}
                   </ul>
                   <div className="rw-item-actions">
                     <button type="button" onClick={() => {
@@ -258,39 +310,48 @@ export default function ResumeDocumentCanvas({
                     aria-label="Project description"
                   />
                   <ul className="rw-bullets">
-                    {(item.bullets || []).map((bullet, bulletIndex) => (
-                      <li key={bullet.id || bulletIndex}>
-                        <Inline
-                          multiline
-                          value={typeof bullet === "string" ? bullet : bullet.text}
-                          onChange={(text) => {
-                            const items = section.items.map((row, i) => {
-                              if (i !== itemIndex) return row;
-                              const bullets = row.bullets.map((entry, bi) => (
-                                bi === bulletIndex ? { ...(typeof entry === "object" ? entry : { id: `b-${bi}` }), text } : entry
+                    {(item.bullets || []).map((bullet, bulletIndex) => {
+                      const bulletId = typeof bullet === "object" ? bullet.id : null;
+                      const bulletText = typeof bullet === "string" ? bullet : bullet.text;
+                      return (
+                        <li key={bullet.id || bulletIndex}>
+                          <ChangeBadge entry={changeMap.get(bulletId)} onReview={() => onReviewChange?.(bulletId)} />
+                          <NoImprovementNotice notice={noImprovementNotice} itemKey={bulletId} />
+                          <Inline
+                            multiline
+                            value={bulletText}
+                            onChange={(text) => {
+                              const items = section.items.map((row, i) => {
+                                if (i !== itemIndex) return row;
+                                const bullets = row.bullets.map((entry, bi) => (
+                                  bi === bulletIndex ? { ...(typeof entry === "object" ? entry : { id: `b-${bi}` }), text } : entry
+                                ));
+                                return { ...row, bullets };
+                              });
+                              updateSection(index, { items });
+                              if (bulletId) onManualEdit?.(bulletId, text);
+                            }}
+                            placeholder="Project bullet"
+                            aria-label="Project bullet"
+                          />
+                          <div className="rw-bullet-actions">
+                            <button type="button" onClick={() => onImprove({
+                              key: bulletId,
+                              text: bulletText,
+                              context: "bullet",
+                            })}>
+                              {improvingKey === bulletId ? "Improving…" : "AI Improve"}
+                            </button>
+                            <button type="button" onClick={() => {
+                              const items = section.items.map((row, i) => (
+                                i === itemIndex ? { ...row, bullets: row.bullets.filter((_, bi) => bi !== bulletIndex) } : row
                               ));
-                              return { ...row, bullets };
-                            });
-                            updateSection(index, { items });
-                          }}
-                          placeholder="Project bullet"
-                          aria-label="Project bullet"
-                        />
-                        <div className="rw-bullet-actions">
-                          <button type="button" onClick={() => onImprove({
-                            path: ["sections", index, "items", itemIndex, "bullets", bulletIndex, "text"],
-                            text: typeof bullet === "string" ? bullet : bullet.text,
-                            context: "bullet",
-                          })}>AI Improve</button>
-                          <button type="button" onClick={() => {
-                            const items = section.items.map((row, i) => (
-                              i === itemIndex ? { ...row, bullets: row.bullets.filter((_, bi) => bi !== bulletIndex) } : row
-                            ));
-                            updateSection(index, { items });
-                          }}>Delete</button>
-                        </div>
-                      </li>
-                    ))}
+                              updateSection(index, { items });
+                            }}>Delete</button>
+                          </div>
+                        </li>
+                      );
+                    })}
                   </ul>
                   <div className="rw-item-actions">
                     <button type="button" onClick={() => {

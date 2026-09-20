@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect -- reset form state when auth mode changes */
 import { useEffect, useState } from "react";
 import { Link, Navigate, useNavigate, useSearchParams } from "react-router-dom";
 import { useApp } from "../context/AppContext";
@@ -30,6 +31,23 @@ function AuthShell({ title, subtitle, children, footer }) {
   );
 }
 
+function PasswordVisibilityButton({ visible, label, onClick }) {
+  return (
+    <button
+      type="button"
+      className="password-visibility-toggle"
+      aria-label={`${visible ? "Hide" : "Show"} ${label}`}
+      onClick={onClick}
+    >
+      {visible ? (
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m3 3 18 18M10.6 10.7a2 2 0 0 0 2.7 2.7M9.9 4.2A10.8 10.8 0 0 1 12 4c5.5 0 9.3 4.3 10 8-.3 1.5-1.2 3.1-2.6 4.4M6.2 6.2C4.3 7.6 2.8 9.8 2 12c.7 3.7 4.5 8 10 8 1.2 0 2.3-.2 3.3-.6" /></svg>
+      ) : (
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M2 12s3.6-8 10-8 10 8 10 8-3.6 8-10 8S2 12 2 12Z" /><circle cx="12" cy="12" r="3" /></svg>
+      )}
+    </button>
+  );
+}
+
 export default function AuthPage({ mode }) {
   const app = useApp();
   const navigate = useNavigate();
@@ -38,6 +56,9 @@ export default function AuthPage({ mode }) {
 
   const [form, setForm] = useState({ name: "", email: "", password: "", confirmPassword: "" });
   const [localError, setLocalError] = useState("");
+  const [signupConfirmError, setSignupConfirmError] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [showConfirmPassword, setShowConfirmPassword] = useState(false);
   const [forgotSent, setForgotSent] = useState(false);
   const [resetDone, setResetDone] = useState(false);
   const [devResetUrl, setDevResetUrl] = useState("");
@@ -45,6 +66,9 @@ export default function AuthPage({ mode }) {
   useEffect(() => {
     app.clearAuthMessages?.();
     setLocalError("");
+    setSignupConfirmError("");
+    setShowPassword(false);
+    setShowConfirmPassword(false);
     setForgotSent(false);
     setResetDone(false);
     setDevResetUrl("");
@@ -72,7 +96,34 @@ export default function AuthPage({ mode }) {
       setLocalError(`Password must be at least ${MIN_PASSWORD_LENGTH} characters.`);
       return;
     }
+    if (mode === "signup") {
+      const confirmError = !form.confirmPassword
+        ? "Please confirm your password."
+        : form.password !== form.confirmPassword
+          ? "Passwords do not match."
+          : "";
+      if (confirmError) {
+        setSignupConfirmError(confirmError);
+        return;
+      }
+      setSignupConfirmError("");
+      const signupPayload = { name: form.name, email: form.email, password: form.password };
+      if (await app.authenticate(mode, signupPayload)) navigate("/dashboard");
+      return;
+    }
     if (await app.authenticate(mode, form)) navigate("/dashboard");
+  };
+
+  const updateSignupPassword = (field, value) => {
+    const nextForm = { ...form, [field]: value };
+    setForm(nextForm);
+    if (signupConfirmError) {
+      setSignupConfirmError(!nextForm.confirmPassword
+        ? "Please confirm your password."
+        : nextForm.password !== nextForm.confirmPassword
+          ? "Passwords do not match."
+          : "");
+    }
   };
 
   const submitForgot = async (event) => {
@@ -83,7 +134,13 @@ export default function AuthPage({ mode }) {
     const result = await app.requestPasswordReset(form.email);
     if (result) {
       setForgotSent(true);
+      // Only ever set when the backend explicitly opts in (APP_ENV=development
+      // AND SHOW_DEV_RESET_LINK=true) — null in every normal/production response.
       if (result.dev_reset_url) setDevResetUrl(result.dev_reset_url);
+    } else {
+      // The request itself failed (network/server error) — a safe, generic
+      // message, never the raw backend exception/error text.
+      setLocalError("Unable to process the request right now. Please try again.");
     }
   };
 
@@ -132,12 +189,17 @@ export default function AuthPage({ mode }) {
             {forgotBusy ? "Please wait…" : "Send Reset Link"}
           </button>
         </form>
-        {forgotSent && forgotMessage && <div className="notice">{forgotMessage}</div>}
-        {forgotSent && !forgotMessage && (
-          <div className="notice">If an account exists for this email, password reset instructions have been sent.</div>
+        {forgotSent && (
+          <div className="notice">
+            {forgotMessage || "If an account exists for this email, password reset instructions have been sent."}
+            {" "}Please check your inbox. Check your spam or junk folder if you don't see the email.
+          </div>
         )}
-        {forgotMessage && !forgotSent && <div className="notice error">{forgotMessage}</div>}
         {localError && <div className="notice error">{localError}</div>}
+        {/* Only ever populated behind an explicit backend opt-in
+            (APP_ENV=development AND SHOW_DEV_RESET_LINK=true) — never
+            shown in normal/production use. Raw reset link is never
+            displayed otherwise. */}
         {devResetUrl && (
           <div className="notice">
             Development reset link:{" "}
@@ -274,17 +336,43 @@ export default function AuthPage({ mode }) {
             autoComplete="email"
           />
         </label>
-        <label>Password
+        <label className={mode === "signup" ? "signup-password-field" : ""}>Password
           <input
-            type="password"
+            className={mode === "signup" ? "auth-password-input" : undefined}
+            type={mode === "signup" && showPassword ? "text" : "password"}
             value={form.password}
-            onChange={(event) => setForm({ ...form, password: event.target.value })}
+            onChange={(event) => mode === "signup"
+              ? updateSignupPassword("password", event.target.value)
+              : setForm({ ...form, password: event.target.value })}
             placeholder="••••••••"
             required
             minLength={mode === "signup" ? MIN_PASSWORD_LENGTH : undefined}
             autoComplete={mode === "login" ? "current-password" : "new-password"}
           />
+          {mode === "signup" && <PasswordVisibilityButton visible={showPassword} label="password" onClick={() => setShowPassword((visible) => !visible)} />}
         </label>
+        {mode === "signup" && (
+          <label className="signup-password-field">Confirm password
+            <input
+              className="auth-password-input"
+              type={showConfirmPassword ? "text" : "password"}
+              value={form.confirmPassword}
+              onChange={(event) => updateSignupPassword("confirmPassword", event.target.value)}
+              placeholder="Re-enter your password"
+              aria-required="true"
+              aria-invalid={Boolean(signupConfirmError)}
+              aria-describedby={signupConfirmError ? "signup-confirm-password-error" : undefined}
+              minLength={MIN_PASSWORD_LENGTH}
+              autoComplete="new-password"
+            />
+            <PasswordVisibilityButton visible={showConfirmPassword} label="confirm password" onClick={() => setShowConfirmPassword((visible) => !visible)} />
+            {signupConfirmError && (
+              <span id="signup-confirm-password-error" className="auth-field-error" role="alert">
+                {signupConfirmError}
+              </span>
+            )}
+          </label>
+        )}
         {mode === "login" && (
           <div className="auth-forgot-row">
             <Link

@@ -877,27 +877,116 @@ def _skill_present_in_document(skill: str, document_text: str) -> bool:
     return False
 
 
+def _skill_in_denied_list(skill: str, denied_skills: list[str] | set[str] | None) -> bool:
+    """True when skill matches a REJECTED / NOT_POSSESSED / blocked label."""
+    if not denied_skills or not skill:
+        return False
+    from app.services.skill_analysis_service import normalize_skill_name
+
+    skill_forms = {
+        skill,
+        skill.lower(),
+        normalize_skill_name(skill),
+        normalize_keyword(skill),
+        str(normalize_keyword(skill)).lower(),
+    }
+    for denied in denied_skills:
+        label = str(denied or "").strip()
+        if not label:
+            continue
+        denied_forms = {
+            label,
+            label.lower(),
+            normalize_skill_name(label),
+            normalize_keyword(label),
+            str(normalize_keyword(label)).lower(),
+        }
+        if skill_forms & denied_forms:
+            return True
+    return False
+
+
+def _skills_to_ignore_for_match_scoring(
+    combined: dict[str, tuple[float, str]],
+    *,
+    document_text: str,
+    all_requirements: list[str],
+) -> set[str]:
+    """Skills typed into the editor that must not affect JD match dimensions."""
+    ignored: set[str] = set()
+    for skill in all_requirements:
+        _, source = combined.get(skill, (0.0, "none"))
+        if source in {"rejected", "unverified"} and _skill_present_in_document(skill, document_text):
+            ignored.add(skill)
+            parts = [part.strip() for part in re.split(r"\s+or\s+", str(skill), flags=re.I) if part.strip()]
+            ignored.update(parts if len(parts) > 1 else [skill])
+    return ignored
+
+
+def _strip_skill_mentions(text: str, skills: set[str]) -> str:
+    """Remove rejected/unverified skill tokens before responsibility/role scoring."""
+    if not text or not skills:
+        return text or ""
+    result = text
+    for skill in sorted(skills, key=len, reverse=True):
+        if not skill:
+            continue
+        pattern = re.compile(rf"(?i)\b{re.escape(str(skill))}\b")
+        result = pattern.sub("", result)
+    result = re.sub(r",\s*,+", ", ", result)
+    result = re.sub(r"[ \t]{2,}", " ", result)
+    result = re.sub(r"\n{3,}", "\n\n", result)
+    return result.strip()
+
+
 def _combined_credit(
     skill: str,
     evidence_entry: dict,
     confirmed_skills: dict[str, dict] | None,
     *,
     document_text: str,
+    original_resume_text: str | None = None,
+    denied_skills: list[str] | set[str] | None = None,
+    evidence_gated: bool = False,
 ) -> tuple[float, str]:
     """Best truthful credit for a skill in the document being scored.
 
     Confirmed evidence may raise credit only when the scored document reflects the skill.
-    Generic/transferable skills are capped so they cannot substitute for missing technologies.
+    When ``evidence_gated`` is True (optimized / recalculate path):
+    - REJECTED / denied skills always receive zero credit (even if typed into the editor)
+    - Unverified skills that appear only because the user typed them (not on the original
+      resume and not accepted confirmed evidence) receive zero credit
+    - Text must not self-authenticate
     """
+    if _skill_in_denied_list(skill, denied_skills):
+        return 0.0, "rejected"
+
     resume_credit = _resume_credit(evidence_entry)
     confirmed_entry = _lookup_confirmed_skill(confirmed_skills, skill)
     confirmed_credit = 0.0
+    confirmed_status = str((confirmed_entry or {}).get("evidence_status") or "").upper()
     if confirmed_entry and confirmed_skills and _skill_present_in_document(skill, document_text):
-        confirmed_credit = float(confirmed_entry["credit"])
+        # LEARNING_ONLY must not count as professional requirement credit.
+        if confirmed_status == "LEARNING_ONLY":
+            confirmed_credit = 0.0
+        else:
+            confirmed_credit = float(confirmed_entry.get("credit") or 0.0)
 
     if skill in GENERIC_SKILLS:
         resume_credit = min(resume_credit, GENERIC_SKILL_CREDIT_CAP)
         confirmed_credit = min(confirmed_credit, GENERIC_SKILL_CREDIT_CAP)
+
+    if evidence_gated:
+        present = _skill_present_in_document(skill, document_text)
+        if not present:
+            return 0.0, "none"
+        if confirmed_credit > 0:
+            return confirmed_credit, "confirmed"
+        was_on_original = _skill_present_in_document(skill, original_resume_text or "")
+        if was_on_original and resume_credit > 0:
+            return resume_credit, "resume"
+        # Present in current editor but neither original-verified nor accepted-confirmed.
+        return 0.0, "unverified"
 
     if confirmed_credit > resume_credit:
         return confirmed_credit, "confirmed"
@@ -1004,12 +1093,18 @@ def calculate_weighted_ats_score(
     *,
     evidence_source_text: str | None = None,
     confirmed_skills: dict[str, dict] | None = None,
+    original_resume_text: str | None = None,
+    denied_skills: list[str] | set[str] | None = None,
+    evidence_gated: bool = False,
 ) -> dict[str, Any]:
     """Score the document in ``resume_text`` against the job.
 
-    Original scoring: pass the uploaded resume only; do not pass ``confirmed_skills``.
-    Optimized/edited scoring: pass the generated/edited document; ``confirmed_skills`` may
-    raise credit only for skills visibly present in that document.
+    Original scoring: pass the uploaded resume only; do not pass ``confirmed_skills``;
+    leave ``evidence_gated=False``.
+
+    Optimized/edited scoring: pass the generated/edited document with
+    ``evidence_gated=True``, ``original_resume_text`` (immutable uploaded resume),
+    ``confirmed_skills``, and ``denied_skills`` (REJECTED / NOT_POSSESSED).
 
     ``evidence_source_text`` is ignored — retained for backward-compatible call signatures.
     """
@@ -1027,14 +1122,38 @@ def calculate_weighted_ats_score(
             evidence[skill],
             confirmed_skills,
             document_text=scored_document,
+            original_resume_text=original_resume_text,
+            denied_skills=denied_skills,
+            evidence_gated=evidence_gated,
         )
         for skill in all_requirements
     }
     confirmed_skills_used = [
         skill for skill, (_, source) in combined.items() if source == "confirmed"
     ]
+    rejected_present_requirements = [
+        skill for skill in all_requirements
+        if _skill_in_denied_list(skill, denied_skills)
+        and _skill_present_in_document(skill, scored_document)
+    ]
+    unverified_present_requirements = [
+        skill for skill, (_, source) in combined.items() if source == "unverified"
+    ]
+    verified_present_requirements = [
+        skill for skill, (_, source) in combined.items() if source == "resume"
+    ]
 
-    resume_role = classify_role(scored_document)
+    match_document = scored_document
+    if evidence_gated:
+        ignored_for_match = _skills_to_ignore_for_match_scoring(
+            combined,
+            document_text=scored_document,
+            all_requirements=all_requirements,
+        )
+        if ignored_for_match:
+            match_document = _strip_skill_mentions(scored_document, ignored_for_match)
+
+    resume_role = classify_role(match_document)
     job_role = classify_role(
         str(getattr(job, "description", "") or "") + "\n" + str(getattr(job, "skills_required", "") or ""),
         str(getattr(job, "title", "") or ""),
@@ -1088,7 +1207,7 @@ def calculate_weighted_ats_score(
     mandatory_credit_ratio = (sum(mandatory_credits) / len(mandatory_units)) if mandatory_units else 1.0
     mandatory_points = 35 * mandatory_credit_ratio
     strong_context = sum(unit["credit"] >= 0.8 for unit in mandatory_units)
-    relevant_experience = _relevant_experience(scored_document, job_family)
+    relevant_experience = _relevant_experience(match_document, job_family)
     technology_context_ratio = strong_context / len(mandatory_units) if mandatory_units else 1.0
     required_years = requirements.get("experience_years_required")
     if relevant_experience["years"] is not None and required_years:
@@ -1113,7 +1232,7 @@ def calculate_weighted_ats_score(
         (jd_keywords.get("responsibilityKeywords") or []) + (jd_keywords.get("qualificationKeywords") or [])
     ))
     if responsibility_terms:
-        responsibility_matches = sum(1 for term in responsibility_terms if _has(scored_document, term))
+        responsibility_matches = sum(1 for term in responsibility_terms if _has(match_document, term))
         responsibilities_points = 7 * (responsibility_matches / len(responsibility_terms))
     else:
         responsibilities_points = 7.0
@@ -1355,6 +1474,11 @@ def calculate_weighted_ats_score(
         "analysis_version": ANALYSIS_VERSION,
         "keyword_analysis": requirements,
         "confirmed_skills_used": confirmed_skills_used,
+        "verified_present_requirements": verified_present_requirements,
+        "confirmed_present_requirements": confirmed_skills_used,
+        "rejected_present_requirements": rejected_present_requirements,
+        "unverified_present_requirements": unverified_present_requirements,
+        "evidence_gated": bool(evidence_gated),
         "mandatory_credit_ratio": round(mandatory_credit_ratio, 4),
         "mandatory_unit_count": mandatory_total,
         "mandatory_satisfied_count": mandatory_covered,
@@ -1435,6 +1559,11 @@ def build_score_view(score: dict) -> dict:
         "formatting_warnings": score.get("formatting_warnings") or [],
         "why_not_95": score.get("why_not_95"),
         "confirmed_skills_used": score.get("confirmed_skills_used") or [],
+        "verified_present_requirements": score.get("verified_present_requirements") or [],
+        "confirmed_present_requirements": score.get("confirmed_present_requirements") or score.get("confirmed_skills_used") or [],
+        "rejected_present_requirements": score.get("rejected_present_requirements") or [],
+        "unverified_present_requirements": score.get("unverified_present_requirements") or [],
+        "evidence_gated": bool(score.get("evidence_gated")),
         "keyword_coverage": keyword,
         "resume_quality": (
             component_details.get("experience_evidence", {}).get("earned")

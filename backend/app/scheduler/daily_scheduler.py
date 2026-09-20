@@ -1,6 +1,10 @@
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 import os
+import logging
+from datetime import datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from sqlalchemy.exc import IntegrityError
 
 from app.database import SessionLocal
 
@@ -10,6 +14,8 @@ from app.models.resume_model import Resume
 from app.models.job_model import Job
 from app.models.match_model import MatchScore
 from app.models.email_log_model import EmailLog
+from app.models.email_summary_preference_model import EmailSummaryPreference
+from app.models.scheduled_daily_summary_model import ScheduledDailySummary
 
 from app.agents.job_search_agent import get_mock_jobs
 from app.agents.email_agent import build_job_summary_email
@@ -19,9 +25,110 @@ from app.services.ats_optimization_workflow_service import (
     start_or_get_workflow,
 )
 from app.services.job_eligibility import job_is_analyzable
+from app.services import daily_summary_delivery_service, daily_summary_service
 
 
 scheduler = BackgroundScheduler()
+logger = logging.getLogger(__name__)
+
+
+def _summary_timezone(value: str | None) -> ZoneInfo | None:
+    try:
+        return ZoneInfo((value or "").strip())
+    except ZoneInfoNotFoundError:
+        return None
+
+
+def run_scheduled_daily_summary_for_user(user_id: int, *, now: datetime | None = None) -> str:
+    """Generate/deliver one opt-in summary without touching the legacy workflow.
+
+    This function reads existing users, preferences, matches and jobs only. It
+    intentionally never calls job search, ATS, Gmail, drafts, or tracking.
+    """
+    return "disabled"
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.id == user_id).first()
+        preference = db.query(UserPreference).filter(UserPreference.user_id == user_id).first()
+        email_preference = db.query(EmailSummaryPreference).filter(EmailSummaryPreference.user_id == user_id).first()
+        if not user or not preference or not email_preference or not email_preference.daily_summary_delivery_enabled:
+            return "skipped"
+        if not preference.schedule_time:
+            return "skipped"
+        user_timezone = _summary_timezone(preference.timezone)
+        if user_timezone is None:
+            logger.warning("scheduled_summary_skipped_invalid_timezone user_id=%s", user_id)
+            return "skipped"
+
+        local_date = (now or datetime.now(user_timezone)).astimezone(user_timezone).date()
+        existing = db.query(ScheduledDailySummary).filter(
+            ScheduledDailySummary.user_id == user_id, ScheduledDailySummary.local_date == local_date,
+        ).first()
+        if existing is not None:
+            email_log = db.query(EmailLog).filter(EmailLog.id == existing.email_log_id).first()
+            if email_log is None:
+                return "skipped"
+            delivery = daily_summary_delivery_service.deliver_generated_summary(
+                db, user_id=user_id, email_log=email_log, recipient_email=email_log.recipient_email,
+                idempotency_key=f"scheduled-summary:{user_id}:{local_date.isoformat()}",
+            )
+            existing.status = delivery.delivery_status
+            db.commit()
+            return delivery.delivery_status.lower()
+
+        recipient = email_preference.daily_summary_recipient or user.email
+        try:
+            recipient = daily_summary_delivery_service.validate_recipient(recipient)
+        except ValueError:
+            logger.warning("scheduled_summary_skipped_invalid_recipient user_id=%s", user_id)
+            return "skipped"
+        try:
+            content = daily_summary_service.build_summary_content(db, user=user)
+        except daily_summary_service.DailySummaryUnavailable as error:
+            logger.info("scheduled_summary_skipped user_id=%s reason=%s", user_id, error.reason)
+            return "skipped"
+
+        email_log = daily_summary_service.new_generated_summary(user_id=user_id, recipient_email=recipient, content=content)
+        claim = ScheduledDailySummary(user_id=user_id, local_date=local_date, email_log_id=email_log.id, status="GENERATED")
+        # Flush assigns email_log.id; one commit persists the generated log and
+        # its daily claim atomically. The database unique constraint is the
+        # cross-instance duplicate barrier.
+        db.add(email_log)
+        db.flush()
+        claim.email_log_id = email_log.id
+        db.add(claim)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            existing = db.query(ScheduledDailySummary).filter(
+                ScheduledDailySummary.user_id == user_id, ScheduledDailySummary.local_date == local_date,
+            ).first()
+            if existing is None:
+                raise
+            email_log = db.query(EmailLog).filter(EmailLog.id == existing.email_log_id).first()
+            if email_log is None:
+                return "skipped"
+            delivery = daily_summary_delivery_service.deliver_generated_summary(
+                db, user_id=user_id, email_log=email_log, recipient_email=email_log.recipient_email,
+                idempotency_key=f"scheduled-summary:{user_id}:{local_date.isoformat()}",
+            )
+            existing.status = delivery.delivery_status
+            db.commit()
+            return delivery.delivery_status.lower()
+
+        delivery = daily_summary_delivery_service.deliver_generated_summary(
+            db, user_id=user_id, email_log=email_log, recipient_email=recipient,
+            idempotency_key=f"scheduled-summary:{user_id}:{local_date.isoformat()}",
+        )
+        claim.status = delivery.delivery_status
+        db.commit()
+        return delivery.delivery_status.lower()
+    except Exception:
+        logger.exception("scheduled_summary_failed user_id=%s", user_id)
+        return "failed"
+    finally:
+        db.close()
 
 
 def run_workflow_for_user(user_id: int):
@@ -180,6 +287,41 @@ def schedule_user_jobs():
                 replace_existing=True
             )
 
+    finally:
+        db.close()
+
+
+def schedule_daily_summary_jobs():
+    """Register only opted-in summary jobs alongside, never inside, legacy jobs."""
+    db = SessionLocal()
+    try:
+        # Remove stale registrations first, so an opt-out never remains as a
+        # runnable APScheduler job after a configuration refresh.
+        for (user_id,) in db.query(UserPreference.user_id).all():
+            job_id = f"daily_summary_user_{user_id}"
+            if scheduler.get_job(job_id):
+                scheduler.remove_job(job_id)
+        rows = (
+            db.query(UserPreference, EmailSummaryPreference)
+            .join(EmailSummaryPreference, EmailSummaryPreference.user_id == UserPreference.user_id)
+            .filter(EmailSummaryPreference.daily_summary_delivery_enabled.is_(True))
+            .all()
+        )
+        for preference, _email_preference in rows:
+            job_id = f"daily_summary_user_{preference.user_id}"
+            if scheduler.get_job(job_id):
+                scheduler.remove_job(job_id)
+            if not preference.schedule_time:
+                continue
+            user_timezone = _summary_timezone(preference.timezone)
+            if user_timezone is None:
+                logger.warning("scheduled_summary_not_registered_invalid_timezone user_id=%s", preference.user_id)
+                continue
+            scheduler.add_job(
+                run_scheduled_daily_summary_for_user,
+                trigger=CronTrigger(hour=preference.schedule_time.hour, minute=preference.schedule_time.minute, timezone=user_timezone),
+                id=job_id, args=[preference.user_id], replace_existing=True,
+            )
     finally:
         db.close()
 

@@ -30,6 +30,8 @@ function buildAtsStatusBanner({
   isComplete,
   result,
   disabledReason,
+  originalScore,
+  currentEditorScore,
 }) {
   if (busy === "ats-requirements") return { text: "Analyzing job requirements…", tone: "info" };
   if (busy === "ats-skills") return { text: "Updating skill evidence…", tone: "info" };
@@ -79,6 +81,16 @@ function buildAtsStatusBanner({
 
   if (step === 5) {
     if (isComplete) {
+      if (originalScore != null && currentEditorScore != null) {
+        const delta = Number(currentEditorScore) - Number(originalScore);
+        const deltaLabel = Number.isFinite(delta)
+          ? (delta >= 0 ? `(+${Math.round(delta)})` : `(${Math.round(delta)})`)
+          : "";
+        return {
+          text: `Original ${Math.round(Number(originalScore))}% → Current ${Math.round(Number(currentEditorScore))}% ${deltaLabel}. Optimized resume ready.`,
+          tone: "info",
+        };
+      }
       return {
         text: messages.ats || "Optimized resume ready.",
         tone: "info",
@@ -351,37 +363,65 @@ function PipelineProgress({ status }) {
 
 function gapItemReason(item) {
   const status = String(item.evidence_status || item.code || "").toUpperCase();
-  const skill = item.skill || "This requirement";
+  const requirementType = String(item.requirement_type || item.importance || "").toUpperCase();
+  const isPreferred = requirementType === "PREFERRED" || status === "PREFERRED_GAP";
   if (status === "REJECTED" || status === "NOT_POSSESSED") {
-    return `${skill} was marked as not possessed. It will not be added to the optimized resume.`;
+    return "Marked as not possessed.";
   }
-  if (status === "INCOMPLETE" || status === "INCOMPLETE_EVIDENCE") {
-    return `${skill} is not supported by your current resume or confirmed evidence. It will not be added to the optimized resume.`;
+  if (isPreferred) {
+    return "Preferred requirement — no supported evidence.";
   }
-  return `${skill} is not supported by your current resume or confirmed evidence. It will not be added to the optimized resume.`;
+  return "Mandatory requirement — no supported evidence.";
 }
 
 function gapItemsFromScoreView(scoreView, result) {
-  const remaining = scoreView?.remaining_gaps;
+  const remaining = scoreView?.remaining_gaps || {};
   const mandatoryMissing = (
     (remaining?.unsupported?.length ? remaining.unsupported : null)
     || scoreView?.mandatory_requirements?.missing
     || scoreView?.missing_mandatory_skills
     || []
   );
-  if (mandatoryMissing.length) {
-    return mandatoryMissing.map((skill) => ({
+  const preferredMissing = (
+    (remaining?.preferred_gaps?.length ? remaining.preferred_gaps : null)
+    || scoreView?.preferred_requirements?.missing
+    || scoreView?.missing_preferred_skills
+    || []
+  );
+  const items = [];
+  for (const skill of mandatoryMissing) {
+    items.push({
       skill: typeof skill === "string" ? skill : (skill?.skill || skill?.label || String(skill)),
       normalized_skill: typeof skill === "object" ? skill?.normalized_skill : undefined,
+      requirement_type: "MANDATORY",
       code: "UNSUPPORTED_REQUIREMENT",
-    }));
+    });
   }
+  for (const skill of preferredMissing) {
+    const label = typeof skill === "string" ? skill : (skill?.skill || skill?.label || String(skill));
+    if (items.some((item) => item.skill === label)) continue;
+    items.push({
+      skill: label,
+      normalized_skill: typeof skill === "object" ? skill?.normalized_skill : undefined,
+      requirement_type: "PREFERRED",
+      code: "PREFERRED_GAP",
+    });
+  }
+  if (items.length) return items;
+
   const legacy = result?.unsupported_keywords_not_added || result?.remaining_gaps;
   if (Array.isArray(legacy)) {
-    return legacy.map((skill) => ({ skill, code: "UNSUPPORTED_REQUIREMENT" }));
+    return legacy.map((skill) => ({ skill, requirement_type: "MANDATORY", code: "UNSUPPORTED_REQUIREMENT" }));
   }
-  if (legacy?.unsupported?.length) {
-    return legacy.unsupported.map((skill) => ({ skill, code: "UNSUPPORTED_REQUIREMENT" }));
+  if (legacy?.unsupported?.length || legacy?.preferred_gaps?.length) {
+    return [
+      ...(legacy.unsupported || []).map((skill) => ({
+        skill, requirement_type: "MANDATORY", code: "UNSUPPORTED_REQUIREMENT",
+      })),
+      ...(legacy.preferred_gaps || []).map((skill) => ({
+        skill, requirement_type: "PREFERRED", code: "PREFERRED_GAP",
+      })),
+    ];
   }
   return [];
 }
@@ -390,11 +430,11 @@ function RemainingGapsPanel({ items }) {
   const gaps = (items || []).filter((item) => item?.skill);
   if (!gaps.length) return null;
   return (
-    <details className="ats-remaining-gaps" open>
+    <details className="ats-remaining-gaps">
       <summary>Remaining Gaps ({gaps.length})</summary>
       <ul>
         {gaps.map((item) => (
-          <li key={item.normalized_skill || item.skill}>
+          <li key={`${item.requirement_type || "gap"}-${item.normalized_skill || item.skill}`}>
             <b>{item.skill}</b>
             {" — "}
             {gapItemReason(item)}
@@ -404,23 +444,6 @@ function RemainingGapsPanel({ items }) {
     </details>
   );
 }
-
-const FALLBACK_REASON_LABELS = {
-  timeout: "Ollama timed out; deterministic optimization was used.",
-  connection_failed: "Ollama was unavailable; deterministic optimization was used.",
-  connection_refused: "Ollama connection was refused; deterministic optimization was used.",
-  model_not_found: "Configured Ollama model was not found; deterministic optimization was used.",
-  invalid_json: "The model returned an unusable response; deterministic optimization was used.",
-  invalid_response: "The model returned an unusable response; deterministic optimization was used.",
-  llm_not_configured: "AI generation was not configured; deterministic optimization was used.",
-  llm_disabled: "AI generation was disabled; deterministic optimization was used.",
-  llm_skipped: "Ollama was skipped after a prior timeout; deterministic optimization was used.",
-  validation_failed: "AI output failed validation; deterministic optimization was used.",
-  schema_validation_failed: "AI output failed schema validation; deterministic optimization was used.",
-  unsupported_provider: "Unsupported LLM provider; deterministic optimization was used.",
-  provider_error: "AI generation failed; deterministic optimization was used.",
-  unexpected_provider_error: "AI generation failed unexpectedly; deterministic optimization was used.",
-};
 
 function WizardSteps({ step, maxUnlockedStep, onSelect }) {
   return (
@@ -692,6 +715,8 @@ export default function AtsAnalyzerPage() {
     jobs,
     latestResume,
     atsResult,
+    activeAtsWorkflowId,
+    previousAtsResult,
     atsSelectedJobId,
     setAtsSelectedJobId,
     setAtsResult,
@@ -813,33 +838,68 @@ export default function AtsAnalyzerPage() {
   const result = atsResult;
   const jobInfo = result?.job || selectedJob;
   const status = result?.workflow_status;
-  const originalScore = result?.original_match_percentage ?? result?.original_match_score ?? result?.original_analysis?.match_percentage;
-  const optimizedScore = result?.optimized_match_percentage ?? result?.optimized_match_score ?? result?.optimized_analysis?.match_percentage;
-  const unsupported = result?.unsupported_keywords_not_added || [];
-  const generatedPlain = result?.generated_resume?.plain_text || result?.generated_resume_plain || result?.generated_resume;
-  const generatedPreview = result?.generated_resume?.formatted_preview || result?.generated_resume_preview_markdown || generatedPlain;
+  const isGenerating = busy === "ats" || (
+    activeAtsWorkflowId
+    && result?.workflow_id
+    && Number(result.workflow_id) === Number(activeAtsWorkflowId)
+    && !["COMPLETED", "FAILED", "VALIDATION_FAILED"].includes(String(status || ""))
+  );
+  const resultMatchesActiveWorkflow = !activeAtsWorkflowId
+    || !result?.workflow_id
+    || Number(result.workflow_id) === Number(activeAtsWorkflowId);
+  const displayResult = (isGenerating && previousAtsResult) ? previousAtsResult : result;
+  const originalScore = displayResult?.original_match_percentage ?? displayResult?.original_match_score ?? displayResult?.original_analysis?.match_percentage;
+  const workflowOptimizedScore = displayResult?.optimized_match_percentage ?? displayResult?.optimized_match_score ?? displayResult?.optimized_analysis?.match_percentage;
+  const unsupported = displayResult?.unsupported_keywords_not_added || [];
+  const generatedPlain = displayResult?.generated_resume?.plain_text || displayResult?.generated_resume_plain || displayResult?.generated_resume;
+  const generatedPreview = displayResult?.generated_resume?.formatted_preview || displayResult?.generated_resume_preview_markdown || generatedPlain;
   const canRetry = ["FAILED", "VALIDATION_FAILED"].includes(status);
-  const isComplete = status === "COMPLETED";
-  const roleAlignment = result?.role_alignment || result?.original_analysis?.role_alignment;
-  const resumeRoles = result?.resume_role_families || result?.original_analysis?.resume_role_families || [];
-  const targetRole = result?.target_job_role || result?.original_analysis?.job_role_family;
+  const isComplete = status === "COMPLETED" && resultMatchesActiveWorkflow && !isGenerating;
+  const currentEditorScore = editResult?.edited_score ?? editableResume?.edited_score ?? (isComplete ? workflowOptimizedScore : null);
+  const liveScoreView = editResult?.score || editableResume?.score || null;
+  const roleAlignment = displayResult?.role_alignment || displayResult?.original_analysis?.role_alignment;
+  const resumeRoles = displayResult?.resume_role_families || displayResult?.original_analysis?.resume_role_families || [];
+  const targetRole = displayResult?.target_job_role || displayResult?.original_analysis?.job_role_family;
   const majorMismatch = roleAlignment === "MISMATCH";
-  const contentChanged = result?.content_changed;
-  const optimizationStatus = result?.optimization_status;
-  const whyNot95 = result?.why_not_95;
-  const confirmedSkillsUsed = result?.confirmed_skills_incorporated
-    || result?.confirmed_skills_used
+  const contentChanged = displayResult?.content_changed;
+  const optimizationStatus = displayResult?.optimization_status;
+  const whyNot95 = displayResult?.why_not_95;
+  const confirmedSkillsUsed = displayResult?.confirmed_skills_incorporated
+    || displayResult?.confirmed_skills_used
     || [];
-  const improvementReport = result?.improvement_report;
-  const generationMetadata = result?.generation_metadata || result || {};
-  const generationLabel = generationMetadata.fallback_used
-    ? "Generation: Deterministic fallback"
-    : generationMetadata.llm_used
-      ? `Generation: ${generationMetadata.llm_service === "ollama" ? "Ollama" : generationMetadata.llm_provider || "LLM"} · ${generationMetadata.llm_model || "Unknown model"}`
-      : null;
-  const fallbackReason = generationMetadata.fallback_used
-    ? (FALLBACK_REASON_LABELS[generationMetadata.fallback_reason] || generationMetadata.fallback_reason || null)
-    : null;
+  const improvementReport = displayResult?.improvement_report;
+  const generationMetadata = resultMatchesActiveWorkflow && !isGenerating
+    ? (result?.generation_metadata || result || {})
+    : {};
+  const workflowStatusForLabel = String(displayResult?.workflow_status || result?.workflow_status || status || "");
+  const finalValidationStatus = String(
+    displayResult?.final_validation?.status
+    || result?.final_validation?.status
+    || ""
+  ).toLowerCase();
+  const validationPassedForLabel = finalValidationStatus === "passed"
+    || finalValidationStatus === "passed_with_warnings"
+    || displayResult?.validation_passed === true
+    || result?.validation_passed === true;
+  const llmGenerationSucceeded = Boolean(
+    generationMetadata.llm_used || generationMetadata.generation_method === "llm"
+  );
+  const generationLabel = isGenerating
+    ? "Generating with AI…"
+    : workflowStatusForLabel === "VALIDATION_FAILED" && llmGenerationSucceeded
+      ? "AI generation completed, but final resume validation failed."
+      : workflowStatusForLabel === "COMPLETED" && llmGenerationSucceeded && validationPassedForLabel
+      ? `AI Optimized · ${generationMetadata.llm_model || generationMetadata.generation_model || "LLM"}`
+      : generationMetadata.fallback_used
+        ? generationMetadata.fallback_reason === "timeout"
+          ? "Optimized locally · AI generation took too long"
+          : "Optimized locally · AI response could not be safely applied"
+        : generationMetadata.generation_method === "deterministic_fallback"
+          ? "Optimized locally · AI response could not be safely applied"
+          : workflowStatusForLabel === "COMPLETED" && generationMetadata.generation_method === "deterministic_fallback"
+            ? "Optimized locally · AI response could not be safely applied"
+            : null;
+  const fallbackReason = null;
 
   const verifiedSkills = missingSkillsGroups?.verified_resume_skills || [];
   const weakSkills = missingSkillsGroups?.weak_or_indirect_skills || [];
@@ -906,10 +966,9 @@ export default function AtsAnalyzerPage() {
     });
   }, [incompleteEvidence, blockingReasons, USER_CONFIRMED_STATUSES, missingSkillsGroups]);
 
-  const optimizedScoreView = result?.optimized_score_view
+  const optimizedScoreView = liveScoreView
+    || result?.optimized_score_view
     || result?.optimized_analysis?.score_view
-    || editResult?.score
-    || editableResume?.score
     || null;
   const authoritativeRemainingGaps = useMemo(() => {
     if (isComplete && (optimizedScoreView || result?.optimized_analysis)) {
@@ -1076,7 +1135,7 @@ export default function AtsAnalyzerPage() {
             edited_score: data.edited_score,
             generated_score: data.generated_score,
             score: data.score,
-            safe_to_download: data.validation_status === "passed",
+            safe_to_download: ["passed", "passed_with_warnings"].includes(String(data.validation_status || "")),
             final_text: data.final_text,
           }));
         }
@@ -1158,6 +1217,7 @@ export default function AtsAnalyzerPage() {
   };
 
   const runGenerateOptimizedResume = async () => {
+    if (busy === "ats" || busy === "ats-skills") return;
     if (!selectedJob?.id) {
       setStepTransitionError("Could not generate: no job is selected.");
       return;
@@ -1171,8 +1231,12 @@ export default function AtsAnalyzerPage() {
       return;
     }
     setStepTransitionError("");
+    // Synchronously occupy the ATS busy channel so rapid double-clicks cannot
+    // start a second generate before React re-renders.
+    if (busy) return;
     try {
       const readiness = await loadSkillConfirmations(selectedJob.id);
+      if (busy === "ats") return;
       const systemBlockers = (readiness?.blocking_reasons || []).filter(
         (item) => item?.code && !String(item.code).includes("EVIDENCE") && item.code !== "MANDATORY_EVIDENCE_INCOMPLETE",
       );
@@ -1224,20 +1288,38 @@ export default function AtsAnalyzerPage() {
   };
 
   const scoreWorkspace = async ({ document, plainText }) => {
+    // Auto-save current editor content, then score with the shared ATS engine (no OpenAI).
     const scored = await saveEditedOptimizedResume(
       currentUser.user_id,
       selectedJob.id,
       result.optimized_resume_id,
       plainText,
-      "score",
-      { document, scoreOnly: true, persist: false },
+      "recalculate",
+      { document, scoreOnly: false, persist: true, skipScore: false },
     );
     setEditResult((current) => ({ ...(current || {}), ...scored }));
+    if (scored?.document) setWorkspaceDocument(scored.document);
     return scored;
   };
 
-  const improveWorkspaceSnippet = async ({ text, context }) => (
-    improveResumeSnippet(currentUser.user_id, selectedJob.id, result.optimized_resume_id, text, context)
+  // Download must be available whenever a generated resume document exists
+  // with valid current content — never gated on ATS score, accepted-AI-
+  // suggestion count, remaining gaps, or JD requirement coverage. The
+  // Generated Resume editor (ResumeWorkspace) only ever renders once
+  // isComplete is true, which itself already requires workflow_status ===
+  // "COMPLETED" — and the workflow service never reaches COMPLETED for a
+  // resume whose final validation failed (that path sets VALIDATION_FAILED
+  // instead, see ats_optimization_workflow_service.py). So by the time the
+  // editor (and this gate) exist at all, the underlying resume has already
+  // passed truthfulness validation — re-chasing validation_status/
+  // safe_to_download/isComplete field variants here was both redundant and
+  // fragile (any one of editResult/editableResume being momentarily null or
+  // shaped differently than expected silently hid Download entirely, which
+  // was the actual cause of the reported regression).
+  const canDownloadOptimized = Boolean(result?.optimized_resume_id);
+
+  const improveWorkspaceSnippet = async ({ text, context, previousSuggestion }) => (
+    improveResumeSnippet(currentUser.user_id, selectedJob.id, result.optimized_resume_id, text, context, previousSuggestion)
   );
 
   const statusBanner = buildAtsStatusBanner({
@@ -1249,6 +1331,8 @@ export default function AtsAnalyzerPage() {
     isComplete,
     result,
     disabledReason,
+    originalScore,
+    currentEditorScore,
   });
 
   const confirmRemoveEvidence = async () => {
@@ -1631,11 +1715,11 @@ export default function AtsAnalyzerPage() {
                     ) : (
                       <button
                         type="button"
-                        className="button danger"
+                        className="button danger ats-remove-evidence-btn"
                         onClick={() => setPendingRemove({ id: row.id, skill: row.skill })}
-                        aria-label={`Remove confirmation for ${row.skill}`}
+                        aria-label={`Remove evidence for ${row.skill}`}
                       >
-                        Remove Confirmation
+                        Remove Evidence
                       </button>
                     )
                   )}
@@ -1646,18 +1730,17 @@ export default function AtsAnalyzerPage() {
             <ul className="ats-list"><li>None</li></ul>
           )}
 
-          <h4>Unsupported requirements (Remaining Gaps)</h4>
-          <ul className="ats-list">
-            {currentUnresolvedRequired.length
-              ? currentUnresolvedRequired.map((row) => (
-                  <li key={row.id || row.normalized_skill || row.skill}>
-                    <b>{row.skill}</b>
-                    {row.evidence_status ? ` — ${evidenceStatusLabel(row.evidence_status)}` : ""}
-                    {row.reason ? ` — ${row.reason}` : " — No verified or user-confirmed professional evidence was found."}
-                  </li>
-                ))
-              : <li>None</li>}
-          </ul>
+          <h4>Unsupported requirements</h4>
+          {currentUnresolvedRequired.length ? (
+            <RemainingGapsPanel
+              items={currentUnresolvedRequired.map((row) => ({
+                ...row,
+                requirement_type: row.requirement_type || "MANDATORY",
+              }))}
+            />
+          ) : (
+            <ul className="ats-list"><li>None</li></ul>
+          )}
 
           <h4>Optional / preferred evidence</h4>
           <ul className="ats-list">
@@ -1728,7 +1811,7 @@ export default function AtsAnalyzerPage() {
                 <button
                   type="button"
                   className="button primary"
-                  disabled={Boolean(disabledReason) || busy === "ats" || !canContinueToOptimization}
+                  disabled={Boolean(disabledReason) || busy === "ats" || busy === "ats-skills" || !canContinueToOptimization}
                   title={
                     !canContinueToOptimization
                       ? (disabledReason || "Analyze a job with a valid resume first.")
@@ -1745,25 +1828,26 @@ export default function AtsAnalyzerPage() {
           {stepTransitionError && (
             <p className="ats-required-warning" role="alert">{stepTransitionError}</p>
           )}
-          {busy === "ats" && <p className="ats-generation-indicator">Generating optimized resume…</p>}
-          {generationLabel && (
+          {isGenerating && (
+            <p className="ats-generation-indicator">Generating with AI…</p>
+          )}
+          {!isGenerating && generationLabel && (
             <p className="ats-generation-indicator" title={fallbackReason || undefined}>
               {generationLabel}
-              {fallbackReason ? ` · ${fallbackReason}` : ""}
+              {fallbackReason && generationLabel !== "Optimized locally · AI generation timed out"
+                ? ` · ${fallbackReason}`
+                : ""}
             </p>
           )}
           {canContinueToOptimization && (
-            <RemainingGapsPanel items={isComplete ? authoritativeRemainingGaps : currentUnresolvedRequired} />
+            <RemainingGapsPanel
+              items={isComplete ? authoritativeRemainingGaps : currentUnresolvedRequired}
+            />
           )}
           {!canContinueToOptimization && (
             <p className="ats-required-warning">
               {disabledReason || "Upload a resume and analyze a job before generating."}
             </p>
-          )}
-          {messages.ats && result?.workflow_status && result.workflow_status !== "COMPLETED" && busy !== "ats"
-            && ["FAILED", "VALIDATION_FAILED"].includes(String(result.workflow_status))
-            && !(canContinueToOptimization && /evidence incomplete/i.test(String(messages.ats))) && (
-            <p className="ats-required-warning">{/timed out waiting/i.test(String(messages.ats)) ? "Resume generation could not be completed." : messages.ats}</p>
           )}
           {status && !isComplete
             && !(status === "FAILED" && /evidence incomplete/i.test(String(result?.error_message || messages.ats || "")))
@@ -1805,15 +1889,15 @@ export default function AtsAnalyzerPage() {
                   initialDocument={workspaceDocument}
                   initialText={editableResume?.final_text || generatedPlain || generatedPreview || ""}
                   originalScore={originalScore}
-                  initialCurrentScore={editResult?.edited_score ?? optimizedScore}
-                  initialScore={editResult?.score || editableResume?.score || optimizedScoreView || null}
+                  initialCurrentScore={currentEditorScore}
+                  initialScore={liveScoreView || optimizedScoreView || null}
                   improvementReport={improvementReport}
                   resultMeta={{
                     content_changed: contentChanged,
                     confirmed_skills_used: confirmedSkillsUsed,
                     unsupported_keywords_not_added: unsupported,
                   }}
-                  gapsUnsupported={gapItemsFromScoreView(optimizedScoreView || editResult?.score, result).map((item) => item.skill)}
+                  gapsUnsupported={gapItemsFromScoreView(liveScoreView || optimizedScoreView, result).map((item) => item.skill)}
                   gapsPreferred={
                     (optimizedScoreView?.remaining_gaps?.preferred_gaps
                       || optimizedScoreView?.preferred_requirements?.missing
@@ -1824,13 +1908,18 @@ export default function AtsAnalyzerPage() {
                   generationLabel={generationLabel}
                   fallbackReason={fallbackReason}
                   downloadDocxUrl={
-                    result.optimized_resume_id && (editResult?.safe_to_download ?? result?.validation_passed ?? isComplete)
+                    canDownloadOptimized
                       ? getFinalResumeDownloadUrl(currentUser.user_id, selectedJob.id, result.optimized_resume_id, "docx")
                       : null
                   }
                   downloadPdfUrl={
-                    result.optimized_resume_id && (editResult?.safe_to_download ?? result?.validation_passed ?? isComplete)
+                    canDownloadOptimized
                       ? getFinalResumeDownloadUrl(currentUser.user_id, selectedJob.id, result.optimized_resume_id, "pdf")
+                      : null
+                  }
+                  downloadTxtUrl={
+                    canDownloadOptimized
+                      ? getFinalResumeDownloadUrl(currentUser.user_id, selectedJob.id, result.optimized_resume_id, "txt")
                       : null
                   }
                   onSave={saveWorkspace}

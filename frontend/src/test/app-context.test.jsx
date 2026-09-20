@@ -82,6 +82,114 @@ describe("application state provider", () => {
     act(() => app.clearSelectedJob());
   });
 
+  describe("removeSelectedJob", () => {
+    const jobA = { id: 9, title: "Engineer A", company: "Acme" };
+    const jobB = { id: 10, title: "Engineer B", company: "Beta" };
+
+    async function mountWithTwoSelectedJobs() {
+      localStorage.setItem("currentUser", JSON.stringify({ user_id: 7 }));
+      api.getSelectedJobs.mockResolvedValue({ jobs: [jobA, jobB] });
+      mount();
+      await act(() => app.loadSelectedJobs());
+    }
+
+    it("removes only the targeted job from state on success — the other job is untouched", async () => {
+      await mountWithTwoSelectedJobs();
+      api.deleteSelectedJob.mockResolvedValue({ message: "Selected job removed successfully", job_id: 9 });
+      await act(() => app.removeSelectedJob(9));
+      expect(app.selectedJobs.map((j) => j.id)).toEqual([10]);
+      expect(app.messages.selected).toBe("Selected job removed successfully");
+    });
+
+    it("does not re-fetch the whole list after a successful delete (no redundant, extra-failure-prone call)", async () => {
+      await mountWithTwoSelectedJobs();
+      api.deleteSelectedJob.mockResolvedValue({ message: "Removed" });
+      api.getSelectedJobs.mockClear();
+      await act(() => app.removeSelectedJob(9));
+      expect(api.getSelectedJobs).not.toHaveBeenCalled();
+    });
+
+    it("keeps the job visible and shows a friendly message on a raw network failure (never a silent optimistic removal)", async () => {
+      await mountWithTwoSelectedJobs();
+      api.deleteSelectedJob.mockRejectedValue(new TypeError("Failed to fetch"));
+      await act(() => app.removeSelectedJob(9));
+      expect(app.selectedJobs.map((j) => j.id)).toEqual([9, 10]);
+      expect(app.messages.selected).toBe("Unable to remove this job. Please try again.");
+    });
+
+    it("surfaces a real backend error message as-is (e.g. 404 Selected job not found)", async () => {
+      await mountWithTwoSelectedJobs();
+      api.deleteSelectedJob.mockRejectedValue(new Error("Selected job not found"));
+      await act(() => app.removeSelectedJob(9));
+      expect(app.selectedJobs.map((j) => j.id)).toEqual([9, 10]);
+      expect(app.messages.selected).toBe("Selected job not found");
+    });
+  });
+
+  describe("saveSelectedJob — payload, success, failure", () => {
+    const manualJob = {
+      title: "Backend Engineer", company: "Acme", location: "Remote", work_mode: "Remote", job_type: "Full-time",
+      description: "A detailed backend role.", skills_required: "Java", source: "User Selected Job", job_url: "",
+    };
+
+    async function mountWithForm(form) {
+      localStorage.setItem("currentUser", JSON.stringify({ user_id: 7 }));
+      mount();
+      for (const [name, value] of Object.entries(form)) {
+        act(() => app.changeSelectedJob({ target: { name, value } }));
+      }
+    }
+
+    it("calls addSelectedJob with the exact current form — payload unchanged", async () => {
+      await mountWithForm(manualJob);
+      api.addSelectedJob.mockResolvedValue({ job: { id: 20, ...manualJob }, message: "Saved" });
+      api.getSelectedJobs.mockResolvedValue([{ id: 20, ...manualJob }]);
+      await act(() => app.saveSelectedJob({ preventDefault: vi.fn() }));
+      expect(api.addSelectedJob).toHaveBeenCalledWith(7, expect.objectContaining(manualJob));
+    });
+
+    it("a successful save adds the new job to selectedJobs (count increases) without a page refresh", async () => {
+      await mountWithForm(manualJob);
+      const saved = { id: 21, ...manualJob };
+      api.addSelectedJob.mockResolvedValue({ job: saved, message: "Job saved successfully" });
+      api.getSelectedJobs.mockResolvedValue([saved]);
+      expect(app.selectedJobs).toHaveLength(0);
+      await act(() => app.saveSelectedJob({ preventDefault: vi.fn() }));
+      expect(app.selectedJobs).toHaveLength(1);
+      expect(app.selectedJobs[0].id).toBe(21);
+      expect(app.messages.selected).toBe("Job saved successfully");
+    });
+
+    it("a successful save clears the form for the next entry", async () => {
+      await mountWithForm(manualJob);
+      api.addSelectedJob.mockResolvedValue({ job: { id: 22, ...manualJob }, message: "Saved" });
+      api.getSelectedJobs.mockResolvedValue([{ id: 22, ...manualJob }]);
+      await act(() => app.saveSelectedJob({ preventDefault: vi.fn() }));
+      expect(app.selectedJobForm.title).toBe("");
+      expect(app.selectedJobForm.description).toBe("");
+    });
+
+    it("a failed save preserves every entered field — never clears or pretends success", async () => {
+      await mountWithForm(manualJob);
+      api.addSelectedJob.mockRejectedValue(new Error("Unable to save job right now."));
+      await act(() => app.saveSelectedJob({ preventDefault: vi.fn() }));
+      expect(app.selectedJobForm).toMatchObject(manualJob);
+      expect(app.selectedJobs).toHaveLength(0);
+      expect(app.messages.selected).toBe("Unable to save job right now.");
+    });
+
+    it("a failed save allows an immediate retry with the same data", async () => {
+      await mountWithForm(manualJob);
+      api.addSelectedJob.mockRejectedValueOnce(new Error("Network error")).mockResolvedValueOnce({ job: { id: 23, ...manualJob }, message: "Saved" });
+      api.getSelectedJobs.mockResolvedValue([{ id: 23, ...manualJob }]);
+      await act(() => app.saveSelectedJob({ preventDefault: vi.fn() }));
+      expect(app.selectedJobs).toHaveLength(0);
+      await act(() => app.saveSelectedJob({ preventDefault: vi.fn() }));
+      expect(api.addSelectedJob).toHaveBeenCalledTimes(2);
+      expect(app.selectedJobs).toHaveLength(1);
+    });
+  });
+
   it("runs ATS requirements, evidence, scores, email, and workflow APIs", async () => {
     localStorage.setItem("currentUser", JSON.stringify({ user_id: 7 }));
     api.startAtsOptimization.mockResolvedValue({ workflow_id: 3, workflow_status: "PENDING" });
@@ -90,7 +198,7 @@ describe("application state provider", () => {
     api.analyzeOptimizerRequirements.mockResolvedValue({ verified_resume_skills: [] });
     api.getEvidence.mockResolvedValue({ evidence: [] }); api.saveEvidence.mockResolvedValue({ evidence: [] });
     api.getMatches.mockResolvedValue({ matches: [] }); api.getOptimizedResumes.mockResolvedValue({ optimized_resumes: [] });
-    api.getEmailLogs.mockResolvedValue({ email_logs: [] }); api.runFullWorkflow.mockResolvedValue({ message: "Done" });
+    api.getEmailLogs.mockResolvedValue({ logs: [] }); api.runFullWorkflow.mockResolvedValue({ message: "Done" });
     mount();
     act(() => app.setAtsSelectedJobId("9"));
     await act(() => app.analyzeAndOptimize(9));
@@ -131,6 +239,38 @@ describe("application state provider", () => {
     expect(api.runFullWorkflow).toHaveBeenCalledWith(7);
   });
 
+  it("does not apply stale completed metadata while a new workflow is generating", async () => {
+    localStorage.setItem("currentUser", JSON.stringify({ user_id: 7 }));
+    api.startAtsOptimization.mockResolvedValue({
+      workflow_id: 9,
+      workflow_status: "PENDING",
+      created_new: true,
+      result: { workflow_id: 9, workflow_status: "PENDING" },
+    });
+    api.pollAtsWorkflow.mockImplementation(async (_id, { onProgress } = {}) => {
+      onProgress?.({ workflow_id: 9, workflow_status: "GENERATING_RESUME" });
+      return {
+        workflow_id: 9,
+        workflow_status: "COMPLETED",
+        original_match_percentage: 80,
+        optimized_match_percentage: 88,
+        generation_metadata: { llm_used: true, llm_model: "llama3.1:8b" },
+      };
+    });
+    mount();
+    act(() => app.setAtsResult({
+      workflow_id: 8,
+      workflow_status: "COMPLETED",
+      generation_metadata: { fallback_used: true, fallback_reason: "timeout" },
+      original_match_percentage: 80,
+      optimized_match_percentage: 88,
+    }));
+    await act(() => app.analyzeAndOptimize(9, true));
+    expect(app.atsResult.workflow_id).toBe(9);
+    expect(app.atsResult.generation_metadata?.fallback_used).not.toBe(true);
+    expect(app.activeAtsWorkflowId).toBe(9);
+  });
+
   it("handles terminal ATS starts and selected-job workflow completion", async () => {
     localStorage.setItem("currentUser", JSON.stringify({ user_id: 7 }));
     const job = { id: 9, title: "Engineer", company: "Acme", description: "A complete job description", job_url: "https://jobs.example.test/9" };
@@ -144,5 +284,115 @@ describe("application state provider", () => {
     act(() => app.changeSelectedJob({ target: { name: "title", value: "Engineer" } }));
     await act(() => app.saveSelectedJob({ preventDefault: vi.fn() }));
     expect(api.pollAtsWorkflow).toHaveBeenCalled();
+  });
+
+  // Match score accuracy — success message must reflect the actual
+  // workflow outcome, never falsely claim "optimize-and-match completed"
+  // when the workflow ended some other way (e.g. INELIGIBLE_LOW_SCORE — a
+  // real original score was computed, optimization just wasn't run).
+  it("shows the real computed score, not a false 'completed' claim, when the workflow ends INELIGIBLE_LOW_SCORE", async () => {
+    localStorage.setItem("currentUser", JSON.stringify({ user_id: 7 }));
+    const job = { id: 10, title: "Engineer", company: "Acme", description: "A complete job description", job_url: "https://jobs.example.test/10" };
+    api.addSelectedJob.mockResolvedValue({ job, workflow_id: 3, workflow_status: "PENDING", message: "Job saved. ATS optimization workflow started." });
+    api.getSelectedJobs.mockResolvedValue([job]);
+    api.pollAtsWorkflow.mockResolvedValue({ workflow_id: 3, workflow_status: "INELIGIBLE_LOW_SCORE", original_match_percentage: 35, optimized_match_percentage: null, error_message: null });
+    mount();
+    await act(() => app.saveSelectedJob({ preventDefault: vi.fn() }));
+    expect(app.messages.selected).toBe("Job saved. Resume match calculated: 35%.");
+    expect(app.messages.selected).not.toContain("optimize-and-match completed");
+  });
+
+  // Section 20/21: the card must update once scoring settles, without the
+  // user needing to visit Workflow/ATS Optimizer or refresh the browser.
+  it("re-fetches Selected Jobs after the ATS poll settles, so the card shows its final score without a manual refresh", async () => {
+    localStorage.setItem("currentUser", JSON.stringify({ user_id: 7 }));
+    const job = { id: 12, title: "Engineer", company: "Acme", description: "A complete job description", job_url: "https://jobs.example.test/12" };
+    api.addSelectedJob.mockResolvedValue({ job, workflow_id: 5, workflow_status: "PENDING", message: "Job saved. ATS optimization workflow started." });
+    api.getSelectedJobs
+      .mockResolvedValueOnce([{ ...job, original_match_percentage: null, match_status: "CALCULATING" }]) // right after save, before polling
+      .mockResolvedValueOnce([{ ...job, original_match_percentage: 78, match_status: "COMPLETE" }]); // after the poll settles
+    api.pollAtsWorkflow.mockResolvedValue({ workflow_id: 5, workflow_status: "COMPLETED", original_match_percentage: 78, optimized_match_percentage: 85 });
+    api.getOptimizedResumes.mockResolvedValue([]); api.getMatches.mockResolvedValue([]);
+    mount();
+    await act(() => app.saveSelectedJob({ preventDefault: vi.fn() }));
+    expect(api.getSelectedJobs).toHaveBeenCalledTimes(2);
+    expect(app.selectedJobs[0].original_match_percentage).toBe(78);
+    expect(app.selectedJobs[0].match_status).toBe("COMPLETE");
+  });
+
+  it("still shows a clean error (never a raw message) when the workflow genuinely fails with no score", async () => {
+    localStorage.setItem("currentUser", JSON.stringify({ user_id: 7 }));
+    const job = { id: 11, title: "Engineer", company: "Acme", description: "A complete job description", job_url: "https://jobs.example.test/11" };
+    api.addSelectedJob.mockResolvedValue({ job, workflow_id: 4, workflow_status: "PENDING", message: "Job saved. ATS optimization workflow started." });
+    api.getSelectedJobs.mockResolvedValue([job]);
+    api.pollAtsWorkflow.mockResolvedValue({ workflow_id: 4, workflow_status: "FAILED", original_match_percentage: null, optimized_match_percentage: null, error_message: "Resume generation could not be completed." });
+    mount();
+    await act(() => app.saveSelectedJob({ preventDefault: vi.fn() }));
+    expect(app.messages.selected).toBe("Resume generation could not be completed.");
+    expect(app.messages.selected).not.toContain("optimize-and-match completed");
+  });
+});
+
+// Dashboard state tracking fix — refreshUserWorkspaceState is the single
+// hydration function Dashboard calls on its own mount so it never needs
+// Preferences/Resume/Job Search/Selected Jobs/ATS/Workflow to have been
+// visited first. It reuses the exact same loaders those pages already call
+// themselves (loadPreferences, verifyLatestResume, loadJobs,
+// loadSelectedJobs, loadOptimizedResumes, loadMatches, loadEmailLogs) —
+// no new API calls, no new business logic.
+describe("refreshUserWorkspaceState — Dashboard hydration", () => {
+  it("independently loads preferences, resume, jobs, selected jobs, optimized resumes, matches, and email logs", async () => {
+    localStorage.setItem("currentUser", JSON.stringify({ user_id: 7, email: "a@example.test" }));
+    api.getUserPreferences.mockResolvedValue({ job_title: "Engineer", schedule_time: "09:00:00" });
+    api.getLatestResume.mockResolvedValue({ id: 4, file_name: "resume.txt" });
+    api.getJobs.mockResolvedValue([{ id: 1, title: "Engineer" }]);
+    api.getSelectedJobs.mockResolvedValue([{ id: 1, title: "Engineer" }]);
+    api.getOptimizedResumes.mockResolvedValue([{ id: 2 }]);
+    api.getMatches.mockResolvedValue([{ id: 3, job_id: 1, match_percentage: 80 }]);
+    api.getEmailLogs.mockResolvedValue([{ id: 5 }]);
+    mount();
+
+    await act(() => app.refreshUserWorkspaceState());
+
+    expect(app.preferencesSaved).toBe(true);
+    expect(app.latestResume).toEqual({ id: 4, file_name: "resume.txt" });
+    expect(app.jobs.some((job) => job.id === 1)).toBe(true);
+    expect(app.selectedJobs).toEqual([{ id: 1, title: "Engineer" }]);
+    expect(app.optimizedResumes).toEqual([{ id: 2 }]);
+    expect(app.matches).toEqual([{ id: 3, job_id: 1, match_percentage: 80 }]);
+    expect(app.emailLogs).toEqual([{ id: 5 }]);
+  });
+
+  it("is a no-op with no logged-in user — never calls any workspace API without a real user id", async () => {
+    mount();
+    await act(() => app.refreshUserWorkspaceState());
+    expect(api.getUserPreferences).not.toHaveBeenCalled();
+    expect(api.getJobs).not.toHaveBeenCalled();
+    expect(api.getEmailLogs).not.toHaveBeenCalled();
+  });
+
+  it("one failing source (e.g. no preferences saved yet) never blocks the others from loading", async () => {
+    localStorage.setItem("currentUser", JSON.stringify({ user_id: 7, email: "a@example.test" }));
+    api.getUserPreferences.mockRejectedValue(new Error("Not found"));
+    api.getLatestResume.mockResolvedValue({ id: 4, file_name: "resume.txt" });
+    api.getJobs.mockResolvedValue([{ id: 1 }]);
+    api.getEmailLogs.mockResolvedValue([{ id: 9 }]);
+    mount();
+
+    await act(() => app.refreshUserWorkspaceState());
+
+    expect(app.preferencesSaved).toBe(false); // the failed source stays at its safe default
+    expect(app.latestResume).toEqual({ id: 4, file_name: "resume.txt" }); // siblings still loaded
+    expect(app.emailLogs).toEqual([{ id: 9 }]);
+  });
+
+  it("no resume yet (404) resolves to null silently, without surfacing a scary error", async () => {
+    localStorage.setItem("currentUser", JSON.stringify({ user_id: 7, email: "a@example.test" }));
+    api.getLatestResume.mockRejectedValue(new Error("Not found"));
+    mount();
+
+    await act(() => app.refreshUserWorkspaceState());
+
+    expect(app.latestResume).toBeNull();
   });
 });

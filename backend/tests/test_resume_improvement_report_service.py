@@ -60,6 +60,121 @@ class DiffSummaryTests(unittest.TestCase):
         diff = diff_summary(ORIGINAL_RESUME, ORIGINAL_RESUME)
         self.assertEqual(diff["sections_improved"], [])
         self.assertEqual(diff["bullets_rewritten"], 0)
+        self.assertEqual(diff["bullet_changes"], [])
+
+    def test_bullet_changes_carries_original_and_generated_text_pairs(self):
+        diff = diff_summary(ORIGINAL_RESUME, OPTIMIZED_RESUME)
+        self.assertEqual(len(diff["bullet_changes"]), diff["bullets_rewritten"])
+        first = diff["bullet_changes"][0]
+        self.assertEqual(first["original_text"], "Worked on Java applications.")
+        self.assertEqual(first["generated_text"], "Developed Java applications to support maintainable delivery.")
+        self.assertEqual(first["change_type"], "REWRITTEN")
+        self.assertIn("Acme", first["section"])
+
+    def test_bullet_changes_never_reports_unchanged_bullets(self):
+        resume_with_one_unchanged = """
+Jane Candidate
+
+Professional Experience
+Acme | Java Developer | Jan 2020 - Present
+- This bullet never changes.
+- Worked on Java applications.
+""".strip()
+        optimized_with_one_unchanged = """
+Jane Candidate
+
+Professional Experience
+Acme | Java Developer | Jan 2020 - Present
+- This bullet never changes.
+- Developed Java applications to support maintainable delivery.
+""".strip()
+        diff = diff_summary(resume_with_one_unchanged, optimized_with_one_unchanged)
+        originals = [change["original_text"] for change in diff["bullet_changes"]]
+        self.assertNotIn("This bullet never changes.", originals)
+        self.assertIn("Worked on Java applications.", originals)
+
+    def test_client_side_bullet_does_not_cascade_misalign_subsequent_pairs(self):
+        """Regression: before CLIENT_PATTERN was anchored, a bullet
+        containing "client-side"/"client-facing"/"client-server" got
+        silently dropped during parsing, shifting every SUBSEQUENT bullet's
+        position by one and causing them to be diffed against the WRONG
+        original counterpart — corrupting bullet_changes for the entire
+        rest of that employment, which is what made genuinely-changed
+        bullets fail to show "AI Improved" (wrong pairing can look
+        unchanged) or show a nonsensical Original/Suggested comparison."""
+        original = """
+Jane Candidate
+
+Professional Experience
+Acme Corp | Engineer | Jan 2020 - Present
+- Tested REST APIs using Postman.
+- Built dashboards using React for internal teams.
+- Deployed services using Jenkins and Docker.
+""".strip()
+        optimized = """
+Jane Candidate
+
+Professional Experience
+Acme Corp | Engineer | Jan 2020 - Present
+- Validated REST API responses and error handling using Postman.
+- Developed dashboards using React, implementing client-side state management.
+- Automated deployments using Jenkins and containerized services with Docker.
+""".strip()
+        diff = diff_summary(original, optimized)
+        changes_by_generated = {c["generated_text"]: c["original_text"] for c in diff["bullet_changes"]}
+        # Each generated bullet must pair with the SAME-TOPIC original bullet.
+        self.assertEqual(
+            changes_by_generated["Validated REST API responses and error handling using Postman."],
+            "Tested REST APIs using Postman.",
+        )
+        self.assertEqual(
+            changes_by_generated["Developed dashboards using React, implementing client-side state management."],
+            "Built dashboards using React for internal teams.",
+        )
+        self.assertEqual(
+            changes_by_generated["Automated deployments using Jenkins and containerized services with Docker."],
+            "Deployed services using Jenkins and Docker.",
+        )
+
+    def test_summary_change_captures_original_and_generated_summary(self):
+        diff = diff_summary(ORIGINAL_RESUME, OPTIMIZED_RESUME)
+        self.assertIsNotNone(diff["summary_change"])
+        self.assertEqual(diff["summary_change"]["original_text"], "Java developer.")
+        self.assertEqual(
+            diff["summary_change"]["generated_text"],
+            "Java Full Stack Developer with experience designing and developing scalable applications using Java, Spring Boot, React.",
+        )
+
+    def test_summary_change_is_none_when_summary_unchanged(self):
+        diff = diff_summary(ORIGINAL_RESUME, ORIGINAL_RESUME)
+        self.assertIsNone(diff["summary_change"])
+
+    def test_summary_change_is_none_for_trivial_reword(self):
+        near_identical_optimized = ORIGINAL_RESUME.replace("Java developer.", "Java Developer.")
+        diff = diff_summary(ORIGINAL_RESUME, near_identical_optimized)
+        self.assertIsNone(diff["summary_change"])
+
+    def test_new_bullet_beyond_original_count_is_marked_added_from_evidence(self):
+        original_two_bullets = """
+Jane Candidate
+
+Professional Experience
+Acme | Java Developer | Jan 2020 - Present
+- Worked on Java applications.
+""".strip()
+        optimized_three_bullets = """
+Jane Candidate
+
+Professional Experience
+Acme | Java Developer | Jan 2020 - Present
+- Developed Java applications to support maintainable delivery.
+- Wrote REST Assured API test suites validating backend contracts.
+""".strip()
+        diff = diff_summary(original_two_bullets, optimized_three_bullets)
+        change_types = {change["change_type"] for change in diff["bullet_changes"]}
+        added = [c for c in diff["bullet_changes"] if c["change_type"] == "ADDED_FROM_CONFIRMED_EVIDENCE"]
+        self.assertIn("ADDED_FROM_CONFIRMED_EVIDENCE", change_types)
+        self.assertEqual(added[0]["original_text"], "")
 
 
 class ImprovementReportTests(unittest.TestCase):

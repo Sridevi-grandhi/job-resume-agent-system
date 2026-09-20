@@ -10,6 +10,7 @@ from app.services.client_domain_validator import (
 )
 from app.services.keyword_utils import contains_keyword, find_keywords_in_text
 from app.services.resume_structure_parser import parse_resume_structure
+from app.services.skill_analysis_service import USAGE_CONTEXT_VERBS
 from app.services.technology_timeline_validator import filter_technologies_for_period
 
 
@@ -20,7 +21,9 @@ ACTION_VERBS = [
 ]
 
 FAKE_METRIC_PATTERN = re.compile(
-    r"(?i)(\b\d{1,3}%\b|\b\d+\s*(million|billion|k)\b|\b\d{2,}\+?\s*(users|customers|transactions)\b|"
+    # Percentages intentionally omit a trailing \b after "%" — "%" is non-word, so
+    # "45%." / "45%" at EOS would otherwise miss the invented-metric check.
+    r"(?i)(\b\d{1,3}%|\b\d+\s*(million|billion|k)\b|\b\d{2,}\+?\s*(users|customers|transactions)\b|"
     r"\$\d|\b99\.9%|\breduced by\s+\d|\bincreased by\s+\d)"
 )
 
@@ -298,11 +301,104 @@ def _rewrite_projects_section(content: str, projects: list[dict], keywords: list
 _PROFESSIONAL_EVIDENCE_TYPES = {"Current employment", "Previous employment"}
 _PROJECT_EVIDENCE_TYPES = {"Professional project", "Personal project", "Academic project"}
 
+_EVIDENCE_NOISE_PATTERNS = [
+    re.compile(r"(?i)^\s*client:\s*status\s+meetings\.?\s*$"),
+    re.compile(r"(?i)^\s*used\s+in\s+project\.?\s*$"),
+    re.compile(r"(?i)^\s*confirm(ed)?\s+(accurate|yes|true)\.?\s*$"),
+    re.compile(r"(?i)^\s*n/?a\.?\s*$"),
+    re.compile(r"(?i)^\s*see\s+above\.?\s*$"),
+    re.compile(r"(?i)^\s*as\s+discussed\.?\s*$"),
+]
+
+
+def _is_evidence_noise(text: str) -> bool:
+    cleaned = re.sub(r"\s+", " ", (text or "").strip())
+    if not cleaned:
+        return True
+    if len(cleaned) < 12 and not re.search(r"[A-Za-z]{3,}", cleaned):
+        return True
+    return any(pattern.match(cleaned) for pattern in _EVIDENCE_NOISE_PATTERNS)
+
+
+# A short subject (the technology name — possibly multi-word, e.g. "Apache
+# JMeter") followed by "is/are/was/were a/an/the/mainly used/..." or
+# "helps"/"provides"/"refers to" is a TEXTBOOK DEFINITION of the technology,
+# not a description of what the candidate did with it. Domain-independent —
+# matches regardless of which specific tool/skill is named.
+_DEFINITION_STYLE_PATTERN = re.compile(
+    r"(?i)^(?:the\s+)?[\w][\w./+#-]*(?:\s+[\w][\w./+#-]*){0,3}\s+"
+    r"(?:is|are|was|were)\s+(?:a|an|the|mainly|primarily|generally|typically|"
+    r"often|commonly|basically|essentially|simply|used\b)"
+    r"|^(?:the\s+)?[\w][\w./+#-]*(?:\s+[\w][\w./+#-]*){0,3}\s+"
+    r"(?:helps?|provides?|refers?\s+to|stands?\s+for)\b"
+)
+
+
+def _looks_like_definition(text: str) -> bool:
+    return bool(_DEFINITION_STYLE_PATTERN.match((text or "").strip()))
+
+
+def _has_usage_context(text: str) -> bool:
+    """Same action-verb vocabulary the evidence-strength scorer itself uses
+    (skill_analysis_service.USAGE_CONTEXT_VERBS) — domain-independent and
+    already proven to recognize real professional/project usage across
+    roles. A sentence without one of these verbs describes what a
+    technology IS, not what the candidate DID with it."""
+    return bool(USAGE_CONTEXT_VERBS.search(text or ""))
+
+
+def _resume_ready_evidence_sentence(skill: str, description: str) -> str:
+    """Turn questionnaire free-text into one professional resume bullet —
+    but ONLY when that free text is genuine PROFESSIONAL_USAGE_EVIDENCE
+    (describes what the candidate did), never SKILL_KNOWLEDGE (a bare
+    acknowledgment, or a textbook definition of the technology echoed back
+    from the questionnaire). Returns "" when there's nothing truthful and
+    substantive to turn into a bullet, so the caller places the skill in
+    Technical Skills only instead of manufacturing a bullet — knowing a
+    skill is not the same as proving professional usage of it."""
+    skill = (skill or "").strip()
+    text = re.sub(r"\s+", " ", (description or "").strip())
+    if _is_evidence_noise(text) or not text:
+        return ""
+    # Checked on the RAW answer, before any presentation cleanup below strips
+    # the leading verb — stripping is cosmetic, not a reason to lose the
+    # usage-evidence signal it carries.
+    if _looks_like_definition(text) or not _has_usage_context(text):
+        return ""
+
+    # Presentation cleanup only, below this point — a leading "I "/"We " is
+    # just an awkward pronoun; the verb itself is kept, both for grammar and
+    # because it's exactly the usage-context signal just confirmed above.
+    text = re.sub(
+        r"(?i)^(it\s+helps\s+us\s+|this\s+tool\s+is\s+used\s+to\s+|used\s+to\s+)",
+        "",
+        text,
+    )
+    text = re.sub(r"(?i)^(i|we)\s+", "", text)
+    text = re.sub(r"(?i)^performed\s+", "Performed ", text)
+    text = text.strip(" -")
+    if not text:
+        return ""
+
+    if skill and skill.lower() not in text.lower():
+        if re.match(r"(?i)^(performed|developed|implemented|automated|built|led|designed)\b", text):
+            text = f"{text[0].upper() + text[1:]} using {skill}."
+        else:
+            text = f"Applied {skill} to {text[0].lower() + text[1:]}"
+    elif re.match(r"(?i)^performed\s+to\s+", text):
+        text = re.sub(r"(?i)^performed\s+to\s+", "Performed ", text)
+
+    # Keep a single concise sentence.
+    sentence = re.split(r"(?<=[.!?])\s+", text)[0].strip()
+    if not sentence or _looks_like_definition(sentence) or not _has_usage_context(sentence):
+        return ""
+    return _confirmed_bullet(sentence)
+
 
 def _confirmed_bullet(description: str) -> str:
     text = re.sub(r"\s+", " ", (description or "").strip())
-    if not text:
-        return text
+    if not text or _is_evidence_noise(text):
+        return ""
     text = text[0].upper() + text[1:]
     if not text.endswith((".", "!", "?")):
         text += "."
@@ -311,10 +407,18 @@ def _confirmed_bullet(description: str) -> str:
 
 def _confirmed_evidence_buckets(confirmed_evidence: dict[str, dict] | None) -> dict[str, list[dict]]:
     buckets = {"professional": [], "project": [], "certification": [], "training": [], "learning": []}
+    seen: set[str] = set()
     for skill, item in (confirmed_evidence or {}).items():
-        entry = {"skill": skill, **item}
-        evidence_type = (item.get("evidence_type") or "").strip()
-        if evidence_type == "Learning only" or item.get("evidence_status") == "LEARNING_ONLY":
+        status = str((item or {}).get("evidence_status") or "").upper()
+        if status in {"REJECTED", "INCOMPLETE", "NOT_POSSESSED", "OBSOLETE"}:
+            continue
+        skill_key = str((item or {}).get("skill") or skill or "").strip().lower()
+        if not skill_key or skill_key in seen:
+            continue
+        seen.add(skill_key)
+        entry = {"skill": (item or {}).get("skill") or skill, **(item or {})}
+        evidence_type = (entry.get("evidence_type") or "").strip()
+        if evidence_type == "Learning only" or entry.get("evidence_status") == "LEARNING_ONLY":
             buckets["learning"].append(entry)
         elif evidence_type in _PROFESSIONAL_EVIDENCE_TYPES:
             buckets["professional"].append(entry)
@@ -348,24 +452,17 @@ def _target_employment_index(employments: list[dict], employer_name: str | None)
 
 def _employment_bullet(item: dict) -> str:
     skill = (item.get("skill") or "").strip()
-    pieces = [item.get("usage_description") or ""]
-    modules = item.get("skill_modules")
-    if modules and modules.lower() not in pieces[0].lower():
-        pieces.append(f"Covering {modules}.")
-    tech = item.get("related_technologies")
-    if tech and tech.lower() not in pieces[0].lower():
-        pieces.append(f"Related tools: {tech}.")
-    context = item.get("supporting_context")
-    if context:
-        pieces.append(context if context.strip().endswith((".", "!", "?")) else context.strip() + ".")
-    impact = item.get("impact_description")
-    if impact:
-        pieces.append(impact if impact.strip().endswith((".", "!", "?")) else impact.strip() + ".")
-    body = " ".join(p for p in pieces if p).strip()
-    # Ensure the confirmed technology itself appears when the free-text evidence omits it.
-    if skill and skill.lower() not in body.lower():
-        body = f"Applied {skill} in professional work. {body}".strip()
-    return _confirmed_bullet(body)
+    primary = (
+        item.get("usage_description")
+        or item.get("work_completed")
+        or item.get("impact_description")
+        or ""
+    )
+    sentence = _resume_ready_evidence_sentence(skill, str(primary))
+    modules = str(item.get("skill_modules") or "").strip()
+    if sentence and modules and modules.lower() not in sentence.lower() and not _is_evidence_noise(modules):
+        sentence = sentence.rstrip(".") + f", covering {modules}."
+    return sentence
 
 
 def _new_employment_block(item: dict) -> str:
@@ -373,30 +470,32 @@ def _new_employment_block(item: dict) -> str:
     own truthful header (never merged into an existing, unrelated employer's block)."""
     dates = " - ".join(filter(None, [item.get("start_date"), "Present" if item.get("currently_using") else item.get("end_date")]))
     header = " | ".join(p for p in [item.get("employer_name") or "", item.get("role_title") or "", dates.strip(" -")] if p)
+    bullet = _employment_bullet(item)
+    if not bullet:
+        return ""
     lines = [header] if header else []
-    lines.append(f"- {_employment_bullet(item)}")
+    lines.append(f"- {bullet}")
     return "\n".join(lines)
 
 
 def _project_block(item: dict) -> str:
-    name = item.get("project_name") or item.get("supporting_context") or f"{item['skill']} Project"
+    skill = (item.get("skill") or "").strip()
+    name = item.get("project_name") or f"{skill} Project"
+    if _is_evidence_noise(str(name)):
+        name = f"{skill} Project" if skill else "Project"
     lines = [name]
-    if item.get("role_title"):
+    if item.get("role_title") and not _is_evidence_noise(str(item.get("role_title"))):
         lines.append(item["role_title"])
     dates = " - ".join(filter(None, [item.get("start_date"), "Present" if item.get("currently_using") else item.get("end_date")]))
     if dates.strip(" -"):
         lines.append(dates)
     body = item.get("work_completed") or item.get("usage_description") or ""
-    if body:
-        lines.append(_confirmed_bullet(body))
-    if item.get("skill_modules"):
-        lines.append(f"Covering {item['skill_modules']}.")
-    if item.get("related_technologies"):
-        lines.append(f"Technologies used: {item['related_technologies']}.")
-    if item.get("supporting_context") and item.get("supporting_context") != name:
-        lines.append(_confirmed_bullet(item["supporting_context"]))
-    if item.get("impact_description"):
-        lines.append(_confirmed_bullet(item["impact_description"]))
+    sentence = _resume_ready_evidence_sentence(skill, str(body))
+    modules = str(item.get("skill_modules") or "").strip()
+    if sentence and modules and modules.lower() not in sentence.lower() and not _is_evidence_noise(modules):
+        sentence = sentence.rstrip(".") + f", covering {modules}."
+    if sentence:
+        lines.append(f"- {sentence}")
     return "\n".join(lines)
 
 
@@ -443,7 +542,12 @@ def generate_optimized_resume(
             if index is None:
                 unplaced_professional.append(item)
             else:
-                by_index.setdefault(index, []).append(_employment_bullet(item))
+                # No genuine PROFESSIONAL_USAGE_EVIDENCE (only SKILL_KNOWLEDGE,
+                # or a definitional answer) -> no bullet manufactured; the
+                # skill still reaches Technical Skills via confirmed_names below.
+                bullet = _employment_bullet(item)
+                if bullet:
+                    by_index.setdefault(index, []).append(bullet)
         for index, bullets in by_index.items():
             structure["employments"][index]["bullets"] = list(
                 structure["employments"][index].get("bullets") or []

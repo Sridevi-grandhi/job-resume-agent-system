@@ -9,11 +9,11 @@ from app.models.password_reset_model import PasswordResetToken
 from app.models.user_model import User
 from app.routes.auth_routes import (
     GENERIC_FORGOT_MESSAGE,
-    RESET_TOKEN_EXPIRY_MINUTES,
     _forgot_password_last_request,
     _hash_reset_token,
     create_password_reset_token,
     hash_password,
+    reset_token_expiry_minutes,
     verify_password,
 )
 
@@ -63,6 +63,76 @@ def test_forgot_password_does_not_expose_token_in_production(client, monkeypatch
         response = client.post("/api/auth/forgot-password", json={"email": "prod-reset@example.com"})
     assert response.status_code == 200
     assert response.json().get("dev_reset_url") is None
+
+
+def test_forgot_password_dev_link_requires_both_dev_mode_and_explicit_flag(client, monkeypatch):
+    """Regression test for the reported bug: a bare development APP_ENV
+    (the default when unset) must NOT be enough on its own to expose the
+    raw reset URL — SHOW_DEV_RESET_LINK must also be explicitly true."""
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.delenv("SHOW_DEV_RESET_LINK", raising=False)
+    _forgot_password_last_request.clear()
+    _signup(client, email="devlink-off@example.com")
+    with patch("app.routes.auth_routes.deliver_password_reset_email") as deliver:
+        deliver.return_value = {"sent": False, "reason": "smtp_not_configured", "dev_logged": False}
+        response = client.post("/api/auth/forgot-password", json={"email": "devlink-off@example.com"})
+    assert response.json().get("dev_reset_url") is None
+
+
+def test_forgot_password_dev_link_shown_when_both_flags_set(client, monkeypatch):
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("SHOW_DEV_RESET_LINK", "true")
+    _forgot_password_last_request.clear()
+    _signup(client, email="devlink-on@example.com")
+    with patch("app.routes.auth_routes.deliver_password_reset_email") as deliver:
+        deliver.return_value = {"sent": True, "reason": None, "dev_logged": True}
+        response = client.post("/api/auth/forgot-password", json={"email": "devlink-on@example.com"})
+    dev_reset_url = response.json().get("dev_reset_url")
+    assert dev_reset_url is not None
+    assert dev_reset_url.startswith("http")
+    assert "token=" in dev_reset_url
+
+
+def test_forgot_password_never_returns_raw_token_field(client, monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    _forgot_password_last_request.clear()
+    _signup(client, email="notoken@example.com")
+    with patch("app.routes.auth_routes.deliver_password_reset_email") as deliver:
+        deliver.return_value = {"sent": True, "reason": None, "dev_logged": False}
+        response = client.post("/api/auth/forgot-password", json={"email": "notoken@example.com"})
+    body = response.json()
+    assert "token" not in body
+    assert "reset_url" not in body
+    assert set(body.keys()) == {"message", "dev_reset_url"}
+
+
+def test_forgot_password_sends_to_registered_account_email_not_input_casing(client, db_session, monkeypatch):
+    """Sends to the stored, canonical account email — never a user-supplied
+    variant string, even though the request payload's exact casing/spacing
+    is only ever used to look the account up."""
+    monkeypatch.setenv("APP_ENV", "development")
+    _forgot_password_last_request.clear()
+    _signup(client, email="canonical@example.com")
+    with patch("app.routes.auth_routes.deliver_password_reset_email") as deliver:
+        deliver.return_value = {"sent": True, "reason": None, "dev_logged": False}
+        client.post("/api/auth/forgot-password", json={"email": "  Canonical@Example.com  "})
+    assert deliver.call_args.kwargs["recipient_email"] == "canonical@example.com"
+
+
+def test_forgot_password_email_failure_still_returns_generic_success(client, monkeypatch):
+    """TEST 8: an SMTP/provider failure must never surface to the user —
+    same generic response either way, and no raw token in it."""
+    monkeypatch.setenv("APP_ENV", "production")
+    _forgot_password_last_request.clear()
+    _signup(client, email="mailfail@example.com")
+    with patch("app.routes.auth_routes.deliver_password_reset_email") as deliver:
+        deliver.return_value = {"sent": False, "reason": "provider_error", "dev_logged": False}
+        response = client.post("/api/auth/forgot-password", json={"email": "mailfail@example.com"})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["message"] == GENERIC
+    assert body.get("dev_reset_url") is None
+    assert set(body.keys()) == {"message", "dev_reset_url"}  # no token/reset_url field at all
 
 
 def test_valid_token_reset_updates_password_hash(client, db_session, monkeypatch):
@@ -137,8 +207,31 @@ def test_reused_token_rejected(client, db_session, monkeypatch):
     assert "invalid or has expired" in second.json()["detail"].lower()
 
 
-def test_reset_token_expiry_constant():
-    assert 30 <= RESET_TOKEN_EXPIRY_MINUTES <= 60
+def test_reset_token_expiry_default():
+    assert reset_token_expiry_minutes() == 45
+
+
+def test_reset_token_expiry_configurable_via_env(monkeypatch):
+    monkeypatch.setenv("PASSWORD_RESET_TOKEN_EXPIRE_MINUTES", "30")
+    assert reset_token_expiry_minutes() == 30
+
+
+def test_reset_token_expiry_falls_back_on_invalid_env(monkeypatch):
+    monkeypatch.setenv("PASSWORD_RESET_TOKEN_EXPIRE_MINUTES", "not-a-number")
+    assert reset_token_expiry_minutes() == 45
+
+
+def test_created_token_expires_at_matches_configured_window(db_session, monkeypatch):
+    monkeypatch.setenv("PASSWORD_RESET_TOKEN_EXPIRE_MINUTES", "20")
+    user = User(name="Expiry Check", email="expirycheck@example.com", password=hash_password("old-pass-1"))
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    create_password_reset_token(db_session, user=user)
+    row = db_session.query(PasswordResetToken).filter(PasswordResetToken.user_id == user.id).first()
+    expires_at = row.expires_at if row.expires_at.tzinfo else row.expires_at.replace(tzinfo=timezone.utc)
+    delta_minutes = (expires_at - datetime.now(timezone.utc)).total_seconds() / 60
+    assert 19 <= delta_minutes <= 20.5
 
 
 def test_create_password_reset_token_stores_hash_not_plaintext(db_session):

@@ -18,13 +18,56 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  redis:
+    image: redis:7-alpine
+    container_name: careerboost_redis
+    # Recruiter Drafts' background draft-generation queue (Phase 7/8 of the
+    # async architecture) — nothing else in CareerBoost uses this Redis
+    # instance. Optional at the app level: if this service isn't running,
+    # the backend and worker both degrade gracefully (see draft_queue.py
+    # and recruiter_draft_service.py) rather than failing to start.
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    restart: unless-stopped
+
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
     container_name: careerboost_backend
+    # Base layer only — any explicit key below in `environment:` still wins
+    # over the same key here (Compose precedence: environment: > env_file:),
+    # so Docker-specific overrides (DATABASE_URL pointing at the postgres
+    # service, host.docker.internal for Ollama, etc.) are unaffected. This
+    # exists so backend/.env stays the single source of truth for
+    # Updated Job Search / JSearch config (UPDATED_JOB_PRIMARY_PROVIDER,
+    # JSEARCH_API_KEY, JSEARCH_API_BASE_URL, JSEARCH_MAX_*,
+    # UPDATED_JOB_REMOTIVE_ENABLED, etc.) without duplicating real secrets
+    # into this file or the root .env. `required: false` so a fresh clone
+    # without backend/.env yet still builds — those vars just fall back to
+    # the explicit defaults below (safe/unconfigured), same as today.
+    env_file:
+      - path: ./backend/.env
+        required: false
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://postgres:postgres@postgres:5432/job_resume_agent_db}
+      # Recruiter Drafts background queue — optional (see redis service
+      # above and draft_queue.py's graceful degradation).
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      RECRUITER_DRAFT_LLM_PROVIDER: ${RECRUITER_DRAFT_LLM_PROVIDER:-}
+      RECRUITER_DRAFT_MODEL: ${RECRUITER_DRAFT_MODEL:-}
+      RECRUITER_DRAFT_TIMEOUT_SECONDS: ${RECRUITER_DRAFT_TIMEOUT_SECONDS:-30}
+      RECRUITER_DRAFT_MAX_RETRIES: ${RECRUITER_DRAFT_MAX_RETRIES:-1}
+      RECRUITER_DRAFT_RATE_LIMIT_REQUESTS: ${RECRUITER_DRAFT_RATE_LIMIT_REQUESTS:-10}
+      RECRUITER_DRAFT_RATE_LIMIT_WINDOW_SECONDS: ${RECRUITER_DRAFT_RATE_LIMIT_WINDOW_SECONDS:-60}
       APP_TIMEZONE: ${APP_TIMEZONE:-America/Chicago}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost:5175,http://127.0.0.1:5175,http://localhost:5176,http://127.0.0.1:5176}
       AUTO_ANALYZE_SAVED_JOBS: ${AUTO_ANALYZE_SAVED_JOBS:-true}
@@ -34,10 +77,22 @@ services:
       LLM_MODEL: ${LLM_MODEL:-}
       LLM_BASE_URL: ${LLM_BASE_URL:-}
       LLM_TEMPERATURE: ${LLM_TEMPERATURE:-0.1}
-      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-240}
+      LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-360}
       LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-2}
-      ATS_GENERATION_TIMEOUT_SECONDS: ${ATS_GENERATION_TIMEOUT_SECONDS:-300}
+      # Bullet-level "Try Again" — independent of LLM_PROVIDER above (full
+      # generation). Defaults to host.docker.internal (mapped below via
+      # extra_hosts) rather than localhost, since localhost inside this
+      # container would refer to the container itself, not the host running
+      # Ollama.
+      BULLET_REWRITE_LLM_PROVIDER: ${BULLET_REWRITE_LLM_PROVIDER:-openai_compatible}
+      BULLET_REWRITE_LLM_BASE_URL: ${BULLET_REWRITE_LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      BULLET_REWRITE_LLM_API_KEY: ${BULLET_REWRITE_LLM_API_KEY:-ollama}
+      BULLET_REWRITE_LLM_MODEL: ${BULLET_REWRITE_LLM_MODEL:-}
+      BULLET_REWRITE_LLM_TEMPERATURE: ${BULLET_REWRITE_LLM_TEMPERATURE:-0.3}
+      BULLET_REWRITE_LLM_TIMEOUT_SECONDS: ${BULLET_REWRITE_LLM_TIMEOUT_SECONDS:-30}
+      ATS_GENERATION_TIMEOUT_SECONDS: ${ATS_GENERATION_TIMEOUT_SECONDS:-540}
       ATS_POLL_INTERVAL_MS: ${ATS_POLL_INTERVAL_MS:-2000}
+      ATS_STALE_WORKFLOW_SECONDS: ${ATS_STALE_WORKFLOW_SECONDS:-600}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-}
       SMTP_USERNAME: ${SMTP_USERNAME:-}
@@ -45,6 +100,25 @@ services:
       SMTP_FROM_EMAIL: ${SMTP_FROM_EMAIL:-}
       APP_ENV: ${APP_ENV:-development}
       FRONTEND_BASE_URL: ${FRONTEND_BASE_URL:-http://localhost:5173}
+      PASSWORD_RESET_TOKEN_EXPIRE_MINUTES: ${PASSWORD_RESET_TOKEN_EXPIRE_MINUTES:-45}
+      SHOW_DEV_RESET_LINK: ${SHOW_DEV_RESET_LINK:-false}
+      # UPDATED_JOB_TRACKER_ENABLED / UPDATED_JOB_POLL_INTERVAL_MINUTES /
+      # UPDATED_JOB_DEMO_MODE are deliberately NOT set here — they're plain
+      # app config with no Docker-specific value, so backend/.env (via
+      # env_file above) and the app's own defaults are the single source of
+      # truth. An explicit entry here — even one that substitutes a value
+      # from backend/.env — would still take precedence over env_file for
+      # anyone who only edits the root .env, which is the opposite of what
+      # "backend/.env is the source of truth" means.
+      JOB_DISCOVERY_MAX_JOBS_PER_SOURCE: ${JOB_DISCOVERY_MAX_JOBS_PER_SOURCE:-100}
+      INACTIVE_AFTER_MISSED_POLLS: ${INACTIVE_AFTER_MISSED_POLLS:-3}
+      GREENHOUSE_COMPANY_SOURCES: ${GREENHOUSE_COMPANY_SOURCES:-}
+      LEVER_COMPANY_SOURCES: ${LEVER_COMPANY_SOURCES:-}
+      GENERIC_FEED_ENABLED: ${GENERIC_FEED_ENABLED:-false}
+      JOB_MATCH_LLM_PROVIDER: ${JOB_MATCH_LLM_PROVIDER:-}
+      JOB_MATCH_LLM_MODEL: ${JOB_MATCH_LLM_MODEL:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
     ports:
       - "${BACKEND_PORT:-8000}:8000"
     extra_hosts:
@@ -60,6 +134,38 @@ services:
       timeout: 5s
       retries: 10
       start_period: 20s
+    restart: unless-stopped
+
+  draft_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: careerboost_draft_worker
+    # Same image as backend, different process (Phase 8: scales
+    # independently — run `docker compose up --scale draft_worker=3` for
+    # more workers without touching backend or RecruiterDraftService).
+    command: ["python", "-m", "app.worker.draft_worker"]
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://postgres:postgres@postgres:5432/job_resume_agent_db}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      RECRUITER_DRAFT_LLM_PROVIDER: ${RECRUITER_DRAFT_LLM_PROVIDER:-}
+      RECRUITER_DRAFT_MODEL: ${RECRUITER_DRAFT_MODEL:-}
+      RECRUITER_DRAFT_TIMEOUT_SECONDS: ${RECRUITER_DRAFT_TIMEOUT_SECONDS:-30}
+      RECRUITER_DRAFT_MAX_RETRIES: ${RECRUITER_DRAFT_MAX_RETRIES:-1}
+      BULLET_REWRITE_LLM_PROVIDER: ${BULLET_REWRITE_LLM_PROVIDER:-openai_compatible}
+      BULLET_REWRITE_LLM_BASE_URL: ${BULLET_REWRITE_LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      BULLET_REWRITE_LLM_API_KEY: ${BULLET_REWRITE_LLM_API_KEY:-ollama}
+      BULLET_REWRITE_LLM_MODEL: ${BULLET_REWRITE_LLM_MODEL:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
   frontend:
@@ -79,3 +185,4 @@ services:
 volumes:
   postgres_data:
   resume_uploads:
+  redis_data:

@@ -7,8 +7,12 @@ async function getErrorMessage(response) {
   try {
     const data = JSON.parse(text);
     if (typeof data.detail === "string") return data.detail;
+    // FastAPI/Pydantic 422s send `detail` as an array of validation error
+    // objects (e.g. [{"type":"value_error", "loc":[...], "msg":"..."}]) —
+    // never surface that raw shape to the user.
+    if (Array.isArray(data.detail)) return "Please enter a valid setting.";
     if (data.detail && typeof data.detail === "object") {
-      return data.detail.message || JSON.stringify(data.detail);
+      return data.detail.message || "Please enter a valid setting.";
     }
     return data.message || text;
   } catch {
@@ -289,8 +293,9 @@ export async function getAtsWorkflowStatus(workflowId) {
   return response.json();
 }
 
-export async function getAtsResultByJob(userId, jobId) {
-  const response = await fetch(`${API_BASE_URL}/api/ats-optimizer/result/${userId}/${jobId}`);
+export async function getAtsResultByJob(userId, jobId, { workflowId } = {}) {
+  const query = workflowId != null ? `?workflow_id=${encodeURIComponent(workflowId)}` : "";
+  const response = await fetch(`${API_BASE_URL}/api/ats-optimizer/result/${userId}/${jobId}${query}`);
   if (!response.ok) {
     throw new Error(await getErrorMessage(response));
   }
@@ -377,11 +382,13 @@ export async function saveEditedOptimizedResume(userId, jobId, optimizedResumeId
   return response.json();
 }
 
-export async function improveResumeSnippet(userId, jobId, optimizedResumeId, text, context = "bullet") {
+export async function improveResumeSnippet(userId, jobId, optimizedResumeId, text, context = "bullet", previousSuggestion = "") {
+  const body = { optimized_resume_id: optimizedResumeId, text, context };
+  if (previousSuggestion) body.previous_suggestion = previousSuggestion;
   const response = await fetch(`${API_BASE_URL}/api/optimizer/resume/${userId}/${jobId}/improve-snippet`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ optimized_resume_id: optimizedResumeId, text, context }),
+    body: JSON.stringify(body),
   });
   if (!response.ok) throw new Error(await getErrorMessage(response));
   return response.json();
@@ -430,9 +437,6 @@ async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export const DEFAULT_ATS_POLL_INTERVAL_MS = 2000;
-export const DEFAULT_ATS_GENERATION_TIMEOUT_SECONDS = 300;
-
 const ATS_STATUS_ALIASES = {
   GENERATING: "GENERATING_RESUME",
   GENERATED: "COMPLETED",
@@ -459,32 +463,86 @@ const TERMINAL_ATS_STATUSES = new Set([
   "SKIPPED_GENERIC_SEARCH_LINK",
 ]);
 
+export const DEFAULT_ATS_POLL_INTERVAL_MS = 2000;
+// Must exceed backend generation budget (LLM timeout + fallback + scoring).
+export const DEFAULT_ATS_GENERATION_TIMEOUT_SECONDS = 600;
+
+/**
+ * Poll a single workflow id until terminal or cancelled.
+ * Pass `{ signal }` / `{ isCancelled }` so Retry/new generates stop old polls.
+ */
 export async function pollAtsWorkflow(workflowId, {
   onProgress,
   maxAttempts,
   intervalMs,
   timeoutSeconds,
+  signal,
+  isCancelled,
 } = {}) {
+  const targetId = Number(workflowId);
   const interval = Number.isFinite(intervalMs) ? intervalMs : DEFAULT_ATS_POLL_INTERVAL_MS;
   const timeout = Number.isFinite(timeoutSeconds) ? timeoutSeconds : DEFAULT_ATS_GENERATION_TIMEOUT_SECONDS;
   const attempts = maxAttempts ?? Math.max(1, Math.ceil((timeout * 1000) / Math.max(interval, 1)));
   let latest = null;
+
+  const cancelled = () => Boolean(
+    (signal && signal.aborted)
+    || (typeof isCancelled === "function" && isCancelled())
+  );
+
   for (let attempt = 0; attempt < attempts; attempt += 1) {
+    if (cancelled()) {
+      return latest
+        ? { ...latest, workflow_status: normalizeAtsWorkflowStatus(latest.workflow_status), poll_cancelled: true }
+        : { workflow_id: targetId, workflow_status: "FAILED", error_message: "Polling cancelled.", poll_cancelled: true };
+    }
     latest = await getAtsWorkflowStatus(workflowId);
+    const responseId = Number(latest?.workflow_id ?? workflowId);
+    if (responseId !== targetId) {
+      // Stale response for a different workflow — ignore.
+      if (interval > 0) await sleep(interval);
+      continue;
+    }
     const normalized = normalizeAtsWorkflowStatus(latest?.workflow_status);
     latest = { ...latest, workflow_status: normalized };
-    if (onProgress) onProgress(latest);
+    if (onProgress && !cancelled()) onProgress(latest);
     if (TERMINAL_ATS_STATUSES.has(normalized)) {
       return latest;
     }
     if (interval > 0) await sleep(interval);
   }
-  const timedOut = latest || { workflow_id: workflowId, workflow_status: "FAILED" };
+
+  // Final authoritative check before declaring client-side timeout failure.
+  try {
+    if (!cancelled()) {
+      latest = await getAtsWorkflowStatus(workflowId);
+      const normalized = normalizeAtsWorkflowStatus(latest?.workflow_status);
+      latest = { ...latest, workflow_status: normalized };
+      if (TERMINAL_ATS_STATUSES.has(normalized)) {
+        if (onProgress) onProgress(latest);
+        return latest;
+      }
+    }
+  } catch {
+    /* keep timedOut path */
+  }
+
+  const timedOut = latest || { workflow_id: targetId, workflow_status: "FAILED" };
   if (!TERMINAL_ATS_STATUSES.has(normalizeAtsWorkflowStatus(timedOut.workflow_status))) {
+    const llmReason = timedOut.llm_failure_reason || timedOut.fallback_reason;
+    const fallbackNote = timedOut.fallback_attempted
+      ? (timedOut.fallback_succeeded
+        ? ""
+        : (timedOut.fallback_failure_reason || "Deterministic fallback did not complete in time."))
+      : "Deterministic fallback may still be running on the server — retry status shortly.";
     return {
       ...timedOut,
       workflow_status: "FAILED",
-      error_message: timedOut.error_message || "Resume generation could not be completed.",
+      error_message: timedOut.error_message || (
+        llmReason
+          ? `AI generation failed (${llmReason}). ${fallbackNote}`.trim()
+          : "Resume generation could not be completed within the client wait window. Retry to refresh status."
+      ),
     };
   }
   return { ...timedOut, workflow_status: normalizeAtsWorkflowStatus(timedOut.workflow_status) };
@@ -555,6 +613,91 @@ export async function getEmailLogs(userId) {
   return response.json();
 }
 
+// Email Summary — Gmail connection, application tracking
+async function emailGet(path) {
+  const response = await fetch(`${API_BASE_URL}${path}`);
+  if (!response.ok) throw new Error(await getErrorMessage(response));
+  return response.json();
+}
+
+async function emailPost(path, body) {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  });
+  if (!response.ok) throw new Error(await getErrorMessage(response));
+  return response.json();
+}
+
+async function emailPatch(path, body) {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  });
+  if (!response.ok) throw new Error(await getErrorMessage(response));
+  return response.json();
+}
+
+export function getGmailConfigStatus() {
+  return emailGet(`/api/email/gmail/config-status`);
+}
+
+export function getEmailSummaryPreferences(userId) {
+  return emailGet(`/api/email/preferences/${userId}`);
+}
+
+export function updateEmailSummaryPreferences(userId, preferences) {
+  return emailPatch(`/api/email/preferences/${userId}`, preferences);
+}
+
+export function getGmailStatus(userId) {
+  return emailGet(`/api/email/gmail/status/${userId}`);
+}
+
+export function connectGmail(userId) {
+  return emailGet(`/api/email/gmail/connect/${userId}`);
+}
+
+export function disconnectGmail(userId) {
+  return emailPost(`/api/email/gmail/disconnect/${userId}`);
+}
+
+export function scanJobEmails(userId) {
+  return emailPost(`/api/email/gmail/scan/${userId}`);
+}
+
+export function getApplications(userId) {
+  return emailGet(`/api/email/applications/${userId}`);
+}
+
+export function getApplicationHistory(userId, applicationId) {
+  return emailGet(`/api/email/applications/${userId}/${applicationId}/history`);
+}
+
+export function updateApplicationStatus(userId, applicationId, newStatus) {
+  return emailPost(`/api/email/applications/${userId}/${applicationId}/status`, { new_status: newStatus });
+}
+
+export function getJobEmailEvents(userId) {
+  return emailGet(`/api/email/events/${userId}`);
+}
+
+export function resolveJobEmailEvent(userId, eventId, action, jobId) {
+  return emailPost(`/api/email/events/${userId}/${eventId}/resolve`, { action, job_id: jobId ?? null });
+}
+
+// CareerBoost-local only — Gmail stays read-only, so neither of these calls
+// a Gmail write/modify API. Marking read is one-way; the star is a toggle.
+export function markJobEmailEventRead(userId, eventId) {
+  return emailPost(`/api/email/events/${userId}/${eventId}/mark-read`);
+}
+
+export function toggleJobEmailEventStar(userId, eventId) {
+  return emailPost(`/api/email/events/${userId}/${eventId}/toggle-star`);
+}
+
 export async function runFullWorkflow(userId) {
   const response = await fetch(`${API_BASE_URL}/api/scheduler/run/${userId}`, {
     method: "POST"
@@ -564,6 +707,64 @@ export async function runFullWorkflow(userId) {
     throw new Error(await getErrorMessage(response));
   }
 
+  return response.json();
+}
+
+// Updated Job Search — career page / ATS tracker discovery + resume matching
+export async function getDiscoveredJobs(userId, params = {}) {
+  const query = new URLSearchParams(
+    Object.entries(params).filter(([, value]) => value !== undefined && value !== null && value !== "")
+  ).toString();
+  const response = await fetch(
+    `${API_BASE_URL}/api/job-discovery/jobs/${userId}${query ? `?${query}` : ""}`
+  );
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+  return response.json();
+}
+
+export async function refreshDiscoveredJobs(userId) {
+  const response = await fetch(`${API_BASE_URL}/api/job-discovery/refresh/${userId}`, {
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+  return response.json();
+}
+
+export async function saveDiscoveredJob(userId, discoveredJobId) {
+  const response = await fetch(`${API_BASE_URL}/api/job-discovery/save/${userId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ discovered_job_id: discoveredJobId }),
+  });
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+  return response.json();
+}
+
+export async function getJobDiscoverySources() {
+  const response = await fetch(`${API_BASE_URL}/api/job-discovery/sources`);
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
+  return response.json();
+}
+
+// Fire-and-forget apply tracking — never blocks the browser's navigation to
+// the employer's real application page (see DiscoveredJobCard's Apply link).
+export async function recordJobApply(userId, discoveredJobId) {
+  const response = await fetch(`${API_BASE_URL}/api/job-discovery/apply/${userId}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ discovered_job_id: discoveredJobId }),
+  });
+  if (!response.ok) {
+    throw new Error(await getErrorMessage(response));
+  }
   return response.json();
 }
 

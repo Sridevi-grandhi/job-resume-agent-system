@@ -135,6 +135,48 @@ CANONICAL_TECHNOLOGIES = [
     "Agile", "Scrum", "Healthcare",
 ]
 
+# Canonical claim categories used by the evidence and final-validation gates.
+# The catalog intentionally contains capabilities and professional practices as
+# well as vendor technologies; callers must not flatten all of them into a
+# generic "technology" error.
+SKILL_CATEGORIES = {
+    # Languages
+    **{name: "language" for name in ("Java", "Python", "JavaScript", "TypeScript", "C#", "Go", "Bash")},
+    # Frameworks and libraries
+    **{name: "framework" for name in (
+        "Spring", "Spring Boot", "Spring MVC", "Spring Security", "Hibernate", "React",
+        "Angular", "AngularJS", "Vue", "Next.js", "Node.js", "Django", "Flask", "FastAPI",
+        "Selenium", "Cypress", "Playwright", "Appium", "Cucumber",
+    )},
+    # Databases and data stores
+    **{name: "database" for name in ("PostgreSQL", "MySQL", "Oracle", "MongoDB", "Redis", "SQL", "SQL Server")},
+    # Cloud and delivery tooling
+    **{name: "cloud platform" for name in ("AWS", "Azure", "GCP")},
+    **{name: "devops tool" for name in (
+        "Docker", "Kubernetes", "Jenkins", "GitHub Actions", "GitLab CI", "Azure DevOps",
+        "Terraform", "CloudFormation", "Ansible", "Helm", "Argo CD", "Git", "Maven",
+    )},
+    **{name: "testing tool" for name in ("JUnit", "TestNG", "Postman", "Rest Assured", "JMeter", "PyTest", "XCTest", "XCUITest")},
+    # Professional working methods are claims that still need evidence, but
+    # are not technologies.
+    **{name: "methodology" for name in ("Agile", "Scrum")},
+    **{name: "practice" for name in ("CI/CD", "Test Automation", "API Testing", "Database Validation", "Infrastructure as Code", "ETL")},
+    "Healthcare": "domain",
+}
+
+# Role titles are materially different claims from a related methodology or
+# tool. These title phrases are checked independently so evidence of Scrum
+# participation, for example, cannot become an unsupported Scrum Master role.
+PROFESSIONAL_ROLE_CLAIMS = (
+    "Scrum Master",
+    "Product Owner",
+    "Architect",
+    "Technical Lead",
+    "Team Lead",
+    "Engineering Manager",
+    "Principal Engineer",
+)
+
 # Capability / concept requirements that can be VERIFIED_CONTEXTUAL from professional
 # responsibilities or defining tools — without requiring the exact JD phrase.
 # Related tools never auto-verify a different vendor technology (see RELATED_NOT_EQUIVALENT).
@@ -312,6 +354,8 @@ CONFLICT_GROUPS = {
     "CI/CD Tools": ["Jenkins", "GitHub Actions", "GitLab CI", "Azure DevOps"],
     "IaC Tools": ["Terraform", "CloudFormation", "Ansible"],
     "Monitoring Tools": ["Splunk", "Dynatrace", "AppDynamics", "ELK"],
+    "E2E/UI Testing Tools": ["Selenium", "Cypress", "Playwright"],
+    "Message Queues": ["Kafka", "RabbitMQ"],
 }
 
 EARLIEST_USE_YEAR = {

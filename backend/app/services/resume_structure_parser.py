@@ -57,7 +57,38 @@ NON_EXPERIENCE_HEADING = re.compile(
     re.I,
 )
 
-CLIENT_PATTERN = re.compile(r"(?i)\bclient\s*[:\-]\s*(.+)$")
+# Anchored to the START of the line and requires a capitalized name after the
+# separator — a genuine "Client: Acme Corp" / "Client - Globex Inc" label line,
+# never a mid-sentence technical term. Unanchored, this used to match ANY
+# occurrence of "client" + hyphen anywhere in a bullet — "client-side logic",
+# "client-facing APIs", "client-server architecture" — silently swallowing
+# the ENTIRE bullet as a bogus client-name declaration and dropping it from
+# parsing (which cascades into lost ATS evidence credit and misaligned
+# original-vs-generated bullet diffs for every bullet after it).
+CLIENT_PATTERN = re.compile(r"(?i)^\s*client\s*[:\-]\s*([A-Z][\w&.,'-]*(?:\s+[\w&.,'-]+)*)\s*$")
+
+# A line beginning with a resume action verb is treated as bullet-worthy
+# professional evidence even without a leading marker — PDF extraction (and
+# some DOCX templates) routinely drop bullet glyphs. Shared with
+# template_preservation_service's DOCX overlay so both "is this line a
+# bullet" decisions stay in sync — a paragraph classification mismatch
+# between the two is exactly what causes metadata/header lines to be
+# mistaken for bullets (or vice versa) during export.
+ACTION_VERB_BULLET_RE = re.compile(
+    r"(?i)^(built|developed|designed|deployed|implemented|managed|led|created|"
+    r"provisioned|administered|automated|migrated|configured|maintained|"
+    r"orchestrated|supported|wrote|used|using|delivered|optimized|"
+    r"integrated|monitored|containerized|established|streamlined)",
+)
+
+# Metadata label lines that are never resume body/bullet prose — structural
+# identity fields (Part 1: employer/client/project/location/address/role/
+# environment) that must never be overwritten by generated bullet text.
+METADATA_LABEL_RE = re.compile(
+    r"(?i)^\s*(client|client\s*location|location|address|role|title|company|"
+    r"employer|project|environment(?:s)?)\s*[:\-]\s*\S",
+)
+
 EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
 PHONE_PATTERN = re.compile(r"(?:\+?\d{1,3}[\s\-.]?)?(?:\(?\d{3}\)?[\s\-.]?)\d{3}[\s\-.]?\d{4}")
 URL_PATTERN = re.compile(r"https?://\S+|www\.\S+|linkedin\.com/\S+|github\.com/\S+", re.I)
@@ -67,13 +98,18 @@ def _is_heading(line: str) -> bool | str:
     cleaned = re.sub(r"^[\W_]+|[\W_]+$", "", line.strip())
     if not cleaned or len(cleaned) > 60:
         return False
-    # All-caps short lines often are headings.
-    if cleaned.isupper() and len(cleaned.split()) <= 6:
-        return cleaned.title() if cleaned.isupper() else cleaned
+    # Root cause of a live false-positive section_order validation failure:
+    # this used to treat ANY short all-caps line as a heading, unconditionally
+    # — which misreads a short all-caps EMPLOYER NAME ("CISCO SYSTEMS",
+    # "DELOITTE") or an experience sub-label ("RESPONSIBILITIES", "CLIENT")
+    # as a brand-new top-level section, fragmenting "Professional Experience"
+    # into many bogus sections. All-caps text is now heading-worthy ONLY
+    # when it also matches a KNOWN section-heading pattern (same check as
+    # the lowercase/title-case path below) — never on casing alone.
     lowered = cleaned.lower()
     for pattern in SECTION_HEADING_PATTERNS:
         if re.fullmatch(pattern, lowered):
-            return cleaned
+            return cleaned.title() if cleaned.isupper() else cleaned
     # Title Case headings matching known patterns partially — e.g. "IV. Professional
     # Experience" or "Professional Experience (5+ yrs)". Requires the heading phrase to
     # account for nearly all of the line; otherwise an ordinary sentence that merely
@@ -93,24 +129,39 @@ def _split_contact_and_body(text: str) -> tuple[str, list[str]]:
     while lines and not lines[0].strip():
         lines.pop(0)
 
-    contact_lines = []
+    # Primary signal: the first REAL section heading found anywhere marks
+    # where contact/header info ends and the resume body begins — including
+    # at index 0. A previous `index > 0` guard here assumed a heading could
+    # never legitimately be the very first line, but a real production
+    # resume can have NO name/contact preamble captured in parsed_text at
+    # all (e.g. the candidate's name/contact lives in a DOCX header or
+    # text-box that plain-paragraph text extraction never captures) — the
+    # body then starts with "PROFESSIONAL SUMMARY" as line 1. With the old
+    # `index > 0` guard, that heading (and every line after it, for as long
+    # as no blank line ever appears — some extractors strip blank lines
+    # entirely) got silently swallowed into "contact", leaving _parse_sections
+    # with an EMPTY body and therefore ZERO detected sections: every
+    # truthfulness check that depends on original_structure (section_order,
+    # employer/dates, protected education/certification sections) was
+    # silently skipped for this resume shape. Scanning the whole text (not
+    # just the first 12 lines) also recovers documents whose header block is
+    # longer than 12 lines before the first real heading.
+    for index, line in enumerate(lines):
+        if _is_heading(line):
+            return "\n".join(lines[:index]).strip(), lines[index:]
+
+    # No heading found anywhere — fall back to "the first blank-line-delimited
+    # block is the contact block" (a genuinely headingless resume; recovered
+    # via the employment-block fallback elsewhere).
+    contact_lines: list[str] = []
     body_start = 0
-    for index, line in enumerate(lines[:12]):
-        heading = _is_heading(line)
-        if heading and index > 0:
-            body_start = index
+    for index, line in enumerate(lines):
+        if not line.strip() and contact_lines:
+            body_start = index + 1
             break
-        contact_lines.append(line)
-        body_start = index + 1
-    else:
-        # No clear heading in first lines — take first non-empty block as contact
-        for index, line in enumerate(lines):
-            if not line.strip() and contact_lines:
-                body_start = index + 1
-                break
-            if line.strip():
-                contact_lines.append(line)
-                body_start = index + 1
+        if line.strip():
+            contact_lines.append(line)
+            body_start = index + 1
 
     return "\n".join(contact_lines).strip(), lines[body_start:]
 
@@ -209,13 +260,7 @@ def _parse_employment_blocks(content: str) -> list[dict[str, Any]]:
             looks_like_bullet = (
                 len(stripped) >= 40
                 and not DATE_PATTERN.search(stripped)
-                and re.match(
-                    r"(?i)^(built|developed|designed|deployed|implemented|managed|led|created|"
-                    r"provisioned|administered|automated|migrated|configured|maintained|"
-                    r"orchestrated|supported|wrote|used|using|delivered|optimized|"
-                    r"integrated|monitored|containerized|established|streamlined)",
-                    stripped,
-                )
+                and ACTION_VERB_BULLET_RE.match(stripped)
             )
             if looks_like_bullet:
                 current["bullets"].append(stripped)

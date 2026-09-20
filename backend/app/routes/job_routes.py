@@ -9,6 +9,7 @@ from app.models.user_preference_model import UserPreference
 from app.models.job_model import Job
 from app.models.match_model import MatchScore
 from app.models.optimized_resume_model import OptimizedResume
+from app.models.ats_optimization_workflow_model import AtsOptimizationWorkflow
 
 # Existing Job Search Agent — LinkedIn / Indeed / Dice / Google Jobs / ZipRecruiter search links
 from app.agents.job_search_agent import get_mock_jobs
@@ -24,6 +25,7 @@ from app.agents.job_url_import_agent import (
 from app.services.ats_optimization_workflow_service import (
     max_optimizations_per_run,
     start_workflow_for_saved_job,
+    RUNNING_WORKFLOW_STATUSES,
 )
 
 
@@ -68,6 +70,37 @@ def _selected_job_payload(job: Job, db: Session) -> dict:
         (match for match in matches if match.resume_version == "optimized"),
         None,
     )
+    original_match_percentage = original.match_percentage if original else None
+    optimized_match_percentage = optimized.match_percentage if optimized else None
+
+    # match_status lets the frontend render an explicit state (complete /
+    # calculating / unavailable / failed) instead of treating every null
+    # score the same way. No new scoring happens here — this only reads
+    # already-persisted data, in the same priority the existing workflow
+    # already establishes: a real MatchScore row first, then the latest
+    # workflow's own original_match_score (already computed, just not yet
+    # mirrored into MatchScore — see execute_workflow), then the workflow's
+    # own status for anything still running or terminally failed.
+    latest_workflow = (
+        db.query(AtsOptimizationWorkflow)
+        .filter(AtsOptimizationWorkflow.user_id == job.user_id, AtsOptimizationWorkflow.job_id == job.id)
+        .order_by(AtsOptimizationWorkflow.id.desc())
+        .first()
+    )
+    match_status = "UNAVAILABLE"
+    if original_match_percentage is not None:
+        match_status = "COMPLETE"
+    elif latest_workflow is not None:
+        if latest_workflow.workflow_status in RUNNING_WORKFLOW_STATUSES:
+            match_status = "CALCULATING"
+        elif latest_workflow.original_match_score is not None:
+            original_match_percentage = latest_workflow.original_match_score
+            match_status = "COMPLETE"
+        elif latest_workflow.workflow_status in {"FAILED", "VALIDATION_FAILED"}:
+            match_status = "FAILED"
+        # WAITING_FOR_RESUME / INCOMPLETE_JOB (no score ever computed,
+        # deliberately not attempted) fall through to UNAVAILABLE.
+
     return {
         "id": job.id,
         "user_id": job.user_id,
@@ -81,8 +114,9 @@ def _selected_job_payload(job: Job, db: Session) -> dict:
         "source": job.source,
         "job_url": job.job_url,
         "discovered_at": str(job.discovered_at) if job.discovered_at else None,
-        "original_match_percentage": original.match_percentage if original else None,
-        "optimized_match_percentage": optimized.match_percentage if optimized else None,
+        "original_match_percentage": original_match_percentage,
+        "optimized_match_percentage": optimized_match_percentage,
+        "match_status": match_status,
     }
 
 
@@ -124,6 +158,27 @@ def get_user_and_preferences(user_id: int, db: Session):
 
 
 def _delete_jobs_and_related(user_id: int, job_ids: list[int], db: Session) -> None:
+    """Deletes a Job row plus every dependent row that has a foreign key to
+    jobs.id — otherwise the final Job delete below raises an uncaught
+    IntegrityError (verified live: job_requirement_analyses_job_id_fkey,
+    e.g., is NOT NULL and blocks the delete for any job that went through
+    ATS analysis or skill confirmation).
+
+    Two different intents, by table:
+    - Artifacts that exist ONLY "for" this specific job (workflow runs,
+      match scores, optimized resumes, cached requirement analysis, skill
+      confirmation evidence) are meaningless once the job is gone, so they
+      are deleted alongside it — same as the existing behavior this
+      function already had for ats_optimization_workflows/match_scores/
+      optimized_resumes.
+    - Genuine user HISTORY that happens to reference the job (tracked
+      applications, Gmail-derived email events) must survive "Remove Job"
+      intact — these rows are detached (their nullable job_id/matched_job_id
+      is set to NULL, matching the fallback state these models already
+      define for "matched to email evidence only, no Job row") rather than
+      deleted, per the product's existing "remove from Selected Jobs, not
+      destroy application/email history" intent.
+    """
     if not job_ids:
         return
 
@@ -148,6 +203,47 @@ def _delete_jobs_and_related(user_id: int, job_ids: list[int], db: Session) -> N
         OptimizedResume.user_id == user_id,
         OptimizedResume.job_id.in_(job_ids),
     ).delete(synchronize_session=False)
+
+    # Per-job derived artifacts — deleted alongside the job (same intent as
+    # match_scores/optimized_resumes above): a cached requirement analysis
+    # or skill-confirmation evidence for a job that no longer exists has no
+    # other purpose and is not user-facing history on its own.
+    try:
+        from app.models.skill_confirmation_model import JobRequirementAnalysis, UserConfirmedSkill
+
+        db.query(JobRequirementAnalysis).filter(
+            JobRequirementAnalysis.user_id == user_id,
+            JobRequirementAnalysis.job_id.in_(job_ids),
+        ).delete(synchronize_session=False)
+
+        db.query(UserConfirmedSkill).filter(
+            UserConfirmedSkill.user_id == user_id,
+            UserConfirmedSkill.job_id.in_(job_ids),
+        ).delete(synchronize_session=False)
+    except Exception:
+        pass
+
+    # Genuine user history — detached, never deleted, by design (both
+    # columns are nullable specifically to support "no matched Job row").
+    try:
+        from app.models.application_tracking_model import ApplicationTracking
+
+        db.query(ApplicationTracking).filter(
+            ApplicationTracking.user_id == user_id,
+            ApplicationTracking.job_id.in_(job_ids),
+        ).update({ApplicationTracking.job_id: None}, synchronize_session=False)
+    except Exception:
+        pass
+
+    try:
+        from app.models.job_email_event_model import JobEmailEvent
+
+        db.query(JobEmailEvent).filter(
+            JobEmailEvent.user_id == user_id,
+            JobEmailEvent.matched_job_id.in_(job_ids),
+        ).update({JobEmailEvent.matched_job_id: None}, synchronize_session=False)
+    except Exception:
+        pass
 
     db.query(Job).filter(
         Job.user_id == user_id,

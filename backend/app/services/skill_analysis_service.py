@@ -16,6 +16,7 @@ from app.services.resume_structure_parser import parse_resume_structure
 from app.services.technology_catalog import (
     CAPABILITY_EVIDENCE,
     RELATED_NOT_EQUIVALENT,
+    SKILL_CATEGORIES,
     TECHNOLOGY_SYNONYMS,
 )
 
@@ -124,6 +125,30 @@ CATEGORY_MAP = {
     "oracle": "Database", "sql server": "Database", "postgresql": "Database", "sql": "Database",
     "jpa": "Framework", "kubernetes": "Cloud / DevOps",
 }
+
+
+def skill_category(skill: str) -> str:
+    """Return the claim category for user-facing validation diagnostics.
+
+    This uses the same normalization path as requirement evidence; unknown
+    terms remain conservatively classified as technologies so an unsupported
+    vendor/tool claim cannot evade the truthfulness gate.
+    """
+    normalized = normalize_skill_name(skill)
+    display = display_skill_name(normalized)
+    category = SKILL_CATEGORIES.get(display)
+    if category:
+        return category
+    if normalized in CATEGORY_MAP:
+        return CATEGORY_MAP[normalized].lower()
+    lowered = str(skill or "").lower()
+    if any(token in lowered for token in ("certified", "certification", "certificate")):
+        return "certification"
+    if any(token in lowered for token in ("architecture", "architectural")):
+        return "architecture pattern"
+    if any(token in lowered for token in ("protocol", "oauth", "http", "grpc")):
+        return "protocol"
+    return "technology"
 
 
 def _basic_normalize(value: str) -> str:

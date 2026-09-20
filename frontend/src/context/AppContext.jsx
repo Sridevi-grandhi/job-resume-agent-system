@@ -1,21 +1,26 @@
 /* eslint-disable react-hooks/exhaustive-deps, react-refresh/only-export-components */
-import { createContext, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api";
 
 const AppContext = createContext(null);
 const emptyPreferences = { job_title:"", location:"", experience:"", work_mode:"", job_type:"", skills:"", schedule_time:"08:00", timezone:"America/Chicago" };
+const ALL_EMAIL_CATEGORIES = ["job_opportunities", "recruiter_messages", "application_updates", "interview_invitations"];
+const emptyEmailSummaryPreferences = {
+  daily_summary_delivery_enabled: false, automatic_gmail_scan_enabled: false, daily_summary_recipient: "", effective_daily_summary_recipient: "",
+  gmail_scan_frequency: "daily", email_types_to_scan: ALL_EMAIL_CATEGORIES,
+};
 const emptySelectedJob = { title:"", company:"", location:"", work_mode:"Remote", job_type:"Full-time", description:"", skills_required:"", source:"User Selected Job", job_url:"" };
 const messageOf = (error) => error?.message || "Something went wrong.";
 
 const STATUS_LABELS = {
-  PENDING: "Queued…",
+  PENDING: "Ready",
   WAITING_FOR_RESUME: "Waiting for resume upload",
   INCOMPLETE_JOB: "Incomplete job — cannot optimize",
-  ANALYZING_ORIGINAL: "Analyzing original resume…",
-  GENERATING_RESUME: "Generating optimized resume…",
-  VALIDATING_RESUME: "Validating generated resume…",
+  ANALYZING_ORIGINAL: "Analyzing Original Resume",
+  GENERATING_RESUME: "Generating optimized resume",
+  VALIDATING_RESUME: "Validating resume",
   VALIDATION_FAILED: "Validation failed",
-  ANALYZING_OPTIMIZED: "Calculating optimized match…",
+  ANALYZING_OPTIMIZED: "Calculating optimized match",
   COMPLETED: "Completed",
   FAILED: "Failed",
   INELIGIBLE_LOW_SCORE: "Below 65% optimization threshold",
@@ -54,16 +59,25 @@ export function AppProvider({ children }) {
   const [optimizedResumes, setOptimizedResumes] = useState([]);
   const [matches, setMatches] = useState([]);
   const [atsResult, setAtsResult] = useState(null);
+  const [activeAtsWorkflowId, setActiveAtsWorkflowId] = useState(null);
+  const [previousAtsResult, setPreviousAtsResult] = useState(null);
   const [atsSelectedJobId, setAtsSelectedJobId] = useState("");
   const [requirementAnalysis, setRequirementAnalysis] = useState(null);
   const [missingSkillsGroups, setMissingSkillsGroups] = useState(null);
   const [confirmedSkills, setConfirmedSkills] = useState([]);
   const [emailLogs, setEmailLogs] = useState([]);
+  const [emailSummaryPreferences, setEmailSummaryPreferences] = useState(emptyEmailSummaryPreferences);
+  const [gmailStatus, setGmailStatus] = useState(null);
+  const [applications, setApplications] = useState([]);
+  const [jobEmailEvents, setJobEmailEvents] = useState([]);
   const [workflowResult, setWorkflowResult] = useState(null);
   const [messages, setMessages] = useState({});
   const [busy, setBusy] = useState("");
   const [deletingJobId, setDeletingJobId] = useState(null);
   const userId = currentUser?.user_id;
+  const activeAtsWorkflowIdRef = useRef(null);
+  const atsPollGenerationRef = useRef(0);
+  const atsGeneratingLockRef = useRef(false);
   const tell = (key, value) => setMessages((old) => ({ ...old, [key]: value }));
   const clearMessage = (key) => setMessages((old) => {
     if (!(key in old)) return old;
@@ -71,15 +85,57 @@ export function AppProvider({ children }) {
     delete next[key];
     return next;
   });
-  const task = async (key, fn) => { setBusy(key); clearMessage(key); try { return await fn(); } catch (e) { tell(key, messageOf(e)); } finally { setBusy(""); } };
+  const task = async (key, fn) => {
+    if (key === "ats") {
+      if (atsGeneratingLockRef.current || busy === "ats") {
+        throw new Error("Resume generation is already in progress.");
+      }
+      atsGeneratingLockRef.current = true;
+    }
+    setBusy(key);
+    clearMessage(key);
+    try { return await fn(); } catch (e) { tell(key, messageOf(e)); } finally {
+      if (key === "ats") atsGeneratingLockRef.current = false;
+      setBusy("");
+    }
+  };
+
+  const beginAtsPoll = (workflowId) => {
+    atsPollGenerationRef.current += 1;
+    const generation = atsPollGenerationRef.current;
+    activeAtsWorkflowIdRef.current = Number(workflowId);
+    return {
+      generation,
+      isCancelled: () => (
+        generation !== atsPollGenerationRef.current
+        || Number(activeAtsWorkflowIdRef.current) !== Number(workflowId)
+      ),
+      onProgress: (status) => {
+        if (generation !== atsPollGenerationRef.current) return;
+        if (Number(status?.workflow_id) !== Number(workflowId)) return;
+        setAtsResult(status);
+        tell("ats", statusLabel(status.workflow_status));
+      },
+    };
+  };
+
+  const cancelAtsPolling = () => {
+    atsPollGenerationRef.current += 1;
+    activeAtsWorkflowIdRef.current = null;
+  };
 
   useEffect(() => { api.checkBackendHealth().then((d) => setBackendStatus(d.status || "Backend is running")).catch(() => setBackendStatus("Backend not connected")); }, []);
+
+  useEffect(() => () => {
+    cancelAtsPolling();
+    atsGeneratingLockRef.current = false;
+  }, []);
 
   const resetData = () => {
     setPreferences(emptyPreferences); setPreferencesSaved(false); setLatestResume(null); setSelectedResumeFile(null);
     setJobs([]); setSelectedJobs([]); setSelectedJobForm(emptySelectedJob); setSelectedJobImportReady(false); setSelectedJobImportStatus(null); setOptimizedResumes([]); setMatches([]);
     setAtsResult(null); setAtsSelectedJobId(""); setRequirementAnalysis(null); setMissingSkillsGroups(null); setConfirmedSkills([]); setEmailLogs([]);
-    setWorkflowResult(null); setMessages({});
+    setWorkflowResult(null); setEmailSummaryPreferences(emptyEmailSummaryPreferences); setMessages({});
   };
   const authenticate = async (mode, form) => task(mode === "signup" ? "authSignup" : "authLogin", async () => {
     const data = mode === "login" ? await api.loginUser(form) : await api.signupUser(form);
@@ -167,18 +223,29 @@ export function AppProvider({ children }) {
     setDeletingJobId(jobId);
     try {
       const d = await api.deleteSelectedJob(userId, jobId);
+      // The backend only ever deletes/detaches records tied to this one
+      // job_id — no other Job row is affected — so this local filter is
+      // already the exact correct post-delete state. Deliberately no
+      // redundant getSelectedJobs() re-fetch here: an unrelated transient
+      // failure in a second network call must never turn an already-
+      // successful removal into a false "Failed to fetch" for the user.
       setSelectedJobs((current) => current.filter((job) => String(job.id) !== String(jobId)));
       setJobs((current) => current.filter((job) => String(job.id) !== String(jobId)));
       if (String(atsSelectedJobId) === String(jobId)) {
         setAtsSelectedJobId("");
         setAtsResult(null);
       }
-      const refreshed = await api.getSelectedJobs(userId);
-      setSelectedJobs(Array.isArray(refreshed) ? refreshed : refreshed.jobs || []);
       tell("selected", d.message || "Selected job removed successfully");
       return d;
     } catch (error) {
-      tell("selected", messageOf(error));
+      // A raw fetch()-level failure (network unreachable, CORS-blocked
+      // error response, etc.) throws a TypeError with a terse browser
+      // string ("Failed to fetch") — not user-friendly and not from our
+      // own code. A real backend-reported failure (404 Selected job not
+      // found, etc.) is already a clean message via getErrorMessage(), so
+      // it's shown as-is.
+      const friendly = error instanceof TypeError ? "Unable to remove this job. Please try again." : messageOf(error);
+      tell("selected", friendly);
       return null;
     } finally {
       setDeletingJobId(null);
@@ -205,6 +272,18 @@ export function AppProvider({ children }) {
         },
       });
       setAtsResult(analysis);
+      // Refresh the Selected Jobs list so the just-saved card reflects its
+      // final match_status/score the moment the workflow settles — never
+      // requiring the user to revisit Workflow/ATS Optimizer or refresh
+      // the browser to see a score that already finished calculating.
+      try {
+        const refreshed = await api.getSelectedJobs(userId);
+        setSelectedJobs(Array.isArray(refreshed) ? refreshed : refreshed.jobs || []);
+      } catch {
+        // Best-effort refresh only — the card still shows its pre-poll
+        // state (Calculating…/no score yet), never a crash, and the next
+        // Load Selected Jobs or page visit picks up the real state.
+      }
       if (analysis.workflow_status === "COMPLETED") {
         tell("selected", "Job saved and ATS optimize-and-match completed.");
         tell("ats", `Original ${analysis.original_match_percentage}% → Optimized ${analysis.optimized_match_percentage}%`);
@@ -214,6 +293,13 @@ export function AppProvider({ children }) {
         ]);
         setOptimizedResumes(Array.isArray(opt) ? opt : opt.optimized_resumes || []);
         setMatches(Array.isArray(matchList) ? matchList : matchList.matches || []);
+      } else if (analysis.original_match_percentage != null && !analysis.error_message) {
+        // A genuine, non-fake score exists (e.g. INELIGIBLE_LOW_SCORE — the
+        // original match was computed, optimization just wasn't worthwhile)
+        // — say so accurately instead of a vague "finished with warnings"
+        // that gives no indication a real score is already on the card.
+        tell("selected", `Job saved. Resume match calculated: ${analysis.original_match_percentage}%.`);
+        tell("ats", statusLabel(analysis.workflow_status, analysis.error_message));
       } else {
         tell("selected", analysis.error_message || d.message || "Job saved. ATS workflow finished with warnings.");
         tell("ats", statusLabel(analysis.workflow_status, analysis.error_message));
@@ -231,28 +317,73 @@ export function AppProvider({ children }) {
     const id = jobId || atsSelectedJobId;
     if (!id) throw new Error("Select a job before running optimize-and-match.");
     setAtsSelectedJobId(String(id));
-    tell("ats", "Generating optimized resume…");
+    tell("ats", "Generating with AI…");
+    cancelAtsPolling();
+    setAtsResult((current) => {
+      if (current?.workflow_status === "COMPLETED" && current?.workflow_id) {
+        setPreviousAtsResult(current);
+      }
+      return {
+        ...(current?.workflow_status === "COMPLETED" ? current : {}),
+        workflow_id: current?.workflow_id,
+        workflow_status: "PENDING",
+        job_id: Number(id),
+        generation_metadata: null,
+        fallback_used: false,
+        generation_method: null,
+        fallback_reason: null,
+      };
+    });
     const started = await api.startAtsOptimization(userId, id, force);
-    setAtsResult(started.result || started);
+    const workflowId = started.workflow_id;
+    setActiveAtsWorkflowId(workflowId ?? null);
+    activeAtsWorkflowIdRef.current = workflowId != null ? Number(workflowId) : null;
+    if (started.created_new === false && started.reuse_reason === "completed_unchanged") {
+      setAtsResult(started.result || started);
+      setPreviousAtsResult(null);
+      setActiveAtsWorkflowId(workflowId ?? null);
+    } else if (workflowId && !TERMINAL_ATS_START_STATUSES.has(started.workflow_status)) {
+      setAtsResult((current) => ({
+        ...current,
+        ...(started.result || started),
+        workflow_id: workflowId,
+        workflow_status: started.workflow_status || "PENDING",
+        generation_metadata: null,
+        fallback_used: false,
+        generation_method: null,
+        fallback_reason: null,
+      }));
+    } else {
+      setAtsResult(started.result || started);
+    }
     let finalResult = started.result || started;
-    if (started.workflow_id && !TERMINAL_ATS_START_STATUSES.has(started.workflow_status)) {
-      finalResult = await api.pollAtsWorkflow(started.workflow_id, {
-        onProgress: (status) => {
-          setAtsResult(status);
-          tell("ats", statusLabel(status.workflow_status));
-        },
+    if (workflowId && !TERMINAL_ATS_START_STATUSES.has(started.workflow_status)) {
+      const poll = beginAtsPoll(workflowId);
+      finalResult = await api.pollAtsWorkflow(workflowId, {
+        onProgress: poll.onProgress,
+        isCancelled: poll.isCancelled,
         intervalMs: started.poll_interval_ms,
         timeoutSeconds: started.poll_timeout_seconds,
       });
-      setAtsResult(finalResult);
+      if (poll.isCancelled() || finalResult?.poll_cancelled) {
+        return finalResult;
+      }
+      if (Number(finalResult?.workflow_id) === Number(workflowId)) {
+        setAtsResult(finalResult);
+        setPreviousAtsResult(null);
+      }
     }
+    setActiveAtsWorkflowId(finalResult?.workflow_id ?? workflowId ?? null);
+    activeAtsWorkflowIdRef.current = finalResult?.workflow_id != null
+      ? Number(finalResult.workflow_id)
+      : (workflowId != null ? Number(workflowId) : null);
     if (finalResult.workflow_status === "COMPLETED") {
       const method = finalResult.generation_metadata?.generation_method
         || finalResult.generation_method
         || (finalResult.fallback_used ? "deterministic_fallback" : "llm");
       const label = finalResult.fallback_used || method === "deterministic_fallback"
         ? "Generation: Deterministic fallback"
-        : `AI Generation: ${(finalResult.generation_metadata?.llm_service || finalResult.llm_service || "LLM")} · ${finalResult.llm_model || finalResult.generation_metadata?.llm_model || ""}`.trim();
+        : `AI Optimized · ${finalResult.llm_model || finalResult.generation_metadata?.llm_model || "LLM"}`.trim();
       tell("ats", `Original ${finalResult.original_match_percentage}% → Optimized ${finalResult.optimized_match_percentage}% (+${finalResult.score_improvement}). ${label}`);
       const [opt, matchList] = await Promise.all([
         api.getOptimizedResumes(userId).catch(() => ({ optimized_resumes: [] })),
@@ -273,6 +404,7 @@ export function AppProvider({ children }) {
     if (!workflowId) throw new Error("No workflow to retry.");
     clearMessage("ats");
     tell("ats", "Retrying ATS workflow…");
+    cancelAtsPolling();
     // Reload current evidence/readiness before retry so stale INCOMPLETE is not restored.
     const jobId = atsSelectedJobId;
     if (jobId) {
@@ -288,14 +420,14 @@ export function AppProvider({ children }) {
       }
     }
     const started = await api.retryAtsWorkflow(workflowId);
+    const poll = beginAtsPoll(started.workflow_id);
     const d = await api.pollAtsWorkflow(started.workflow_id, {
-      onProgress: (status) => {
-        setAtsResult(status);
-        tell("ats", statusLabel(status.workflow_status));
-      },
+      onProgress: poll.onProgress,
+      isCancelled: poll.isCancelled,
       intervalMs: started.poll_interval_ms,
       timeoutSeconds: started.poll_timeout_seconds,
     });
+    if (poll.isCancelled() || d?.poll_cancelled) return d;
     setAtsResult(d);
     if (d.workflow_status === "COMPLETED") {
       tell(
@@ -310,8 +442,14 @@ export function AppProvider({ children }) {
   const loadAtsResultForJob = (jobId) => task("ats", async () => {
     const id = jobId || atsSelectedJobId;
     if (!id) return null;
+    if (atsGeneratingLockRef.current || activeAtsWorkflowIdRef.current) {
+      return atsResult;
+    }
     try {
       const d = await api.getAtsResultByJob(userId, id);
+      if (atsGeneratingLockRef.current || activeAtsWorkflowIdRef.current) {
+        return atsResult;
+      }
       setAtsResult(d);
       const status = String(d.workflow_status || "");
       // Do not stamp Step 2 Analyze Requirements with a historical generation failure.
@@ -459,18 +597,75 @@ export function AppProvider({ children }) {
   });
   const loadMatches = () => task("matches",async()=>{ const d=await api.getMatches(userId); setMatches(Array.isArray(d)?d:d.matches||[]); tell("matches","Matches loaded."); });
   const calculateMatches = () => task("matches",async()=>{ const d=await api.calculateMatches(userId); tell("matches",d.message||"Matches calculated."); const list=await api.getMatches(userId); setMatches(Array.isArray(list)?list:list.matches||[]); });
-  const loadEmailLogs = () => task("emails",async()=>{ const d=await api.getEmailLogs(userId); setEmailLogs(Array.isArray(d)?d:d.email_logs||[]); tell("emails","Email logs loaded."); });
-  const generateEmailSummary = () => task("emails",async()=>{ const d=await api.generateEmailSummary(userId); tell("emails",d.message||"Email summary generated."); const list=await api.getEmailLogs(userId); setEmailLogs(Array.isArray(list)?list:list.email_logs||[]); });
+  const loadEmailLogs = () => task("emails",async()=>{ const d=await api.getEmailLogs(userId); setEmailLogs(Array.isArray(d)?d:d.logs||[]); tell("emails","Email logs loaded."); });
+  const generateEmailSummary = () => task("emails",async()=>{ const d=await api.generateEmailSummary(userId); tell("emails",d.message||"Email summary generated."); const list=await api.getEmailLogs(userId); setEmailLogs(Array.isArray(list)?list:list.logs||[]); });
+  const loadEmailSummaryPreferences = () => task("email-settings", async () => {
+    const data = await api.getEmailSummaryPreferences(userId);
+    setEmailSummaryPreferences({ ...emptyEmailSummaryPreferences, ...data, daily_summary_recipient: data.daily_summary_recipient || "" });
+    return data;
+  });
+  const saveEmailSummaryPreferences = (values) => task("email-settings", async () => {
+    const data = await api.updateEmailSummaryPreferences(userId, values);
+    setEmailSummaryPreferences({ ...emptyEmailSummaryPreferences, ...data, daily_summary_recipient: data.daily_summary_recipient || "" });
+    tell("email-settings", "Email Summary settings saved.");
+    return data;
+  });
   const runWorkflow = () => task("workflow",async()=>{ if(!preferencesSaved) throw new Error("Save your preferences before running the workflow."); const d=await api.runFullWorkflow(userId); setWorkflowResult(d); tell("workflow",d.message||"Workflow completed."); await Promise.all([loadJobs(),loadOptimizedResumes(),loadMatches(),loadEmailLogs()]); });
+
+  // Dashboard progress tracker fix: every one of these loaders already
+  // exists and is normally triggered by its own owning page's manual
+  // "Load"/mount action (Preferences, Resume, Job Search, Selected Jobs,
+  // ATS Optimizer, Workflow). Dashboard previously read this same context
+  // state but never fetched anything itself, so it only ever looked correct
+  // once the user happened to visit (or the workflow happened to bulk-load)
+  // each of those pages first. This reuses the exact same loaders — no new
+  // API calls, no new business logic — so Dashboard can hydrate itself
+  // independently on mount/login/refresh. Each loader already swallows its
+  // own error via task()/verifyLatestResume's own try/catch, so one failing
+  // source (e.g. no preferences saved yet) never blocks the others.
+  const refreshUserWorkspaceState = async () => {
+    if (!userId) return;
+    await Promise.all([
+      loadPreferences(),
+      verifyLatestResume(),
+      loadJobs(),
+      loadSelectedJobs(),
+      loadOptimizedResumes(),
+      loadMatches(),
+      loadEmailLogs(),
+    ]);
+  };
+
+  // Email Summary — Gmail connection, application tracking, recruiter drafts
+  const loadGmailStatus = () => task("gmail",async()=>{ const d=await api.getGmailStatus(userId); setGmailStatus(d); });
+  const connectGmailAccount = () => task("gmail",async()=>{ const d=await api.connectGmail(userId); if(d.authorization_url) window.location.href=d.authorization_url; });
+  const disconnectGmailAccount = () => task("gmail",async()=>{ await api.disconnectGmail(userId); tell("gmail","Gmail disconnected."); await loadGmailStatus(); });
+  const scanGmailForJobs = () => task("gmail",async()=>{ const d=await api.scanJobEmails(userId); tell("gmail",`Scan complete — checked ${d.messages_checked||0} message(s).`); await Promise.all([loadGmailStatus(),loadApplications(),loadJobEmailEvents()]); });
+  const loadApplications = () => task("applications",async()=>{ const d=await api.getApplications(userId); setApplications(Array.isArray(d.applications)?d.applications:[]); });
+  const updateApplicationStatusAction = (applicationId,newStatus) => task("applications",async()=>{ await api.updateApplicationStatus(userId,applicationId,newStatus); tell("applications","Status updated."); await loadApplications(); });
+  const loadJobEmailEvents = () => task("applications",async()=>{ const d=await api.getJobEmailEvents(userId); setJobEmailEvents(Array.isArray(d.events)?d.events:[]); });
+  const resolveJobEmailEventAction = (eventId,action,jobId) => task("applications",async()=>{ await api.resolveJobEmailEvent(userId,eventId,action,jobId); tell("applications","Update resolved."); await Promise.all([loadJobEmailEvents(),loadApplications()]); });
+  // CareerBoost-local only (Gmail stays read-only) — update the one changed
+  // event in place from the response rather than refetching the whole list.
+  const markJobEmailEventReadAction = (eventId) => task("email-events",async()=>{
+    const updated = await api.markJobEmailEventRead(userId,eventId);
+    setJobEmailEvents((old)=>old.map((event)=>(event.id===updated.id?updated:event)));
+  });
+  const toggleJobEmailEventStarAction = (eventId) => task("email-events",async()=>{
+    const updated = await api.toggleJobEmailEventStar(userId,eventId);
+    setJobEmailEvents((old)=>old.map((event)=>(event.id===updated.id?updated:event)));
+  });
   const averageMatch = matches.length ? Math.round(matches.reduce((s,m)=>s+Number(m.match_percentage||0),0)/matches.length) : 0;
   const value = useMemo(()=>({
     currentUser,backendStatus,preferences,preferencesSaved,latestResume,selectedResumeFile,jobs,selectedJobs,selectedJobForm,selectedJobImportReady,selectedJobImportStatus,
-    optimizedResumes,matches,atsResult,atsSelectedJobId,requirementAnalysis,missingSkillsGroups,confirmedSkills,emailLogs,workflowResult,messages,busy,deletingJobId,averageMatch,
+    optimizedResumes,matches,atsResult,activeAtsWorkflowId,previousAtsResult,atsSelectedJobId,requirementAnalysis,missingSkillsGroups,confirmedSkills,emailLogs,workflowResult,messages,busy,deletingJobId,averageMatch,
+    gmailStatus,applications,jobEmailEvents,
     authenticate,clearAuthMessages,requestPasswordReset,submitPasswordReset,logout,changePreferences,savePreferences,loadPreferences,setSelectedResumeFile,uploadResume,loadLatestResume,loadJobs,search,
     changeSelectedJob,previewSelectedJobUrl,clearSelectedJob,saveSelectedJob,loadSelectedJobs,removeSelectedJob,verifyLatestResume,optimizeResume,loadOptimizedResumes,analyzeAndOptimize,retryAtsWorkflow,loadAtsResultForJob,setAtsSelectedJobId,setAtsResult,
     loadJobRequirements,loadMissingSkills,loadSkillConfirmations,saveConfirmedSkills,deleteConfirmedSkill,setMissingSkillsGroups,
-    calculateMatches,loadMatches,generateEmailSummary,loadEmailLogs,runWorkflow
-  }),[currentUser,backendStatus,preferences,preferencesSaved,latestResume,selectedResumeFile,jobs,selectedJobs,selectedJobForm,selectedJobImportReady,selectedJobImportStatus,optimizedResumes,matches,atsResult,atsSelectedJobId,requirementAnalysis,missingSkillsGroups,confirmedSkills,emailLogs,workflowResult,messages,busy,deletingJobId,averageMatch]);
+    calculateMatches,loadMatches,generateEmailSummary,loadEmailLogs,runWorkflow,refreshUserWorkspaceState,emailSummaryPreferences,loadEmailSummaryPreferences,saveEmailSummaryPreferences,
+    loadGmailStatus,connectGmailAccount,disconnectGmailAccount,scanGmailForJobs,loadApplications,updateApplicationStatusAction,loadJobEmailEvents,resolveJobEmailEventAction,markJobEmailEventReadAction,toggleJobEmailEventStarAction
+  }),[currentUser,backendStatus,preferences,preferencesSaved,latestResume,selectedResumeFile,jobs,selectedJobs,selectedJobForm,selectedJobImportReady,selectedJobImportStatus,optimizedResumes,matches,atsResult,activeAtsWorkflowId,previousAtsResult,atsSelectedJobId,requirementAnalysis,missingSkillsGroups,confirmedSkills,emailLogs,workflowResult,messages,busy,deletingJobId,averageMatch,gmailStatus,applications,jobEmailEvents,emailSummaryPreferences]);
   return <AppContext.Provider value={value}>{children}</AppContext.Provider>;
 }
 export const useApp = () => useContext(AppContext);

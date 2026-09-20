@@ -92,6 +92,18 @@ def test_start_or_get_workflow_reuses_completed_when_hash_unchanged(db_session, 
     assert reused.id == workflow.id
 
 
+def test_start_or_get_workflow_force_reuses_fresh_in_flight(db_session, test_user, test_resume, java_job):
+    """force=True must not start a second concurrent Ollama generation."""
+    first = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+    first.workflow_status = "GENERATING_RESUME"
+    db_session.add(first)
+    db_session.commit()
+
+    second = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id, force=True)
+    assert second.id == first.id
+    assert second.workflow_status == "GENERATING_RESUME"
+
+
 def test_start_or_get_workflow_force_starts_new_run_even_if_completed(db_session, test_user, test_resume, java_job):
     workflow = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
     execute_workflow(db_session, workflow.id)
@@ -124,12 +136,59 @@ def test_start_or_get_workflow_replaces_stale_generating_status(db_session, test
 
     stuck = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
     stuck.workflow_status = "GENERATING_RESUME"
-    stuck.updated_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+    stale_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+    stuck.updated_at = stale_time
+    stuck.last_activity_at = stale_time
     db_session.add(stuck)
     db_session.commit()
 
     fresh = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
     assert fresh.id != stuck.id
+    assert fresh.workflow_status == "PENDING"
+    db_session.refresh(stuck)
+    assert stuck.workflow_status == "FAILED"
+
+
+def test_start_or_get_workflow_force_replaces_stale_in_flight(db_session, test_user, test_resume, java_job):
+    from datetime import datetime, timedelta, timezone
+
+    stuck = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+    stuck.workflow_status = "GENERATING_RESUME"
+    stale_time = datetime.now(timezone.utc) - timedelta(minutes=10)
+    stuck.updated_at = stale_time
+    stuck.last_activity_at = stale_time
+    db_session.add(stuck)
+    db_session.commit()
+
+    fresh = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id, force=True)
+    assert fresh.id != stuck.id
+    assert fresh.workflow_status == "PENDING"
+
+
+def test_recover_orphaned_workflows_marks_running_as_failed(db_session, test_user, test_resume, java_job):
+    from app.services.ats_optimization_workflow_service import recover_orphaned_workflows
+
+    workflow = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+    workflow.workflow_status = "GENERATING_RESUME"
+    db_session.add(workflow)
+    db_session.commit()
+
+    count = recover_orphaned_workflows(db_session)
+    assert count == 1
+    db_session.refresh(workflow)
+    assert workflow.workflow_status == "FAILED"
+    assert "restart" in (workflow.error_message or "").lower()
+
+
+def test_start_or_get_workflow_force_fresh_after_failed(db_session, test_user, test_resume, java_job):
+    failed = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+    failed.workflow_status = "FAILED"
+    failed.error_message = "prior failure"
+    db_session.add(failed)
+    db_session.commit()
+
+    fresh = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id, force=True)
+    assert fresh.id != failed.id
     assert fresh.workflow_status == "PENDING"
 
 
@@ -168,6 +227,64 @@ def test_execute_workflow_happy_path_completes(db_session, test_user, test_resum
     match_rows = db_session.query(MatchScore).filter(MatchScore.user_id == test_user.id).all()
     versions = {row.resume_version for row in match_rows}
     assert versions == {"original", "optimized"}
+
+
+# CURRENT VERIFIED BUG fix: the original (resume-as-uploaded) match score
+# used to only reach the MatchScore table alongside the optimized score, at
+# the very end of a successful run — every other exit from execute_workflow
+# (ineligible for optimization, a later-stage failure, validation failure)
+# returned before ever reaching that point, silently discarding an already
+# correctly-computed original score. Confirmed live against real data: many
+# saved jobs with a real, complete job description and a real computed
+# score sitting on the workflow row had zero MatchScore rows, so Selected
+# Jobs showed no Resume Match at all for them.
+def test_execute_workflow_persists_original_match_score_even_when_ineligible_for_optimization(db_session, test_user, test_resume, java_job):
+    with patch.object(
+        workflow_service, "role_aware_optimization_eligibility",
+        return_value={"optimization_allowed": False, "eligibility_status": "INELIGIBLE_LOW_SCORE", "eligibility_reason": "Score below threshold", "eligibility_tier": "LOW"},
+    ):
+        workflow = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+        result = execute_workflow(db_session, workflow.id)
+
+    assert result.workflow_status == "INELIGIBLE_LOW_SCORE"
+    assert result.original_match_score is not None
+    assert result.optimized_resume_id is None  # optimization genuinely never ran
+
+    original_row = (
+        db_session.query(MatchScore)
+        .filter(MatchScore.user_id == test_user.id, MatchScore.job_id == java_job.id, MatchScore.resume_version == "original")
+        .first()
+    )
+    assert original_row is not None
+    assert original_row.match_percentage == result.original_match_score
+
+    # No fabricated "optimized" row — an optimized resume genuinely doesn't exist.
+    optimized_row = (
+        db_session.query(MatchScore)
+        .filter(MatchScore.user_id == test_user.id, MatchScore.job_id == java_job.id, MatchScore.resume_version == "optimized")
+        .first()
+    )
+    assert optimized_row is None
+
+
+def test_execute_workflow_persists_original_match_score_even_when_generation_fails_later(db_session, test_user, test_resume, java_job):
+    """A later-stage failure (resume generation/injection/validation) must
+    not erase the original score that was already correctly computed and
+    committed earlier in the same run."""
+    with patch("app.services.ats_optimization_workflow_service.plan_keyword_injection", side_effect=RuntimeError("boom")):
+        workflow = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+        result = execute_workflow(db_session, workflow.id)
+
+    assert result.workflow_status == "FAILED"
+    assert result.original_match_score is not None
+
+    original_row = (
+        db_session.query(MatchScore)
+        .filter(MatchScore.user_id == test_user.id, MatchScore.job_id == java_job.id, MatchScore.resume_version == "original")
+        .first()
+    )
+    assert original_row is not None
+    assert original_row.match_percentage == result.original_match_score
 
 
 def test_execute_workflow_missing_workflow_raises_404(db_session):
@@ -253,6 +370,56 @@ def test_execute_workflow_marks_no_meaningful_change_when_content_identical(
     assert result.workflow_status == "COMPLETED"
     assert result.optimization_status == "NO_MEANINGFUL_CHANGE"
     assert result.content_changed is False
+
+
+def test_execute_workflow_transient_llm_failure_does_not_poison_later_passes(
+    db_session, test_user, test_resume, java_job
+):
+    """A single timeout/connection failure on pass 1 must not force pass 2 to
+    skip the LLM entirely — only a genuinely permanent reason (bad model/
+    provider config) should do that. Regression test for a bug where every
+    subsequent optimization pass in the same workflow run silently gave up
+    on the LLM after one transient network blip."""
+    timed_out_pass = {
+        "plain_text": test_resume.parsed_text,
+        "sections": [],
+        "generation_mode": "deterministic",
+        "generation_warnings": [],
+        "llm_provider": "openai",
+        "llm_model": "gpt-5-mini",
+        "prompt_version": "ats-optimizer-v1",
+        "fallback_used": True,
+        "fallback_reason": "timeout",
+        "generation_method": "deterministic_fallback",
+    }
+    recovered_pass = {
+        "plain_text": test_resume.parsed_text + "\nDelivered Java Spring Boot REST APIs with improved reliability.",
+        "sections": [],
+        "generation_mode": "llm",
+        "generation_warnings": [],
+        "llm_provider": "openai",
+        "llm_model": "gpt-5-mini",
+        "prompt_version": "ats-optimizer-v1",
+        "fallback_used": False,
+        "fallback_reason": None,
+        "generation_method": "llm",
+    }
+    passing_validation = {
+        "status": "passed", "warnings": [], "errors": [],
+        "protectedFieldsVerified": True, "structurePreserved": True,
+    }
+    workflow = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+    with patch.object(
+        workflow_service, "generate_with_llm_or_fallback",
+        side_effect=[timed_out_pass, recovered_pass],
+    ) as mock_gen, patch.object(workflow_service, "validate_final_resume", return_value=passing_validation):
+        execute_workflow(db_session, workflow.id)
+
+    assert mock_gen.call_count == 2
+    first_call_skip_llm = mock_gen.call_args_list[0].kwargs.get("skip_llm")
+    second_call_skip_llm = mock_gen.call_args_list[1].kwargs.get("skip_llm")
+    assert first_call_skip_llm is False
+    assert second_call_skip_llm is False  # not poisoned by pass 1's transient timeout
 
 
 def test_execute_workflow_original_score_never_uses_confirmed_evidence(
