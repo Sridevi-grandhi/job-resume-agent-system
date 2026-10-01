@@ -24,6 +24,7 @@ import copy
 import logging
 import re
 import shutil
+from collections import Counter
 from pathlib import Path
 from uuid import uuid4
 
@@ -47,9 +48,10 @@ OUTPUT_DIR = Path(__file__).resolve().parents[1] / "uploads" / "optimized"
 
 _HEADING_RE = re.compile(
     r"(?i)^(professional\s+summary|summary|profile|objective|technical\s+skills|"
-    r"skills|technologies|competencies|professional\s+experience|experience|"
-    r"employment|work\s+history|projects?|education|certifications?|"
-    r"tools)$"
+    r"key\s+skills|core\s+competenc(?:y|ies)|skills(?:\s+(?:&|and)\s+(?:abilities|expertise))?|"
+    r"skills|technologies|competencies|tools\s*(?:&|and)\s*technologies|"
+    r"professional\s+experience|experience|"
+    r"employment|work\s+history|projects?|education|certifications?)$"
 )
 # "environment" deliberately excluded — a standalone "Environment:" label is
 # per-project experience metadata (see METADATA_LABEL_RE), never a
@@ -99,7 +101,7 @@ def _section_kind(heading: str) -> str:
     h = (heading or "").strip().lower().rstrip(":")
     if re.search(r"summary|profile|objective", h):
         return "summary"
-    if re.search(r"skill|technolog|competenc|tools?", h):
+    if re.search(r"skill|technolog|competenc|tools\s*(?:&|and)\s*technolog", h):
         return "skills"
     if re.search(r"experience|employment|work\s+history|career", h):
         return "experience"
@@ -501,6 +503,117 @@ def _flush_leftover_bullets(state: "_RunState", per_kind_bullets: dict[str, list
         state.last_bullet_paragraph = anchor
 
 
+def _top_up_missing_sections(document, optimized_text: str, rendered_text: str) -> None:
+    """Safety net for a template so different from optimized_text that the
+    main overlay loop above couldn't place most of it — e.g. a template
+    genuinely missing a whole section. Deliberately NOT a "dump the entire
+    optimized_text" fallback: it only ever adds a section whose heading
+    does not already exist ANYWHERE in the document (paragraphs or
+    tables — see seen_headings), so an already-rendered section (heading,
+    and for skills its table) can never be duplicated. The contact block is
+    structurally unreachable from here: parse_resume_structure's "contact"
+    field is separate from its "sections" list, and only "sections" is
+    read below.
+    """
+    seen_headings = {
+        _section_kind(p.text.strip())
+        for p in _body_paragraphs(document)
+        if _looks_like_heading((p.text or "").strip())
+    }
+    existing = {
+        _BULLET_MARKER_RE.sub("", line).strip()
+        for line in rendered_text.splitlines() if line.strip()
+    }
+    parsed = parse_resume_structure(optimized_text)
+    for section in parsed.get("sections") or []:
+        heading = (section.get("heading") or "").strip()
+        if not heading:
+            continue
+        kind = _section_kind(heading)
+        if kind in seen_headings:
+            continue
+        content_lines = _content_lines((section.get("content") or "").strip())
+        if not content_lines:
+            continue
+        document.add_paragraph(heading)
+        for line in content_lines:
+            normalized = _BULLET_MARKER_RE.sub("", line).strip()
+            if normalized and normalized not in existing:
+                document.add_paragraph(normalized)
+                existing.add(normalized)
+        seen_headings.add(kind)
+
+
+def _collapse_duplicate_top_level_headings(document) -> None:
+    """Keep the first Professional Summary / Technical Skills / Experience heading.
+
+    Extra body headings of the same kind (including a generated 'Technical Skills'
+    line that survived overlay) are dropped. Table category labels are ignored
+    because they are not top-level sections.
+    """
+    seen: set[str] = set()
+    for paragraph in list(document.paragraphs):
+        if _paragraph_in_table(paragraph):
+            continue
+        text = (paragraph.text or "").strip()
+        if not _looks_like_heading(text):
+            continue
+        kind = _section_kind(text)
+        if kind not in {"summary", "skills", "experience"}:
+            continue
+        if kind in seen:
+            _remove_paragraph(paragraph)
+            continue
+        seen.add(kind)
+
+
+def validate_rendered_structure(
+    document, optimized_text: str = "", original_employer_names: list[str] | None = None,
+) -> dict:
+    """Post-render structural check — never raises, never blocks a save
+    (called for logging only from render_optimized_document). Counts
+    top-level section headings in the document body only (table cells such
+    as skill categories are not headings) and contact-line occurrences,
+    purely structurally — no hardcoded name/email/keyword — so a regression
+    that re-introduces duplicate content is caught by count. Tests that want
+    a hard failure should assert directly on the returned counts.
+
+    `original_employer_names`, when given, additionally checks that every
+    one of the original resume's employer names still appears somewhere in
+    the rendered body — purely additive (default None leaves every
+    existing call site/test unaffected)."""
+    # Top-level section headings live in the document body only. Table cells
+    # such as category labels ("Tools", "Databases") are child content of the
+    # existing Technical Skills section — never additional Skills headings.
+    body = [p for p in document.paragraphs if not _paragraph_in_table(p)]
+    body_texts = [(p.text or "").strip() for p in body]
+    heading_counts = Counter(
+        _section_kind(text) for text in body_texts if _looks_like_heading(text)
+    )
+    duplicate_section_kinds = sorted(kind for kind, count in heading_counts.items() if count > 1)
+
+    contact_block_count = 1
+    if optimized_text:
+        contact_text = (parse_resume_structure(optimized_text).get("contact") or "").strip()
+        contact_lines = [line.strip() for line in contact_text.splitlines() if line.strip()]
+        if contact_lines:
+            contact_block_count = max(body_texts.count(line) for line in contact_lines)
+
+    result = {
+        "heading_counts": dict(heading_counts),
+        "duplicate_section_kinds": duplicate_section_kinds,
+        "contact_block_count": contact_block_count,
+    }
+    if original_employer_names is not None:
+        full_text = "\n".join(body_texts)
+        found = [name for name in original_employer_names if name and name in full_text]
+        result["employer_count_expected"] = len(original_employer_names)
+        result["employer_count_found"] = len(found)
+        result["missing_employers"] = [name for name in original_employer_names if name not in found]
+
+    return result
+
+
 def render_optimized_document(
     source_path: str,
     file_type: str,
@@ -614,6 +727,12 @@ def render_optimized_document(
             if cursor < len(lines):
                 replacement = lines[cursor]
                 cursors[current_kind] = cursor + 1
+                # Generated content may accidentally repeat a section heading
+                # as a body line. Never write that into a content slot — it
+                # would create a second top-level Skills/Summary heading.
+                heading_candidate = _BULLET_MARKER_RE.sub("", replacement).strip()
+                if _looks_like_heading(heading_candidate):
+                    continue
                 _replace_preserving_runs(paragraph, replacement)
             elif current_kind == "skills":
                 _remove_paragraph(paragraph)
@@ -635,15 +754,17 @@ def render_optimized_document(
         # to one — Part 10/11's "large empty gap" fix.
         _collapse_excess_blank_paragraphs(document)
 
-        rendered_text = "\n".join(p.text for p in document.paragraphs if (p.text or "").strip())
+        # Table-aware: a categorized skills table (or any other table-based
+        # content) must count as "already rendered" — see _body_paragraphs.
+        rendered_text = "\n".join(p.text for p in _body_paragraphs(document) if (p.text or "").strip())
         if len(rendered_text.strip()) < max(80, len(optimized_text.strip()) // 3):
-            existing = set(rendered_text.splitlines())
-            for line in _content_lines(optimized_text):
-                if _looks_like_heading(line):
-                    document.add_paragraph(line)
-                elif line not in existing:
-                    document.add_paragraph(re.sub(r"^[-•*]\s+", "", line))
-                    existing.add(line)
+            _top_up_missing_sections(document, optimized_text, rendered_text)
+
+        _collapse_duplicate_top_level_headings(document)
+
+        structure_report = validate_rendered_structure(document, optimized_text)
+        if structure_report["duplicate_section_kinds"] or structure_report["contact_block_count"] > 1:
+            logger.warning("TEMPLATE_DOCX_STRUCTURE_ISSUE report=%s", structure_report)
 
         document.save(destination)
         logger.info(

@@ -41,17 +41,19 @@ export default function ResumeAtsPanel({
     }
     return "—";
   };
-  // Prefer live score gaps; fall back to workflow Remaining Gaps (same backend scorer).
+  // Workflow remaining_gaps is the display list (unsupported JD terms absent
+  // from the generated resume). Live editor scores keep the same engine
+  // numbers but may omit display-only gaps such as unsupported methodologies.
   const missingMandatory = (
-    (score?.remaining_gaps?.unsupported?.length ? score.remaining_gaps.unsupported : null)
+    (gapsUnsupported?.length ? gapsUnsupported : null)
+    || (score?.remaining_gaps?.unsupported?.length ? score.remaining_gaps.unsupported : null)
     || (mandatory.missing?.length ? mandatory.missing : null)
-    || gapsUnsupported
     || []
   );
   const missingPreferred = (
-    (score?.remaining_gaps?.preferred_gaps?.length ? score.remaining_gaps.preferred_gaps : null)
+    (gapsPreferred?.length ? gapsPreferred : null)
+    || (score?.remaining_gaps?.preferred_gaps?.length ? score.remaining_gaps.preferred_gaps : null)
     || (preferred.missing?.length ? preferred.missing : null)
-    || gapsPreferred
     || []
   );
   const confirmedUsed = (

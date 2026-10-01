@@ -141,9 +141,13 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: careerboost_draft_worker
-    # Same image as backend, different process (Phase 8: scales
-    # independently — run `docker compose up --scale draft_worker=3` for
-    # more workers without touching backend or RecruiterDraftService).
+    # Recruiter Drafts were removed (Gmail is readonly). The worker module
+    # no longer exists, so this service is profile-gated and must not start
+    # with the default stack. Start explicitly with:
+    #   docker compose --profile unused-recruiter-drafts up draft_worker
+    # only if that worker is restored.
+    profiles:
+      - unused-recruiter-drafts
     command: ["python", "-m", "app.worker.draft_worker"]
     env_file:
       - path: ./backend/.env

@@ -8,8 +8,10 @@ import MetricCard from "../components/MetricCard";
 import DiscoveredJobCard from "../components/DiscoveredJobCard";
 import JobDetailsDrawer from "../components/JobDetailsDrawer";
 import { getDiscoveredJobs, refreshDiscoveredJobs, saveDiscoveredJob } from "../api";
+import { ATS_ENTRY_MODE, writeFreshSelectedJobIntent } from "../utils/atsWizardState";
 
 const WORK_MODES = ["Remote", "Hybrid", "Onsite"];
+const EMPLOYMENT_TYPES = ["Full-time", "Part-time", "Contract", "Internship", "Freelance"];
 const SORTS = [
   ["best_match", "Best Match"],
   ["newest_detected", "Newest Detected"],
@@ -32,7 +34,7 @@ function formatLastUpdated(iso) {
 }
 
 export default function UpdatedJobSearchPage() {
-  const { currentUser, setAtsSelectedJobId } = useApp();
+  const { currentUser, startAtsForSelectedJob } = useApp();
   const navigate = useNavigate();
   const userId = currentUser?.user_id;
 
@@ -42,6 +44,8 @@ export default function UpdatedJobSearchPage() {
   const [summary, setSummary] = useState(null);
   const [sources, setSources] = useState([]);
   const [hasResume, setHasResume] = useState(true);
+  const [hasPreferences, setHasPreferences] = useState(false);
+  const [preferenceSummary, setPreferenceSummary] = useState(null);
   const [loading, setLoading] = useState(false);
   const [loadingMessage, setLoadingMessage] = useState("Checking job sources…");
   const [refreshing, setRefreshing] = useState(false);
@@ -66,6 +70,8 @@ export default function UpdatedJobSearchPage() {
       setSummary(data.summary || null);
       setSources(Array.isArray(data.sources) ? data.sources : []);
       setHasResume(Boolean(data.has_resume));
+      setHasPreferences(Boolean(data.has_preferences));
+      setPreferenceSummary(data.preference_summary || null);
     } catch (err) {
       setError(err?.message || "Unable to refresh some job sources. Previously discovered jobs are still available.");
     } finally {
@@ -144,13 +150,14 @@ export default function UpdatedJobSearchPage() {
     if (!userId) return;
     setSavingId(job.discovered_job_id);
     try {
-      const result = await saveDiscoveredJob(userId, job.discovered_job_id);
+      const result = await saveDiscoveredJob(userId, job.discovered_job_id, { startWorkflow: false });
       setSavedIds((current) => new Set(current).add(job.discovered_job_id));
       const jobId = result.job_id;
-      setAtsSelectedJobId(String(jobId));
+      startAtsForSelectedJob(jobId);
       sessionStorage.setItem("atsSelectedJobId", String(jobId));
+      writeFreshSelectedJobIntent(userId, jobId);
       navigate(`/optimizer/${jobId}`, {
-        state: { job_id: Number(jobId), title: job.title, company: job.company, job_url: job.direct_url, source: "User Selected Job" },
+        state: { job_id: Number(jobId), title: job.title, company: job.company, job_url: job.direct_url, source: "User Selected Job", atsEntryMode: ATS_ENTRY_MODE.START_SELECTED_JOB },
       });
     } catch (err) {
       setError(err?.message || "Could not open the ATS Optimizer for this job right now.");
@@ -189,7 +196,7 @@ export default function UpdatedJobSearchPage() {
   return (
     <Page
       title="Updated Job Search"
-      subtitle="Near-real-time job discovery from your configured career sources, matched against your resume."
+      subtitle="Browse current openings that match your saved job preference, then save, review, optimize, or apply."
       actions={
         <button className="button primary" onClick={handleRefresh} disabled={refreshing}>
           {refreshing ? "Refreshing…" : "Refresh Jobs"}
@@ -205,6 +212,19 @@ export default function UpdatedJobSearchPage() {
           Upload a resume to calculate personalized match scores. <Link to="/resume">Go to Resume</Link>
         </Notice>
       )}
+      {initialized && !hasPreferences && (
+        <Notice tone="warning">
+          Save a job title preference to focus this feed on your target role. <Link to="/preferences">Go to Preferences</Link>
+        </Notice>
+      )}
+      {preferenceSummary?.job_title && (
+        <p className="uj-preference-context">
+          Showing roles matching <b>{preferenceSummary.job_title}</b>
+          {preferenceSummary.location ? ` · ${preferenceSummary.location}` : ""}
+          {preferenceSummary.work_mode ? ` · ${preferenceSummary.work_mode}` : ""}
+          {preferenceSummary.job_type ? ` · ${preferenceSummary.job_type}` : ""}
+        </p>
+      )}
       <Notice tone="error">{error}</Notice>
       <Notice tone="warning">{notice}</Notice>
 
@@ -212,7 +232,7 @@ export default function UpdatedJobSearchPage() {
         <input
           className="uj-search-input"
           type="search"
-          placeholder="Search title, company, skill, or keyword"
+          placeholder="Search by title, company, or keyword"
           value={filters.search}
           onChange={changeFilter("search")}
         />
@@ -233,7 +253,10 @@ export default function UpdatedJobSearchPage() {
           <option value="24h">Last 24 hours</option>
           <option value="7d">Last 7 days</option>
         </select>
-        <input placeholder="Employment type" value={filters.employment_type} onChange={changeFilter("employment_type")} />
+        <select value={filters.employment_type} onChange={changeFilter("employment_type")}>
+          <option value="">Any employment type</option>
+          {EMPLOYMENT_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}
+        </select>
         <select value={filters.min_score} onChange={changeFilter("min_score")}>
           <option value="">Any match score</option>
           <option value="60">60%+</option>
@@ -256,18 +279,18 @@ export default function UpdatedJobSearchPage() {
             <>
               <div className="results-head">
                 <h3>Top Job Matches</h3>
-                <p>Your strongest legitimate matches, ranked by resume fit</p>
+                <p>Strongest resume matches among jobs already relevant to your saved job preference</p>
               </div>
-              <div className="job-grid">{topMatches.map(renderCard)}</div>
+              <div className="job-grid uj-job-grid">{topMatches.map(renderCard)}</div>
             </>
           )}
           {remainingJobs.length > 0 && (
             <>
               <div className="results-head">
                 <h3>All Jobs <span>{jobs.length}</span></h3>
-                <p>Recently detected jobs from your configured career sources</p>
+                <p>Browse current openings for your saved preference</p>
               </div>
-              <div className="job-grid">{remainingJobs.map(renderCard)}</div>
+              <div className="job-grid uj-job-grid">{remainingJobs.map(renderCard)}</div>
             </>
           )}
         </>

@@ -76,6 +76,7 @@ TABLE_COLUMN_DDL = {
         # "provider" | "enrichment" | NULL — see DiscoveredJob model +
         # job_enrichment_service. Diagnostics only.
         "direct_url_source": "ALTER TABLE discovered_jobs ADD COLUMN direct_url_source VARCHAR(20)",
+        "unverified_application_url": "ALTER TABLE discovered_jobs ADD COLUMN unverified_application_url TEXT",
     },
     "optimized_resumes": {
         "generated_resume_text": "ALTER TABLE optimized_resumes ADD COLUMN generated_resume_text TEXT",

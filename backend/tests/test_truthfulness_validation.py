@@ -144,17 +144,33 @@ def test_rejected_cucumber_blocked(java_resume_text):
         )
 
 
-def test_invented_metric_blocked():
+def test_invented_metric_is_rewritten_not_rejected():
     original = "Jane Doe\nJava developer.\nBuilt Selenium automation for web applications."
-    with pytest.raises(GenerationValidationError, match="metrics"):
-        _validate_llm_result(
-            {
-                "generated_resume_plain_text": original + "\nIncreased test coverage by 45%.",
-                "factual_preservation_confirmed": True,
-            },
-            resume_text=original,
-            valid_evidence_ids={"E1"},
-        )
+    result = _validate_llm_result(
+        {
+            "generated_resume_plain_text": original + "\nImproved API performance by 40%.",
+            "factual_preservation_confirmed": True,
+        },
+        resume_text=original,
+        valid_evidence_ids={"E1"},
+        workflow_id=293,
+    )
+    plain = result["generated_resume_plain_text"]
+    assert "40%" not in plain
+    assert "Improved API performance" in plain
+
+
+def test_supported_metric_is_preserved():
+    original = "Jane Doe\nJava developer.\nReduced processing time by 40%."
+    result = _validate_llm_result(
+        {
+            "generated_resume_plain_text": original + "\nReduced processing time by 40% on batch jobs.",
+            "factual_preservation_confirmed": True,
+        },
+        resume_text=original,
+        valid_evidence_ids={"E1"},
+    )
+    assert "40%" in result["generated_resume_plain_text"]
 
 
 def test_invented_certification_blocked_by_final_validator(java_resume_text):
@@ -271,6 +287,47 @@ def test_scrum_participation_does_not_authorize_scrum_master_role():
         selected_technologies=[],
     )
     assert "Unsupported professional role introduced: Scrum Master" in result["errors"]
+
+
+def test_agile_scrum_compound_rewrites_to_supported_agile():
+    from app.services.resume_generator import apply_truthfulness_corrections
+
+    cleaned, removed = apply_truthfulness_corrections(
+        "Jane Doe\nWorked in Agile/Scrum teams to deliver Spring Boot microservices.",
+        original_text="Jane Doe\nWorked in Agile teams.",
+        unsupported_terms=["Scrum"],
+    )
+    assert "Scrum" not in cleaned
+    assert "Agile" in cleaned
+    assert "Spring Boot" in cleaned
+    assert "Scrum" in removed
+
+
+def test_scrum_master_role_is_stripped_by_safe_correction():
+    from app.services.resume_generator import apply_truthfulness_corrections
+
+    cleaned, removed = apply_truthfulness_corrections(
+        "Jane Doe\nServed as Scrum Master for Agile teams and sprint planning.",
+        original_text="Jane Doe\nWorked in Agile/Scrum teams and participated in sprint planning.",
+        unsupported_terms=["Scrum"],
+    )
+    assert "Scrum Master" not in cleaned
+    assert "Scrum Master" in removed
+
+
+def test_metric_and_methodology_are_corrected_together():
+    from app.services.resume_generator import apply_truthfulness_corrections
+
+    cleaned, removed = apply_truthfulness_corrections(
+        "Jane Doe\nImproved API performance by 40%. Worked in Agile/Scrum teams.",
+        original_text="Jane Doe\nImproved API performance. Worked in Agile teams.",
+        unsupported_terms=["Scrum"],
+    )
+    assert "40%" not in cleaned
+    assert "Scrum" not in cleaned
+    assert "Improved API performance" in cleaned
+    assert "Agile" in cleaned
+    assert "40%" in removed or "Scrum" in removed
 
 
 def test_valid_paraphrasing_does_not_false_reject(java_resume_text):

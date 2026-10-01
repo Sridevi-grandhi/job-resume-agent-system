@@ -130,13 +130,19 @@ export default function ResumeWorkspace({
   // while a debounced autosave is still mid-flight can await the SAME
   // request instead of racing ahead of it — see handleDownload.
   const pendingSaveRef = useRef(null);
+  const dirtyRef = useRef(false);
+  const lastSavedPlainRef = useRef("");
 
   useEffect(() => {
-    if (initialDocument) {
-      setDocument(initialDocument);
-      latestDoc.current = initialDocument;
-      setChangeMap(buildInitialChangeMap(initialDocument, improvementReport));
-    }
+    if (!initialDocument) return;
+    // A slow GET (editable resume scores on every fetch) must not replace
+    // in-progress typing or a newer autosave with an older generated snapshot.
+    if (dirtyRef.current) return;
+    const incoming = documentToPlainText(initialDocument);
+    if (lastSavedPlainRef.current && incoming !== lastSavedPlainRef.current) return;
+    setDocument(initialDocument);
+    latestDoc.current = initialDocument;
+    setChangeMap(buildInitialChangeMap(initialDocument, improvementReport));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialDocument, improvementReport]);
 
@@ -165,6 +171,7 @@ export default function ResumeWorkspace({
     latestDoc.current = next;
     setSaveStatus("unsaved");
     setScoreStale(true);
+    dirtyRef.current = true;
     if (autosaveTimer.current) clearTimeout(autosaveTimer.current);
     autosaveTimer.current = setTimeout(() => {
       persist(next, { silent: true, skipScore: true, action: "autosave" });
@@ -184,6 +191,8 @@ export default function ResumeWorkspace({
           skipScore,
         });
         setSaveStatus("saved");
+        dirtyRef.current = false;
+        lastSavedPlainRef.current = documentToPlainText(doc);
         if (saved?.edited_score != null && !skipScore) {
           setCurrentScore(saved.edited_score);
           setScoreStale(false);
@@ -227,7 +236,20 @@ export default function ResumeWorkspace({
       }
       await persist(latestDoc.current, { silent: true, skipScore: true, action: "pre-download-save" });
       const response = await fetch(url);
-      if (!response.ok) throw new Error(`download_failed_${response.status}`);
+      if (!response.ok) {
+        // Surface the backend's own reason (e.g. validation not passed, PDF
+        // converter unavailable, resume not found) instead of a generic note.
+        let detail = "";
+        try {
+          const body = await response.json();
+          detail = typeof body?.detail === "string" ? body.detail : (body?.detail?.message || "");
+        } catch {
+          detail = "";
+        }
+        const error = new Error(`download_failed_${response.status}`);
+        error.userMessage = detail;
+        throw error;
+      }
       const blob = await response.blob();
       const disposition = response.headers.get("Content-Disposition") || "";
       const match = /filename\*?=(?:UTF-8'')?"?([^";\n]+)"?/i.exec(disposition);
@@ -240,8 +262,12 @@ export default function ResumeWorkspace({
       link.click();
       link.remove();
       URL.revokeObjectURL(objectUrl);
-    } catch {
-      setDownloadError("Unable to prepare the resume download. Please try again.");
+    } catch (error) {
+      setDownloadError(
+        error?.userMessage
+          ? `Unable to prepare the resume download: ${error.userMessage}`
+          : "Unable to prepare the resume download. Please try again.",
+      );
     } finally {
       setDownloadingFormat(null);
     }
@@ -260,6 +286,7 @@ export default function ResumeWorkspace({
     latestDoc.current = previous;
     setSaveStatus("unsaved");
     setScoreStale(true);
+    dirtyRef.current = true;
   };
 
   const handleRedo = () => {
@@ -271,6 +298,7 @@ export default function ResumeWorkspace({
     latestDoc.current = next;
     setSaveStatus("unsaved");
     setScoreStale(true);
+    dirtyRef.current = true;
   };
 
   const recalculate = async () => {

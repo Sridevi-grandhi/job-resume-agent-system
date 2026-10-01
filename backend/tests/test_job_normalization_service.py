@@ -18,6 +18,7 @@ from app.services.job_normalization_service import (
     resolve_application_url,
     select_apply_urls_from_candidates,
 )
+from app.services import job_normalization_service as normalization
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +228,31 @@ def test_classify_employer_matched_from_company_name_alone_no_website():
     display name — still resolves to 'employer' generically."""
     result = classify_url_domain("https://careers.globex.com/job/9", employer_name="Globex")
     assert result == "employer"
+
+
+def test_confirmed_employer_domain_alias_is_explicit_positive_identity_evidence(monkeypatch):
+    """A reviewed brand-to-parent-domain relationship is allowed, without
+    teaching the normal matcher to guess unrelated corporate families."""
+    monkeypatch.setitem(
+        normalization._VERIFIED_EMPLOYER_DOMAIN_ALIASES,
+        "exampletalentbrand",
+        frozenset({"example-parent-careers.com"}),
+    )
+    assert classify_url_domain(
+        "https://jobs.example-parent-careers.com/job/48213/java-engineer",
+        employer_name="Example Talent Brand LLC",
+    ) == "employer"
+    assert normalization.verified_employer_domain_alias(
+        "https://jobs.example-parent-careers.com/job/48213/java-engineer",
+        "Example Talent Brand LLC",
+    ) == "example-parent-careers.com"
+
+
+def test_unconfirmed_or_arbitrary_app_domain_is_never_an_employer_alias():
+    assert classify_url_domain(
+        "https://hrmsportal.app/jobs/48213/java-engineer",
+        employer_name="Example Talent Brand LLC",
+    ) is None
 
 
 def test_classify_icims_hosted_url_is_ats():

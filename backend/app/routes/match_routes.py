@@ -9,6 +9,7 @@ from app.models.resume_model import Resume
 from app.models.job_model import Job
 from app.models.match_model import MatchScore
 from app.agents.matching_agent import calculate_match_score
+from app.services.canonical_resume_match import canonical_original_matches_for_user
 from app.services.job_eligibility import job_is_analyzable
 
 
@@ -124,13 +125,10 @@ def get_matches_for_user(
     user_id: int,
     db: Session = Depends(get_db)
 ):
-    matches = (
-        db.query(MatchScore, Job)
-        .join(Job, MatchScore.job_id == Job.id)
-        .filter(MatchScore.user_id == user_id)
-        .order_by(MatchScore.match_percentage.desc())
-        .all()
-    )
+    # Current original Resume Match only — same selection Selected Jobs uses
+    # (latest original MatchScore by id per job). Historical highs and ATS
+    # optimized rows must not appear as Dashboard Best Match / Top Job Matches.
+    matches = canonical_original_matches_for_user(db, user_id)
 
     return [
         {

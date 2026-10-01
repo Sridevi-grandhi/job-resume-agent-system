@@ -21,6 +21,8 @@ from app.job_sources.base import JobSourceAdapter, SourceHealth
 from app.job_sources.generic_feed import GenericCareerFeedAdapter
 from app.job_sources.greenhouse import GreenhouseAdapter
 from app.job_sources.jsearch import JSearchAdapter, api_key as jsearch_api_key
+from app.job_sources.adzuna import AdzunaAdapter
+from app.job_sources.apify_dice import ApifyDiceAdapter
 from app.job_sources.lever import LeverAdapter
 from app.job_sources.remotive import RemotiveAdapter
 from app.job_sources.workday import WorkdayAdapter
@@ -62,9 +64,11 @@ def provider_config_status() -> dict:
     """Safe, secret-free configuration/diagnostics summary — never includes
     the API key itself, only whether one is present."""
     from app.scheduler.updated_job_scheduler_service import poll_interval_minutes, tracker_enabled
+    from app.services.broad_search_enrichment_provider import broad_provider_api_key, broad_provider_name
 
     provider = primary_provider_name()
     configured = jsearch_configured() if provider == "jsearch" else False
+    enrichment_provider = broad_provider_name()
     return {
         "primary_provider": provider,
         "configured": configured,
@@ -72,6 +76,10 @@ def provider_config_status() -> dict:
         "poll_interval_minutes": poll_interval_minutes(),
         "demo_mode": demo_mode_enabled(),
         "remotive_enabled": remotive_enabled(),
+        "enrichment": {
+            "broad_provider": enrichment_provider,
+            "configured": enrichment_provider not in ("", "none", "off", "disabled") and bool(broad_provider_api_key()),
+        },
         "sources": {
             "jsearch": {"configured": jsearch_configured()},
             "greenhouse": {"configured": bool(os.getenv("GREENHOUSE_COMPANY_SOURCES", "").strip())},
@@ -100,6 +108,8 @@ def classify_source_status(source_name: str, enabled: bool, mode: str) -> str:
         return "DISABLED"
     if mode == "error":
         return "LIVE_ERROR"
+    if mode == "rate_limited":
+        return "RATE_LIMITED"
     if mode == "live":
         return "ENABLED_AND_CONFIGURED"
     if mode == "mock":
@@ -109,10 +119,10 @@ def classify_source_status(source_name: str, enabled: bool, mode: str) -> str:
     return "OPTIONAL_NOT_CONFIGURED"
 
 
-def get_broad_provider_adapter(db: Session) -> JobSourceAdapter | None:
+def get_broad_provider_adapter(db: Session, user_id: int | None = None) -> JobSourceAdapter | None:
     provider = primary_provider_name()
     if provider == "jsearch":
-        return JSearchAdapter(preference_queries=get_active_preference_queries(db))
+        return JSearchAdapter(preference_queries=get_active_preference_queries(db, user_id=user_id))
     return None
 
 
@@ -209,7 +219,7 @@ def count_configured_companies(db: Session) -> int:
 # Connector adapters — internal retrieval mechanism, resolved per company
 # ---------------------------------------------------------------------------
 
-def get_adapters(db: Session) -> list[JobSourceAdapter]:
+def get_adapters(db: Session, user_id: int | None = None) -> list[JobSourceAdapter]:
     """ConnectorResolver: builds one adapter instance per connector, each
     already carrying the real, operator-configured companies it should
     retrieve. The discovery orchestrator never needs to know which
@@ -225,9 +235,25 @@ def get_adapters(db: Session) -> list[JobSourceAdapter]:
     ]
     if remotive_enabled():
         adapters.append(RemotiveAdapter())
-    broad_provider = get_broad_provider_adapter(db)
+    broad_provider = get_broad_provider_adapter(db, user_id=user_id)
     if broad_provider is not None:
         adapters.append(broad_provider)
+    # JSearch retains the primary slot. Adzuna is an additional broad source
+    # only when its independently configured credentials are present; its
+    # adapter shares the same preference-derived query specs and is isolated
+    # by the existing per-adapter poll error boundary.
+    adzuna = AdzunaAdapter(preference_queries=get_active_preference_queries(db, user_id=user_id))
+    if adzuna.is_configured:
+        adapters.append(adzuna)
+    dice = ApifyDiceAdapter(preference_queries=get_active_preference_queries(db, user_id=user_id))
+    if dice.is_configured:
+        adapters.append(dice)
+    # Optional official career pages share the existing refresh/scheduler,
+    # but each company has an independent error/freshness boundary.
+    from app.job_sources.career_sources.adapter import CompanyCareerAdapter, configured_sources, sync_companies
+    companies = configured_sources()
+    sync_companies(db, companies)
+    adapters.extend(CompanyCareerAdapter(company) for company in companies)
     return adapters
 
 
@@ -266,7 +292,7 @@ def sync_registry(db: Session) -> list[JobSource]:
 
 def record_health(db: Session, health: SourceHealth) -> JobSource:
     row = _get_or_create(db, health.source_name, health.source_type)
-    row.mode = health.mode
+    row.mode = ("rate_limited" if health.error == "rate_limited" else "error") if not health.healthy and health.mode == "live" else health.mode
     row.last_checked_at = datetime.now(timezone.utc)
     if health.healthy:
         row.last_success_at = datetime.now(timezone.utc)
@@ -296,7 +322,7 @@ def list_sources_status(db: Session) -> list[dict]:
             "last_checked_at": row.last_checked_at.isoformat() if row.last_checked_at else None,
             "last_success_at": row.last_success_at.isoformat() if row.last_success_at else None,
             "last_error": None,  # Never surface raw technical errors to end users.
-            "healthy": bool(row.last_success_at) and row.mode not in ("unavailable", "error"),
+            "healthy": bool(row.last_success_at) and row.mode not in ("unavailable", "error", "rate_limited"),
         }
         for row in rows
     ]

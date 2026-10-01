@@ -1,11 +1,19 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "../api";
 
+// Intended unit-test API origin. Isolated in vite.config.js (VITEST + test.env)
+// so a developer/Docker VITE_API_BASE_URL=http://localhost:8001 cannot leak here.
+const API_BASE = "http://localhost:8000";
+
 const ok = (data = { ok: true }) => Promise.resolve(new Response(JSON.stringify(data), { status: 200, headers: { "Content-Type": "application/json" } }));
 
 beforeEach(() => { globalThis.fetch = vi.fn(() => ok()); });
 
 describe("API contract", () => {
+  it("uses the isolated default API base regardless of the developer shell", () => {
+    expect(import.meta.env.VITE_API_BASE_URL).toBe(API_BASE);
+  });
+
   it("uses the correct auth, preferences, resume and job endpoints", async () => {
     await api.checkBackendHealth();
     await api.signupUser({ email: "a@example.test", password: "secret" });
@@ -24,12 +32,21 @@ describe("API contract", () => {
     await api.getJobDetail(7, 9);
     await api.getJobs(7);
     const urls = fetch.mock.calls.map(([url]) => url);
-    expect(urls).toContain("http://localhost:8000/api/auth/forgot-password");
-    expect(urls).toContain("http://localhost:8000/api/auth/reset-password");
-    expect(urls).toContain("http://localhost:8000/api/jobs/search/7");
-    expect(urls).toContain("http://localhost:8000/api/jobs/search-updated/7");
+    expect(urls).toContain(`${API_BASE}/api/auth/forgot-password`);
+    expect(urls).toContain(`${API_BASE}/api/auth/reset-password`);
+    expect(urls).toContain(`${API_BASE}/api/jobs/search/7`);
+    expect(urls).toContain(`${API_BASE}/api/jobs/search-updated/7`);
     const uploadCall = fetch.mock.calls.find(([, options]) => options?.body instanceof FormData);
     expect(uploadCall).toBeTruthy();
+  });
+
+  it("updates the existing profile with a password-confirmed name PATCH", async () => {
+    await api.updateProfileName(7, { name: "Tanishka Test", current_password: "secret123" });
+    expect(fetch).toHaveBeenCalledWith(`${API_BASE}/api/auth/profile/7`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: "Tanishka Test", current_password: "secret123" }),
+    });
   });
 
   it("covers matching, optimizer, evidence, email and workflow endpoints", async () => {
@@ -41,12 +58,12 @@ describe("API contract", () => {
     await api.getEvidence(7, 9); await api.saveEvidence(7, 9, [{ skill: "Maven" }]); await api.deleteEvidence(7, 9, 2);
     await api.getOptimizedResumes(7); await api.generateEmailSummary(7); await api.getEmailLogs(7); await api.runFullWorkflow(7);
     await api.importJobByUrl(7, "https://jobs.example.test/9");
-    expect(api.getAtsDownloadUrl(3)).toBe("http://localhost:8000/api/ats-optimizer/download/3?format=txt");
+    expect(api.getAtsDownloadUrl(3)).toBe(`${API_BASE}/api/ats-optimizer/download/3?format=txt`);
     // Item 7: the exact current generated-resume id must appear in the download URL.
-    expect(api.getFinalResumeDownloadUrl(7, 9, 91, "docx")).toBe("http://localhost:8000/api/optimizer/resume/7/9/91/download");
-    expect(api.getFinalResumeDownloadUrl(7, 9, 91, "pdf")).toBe("http://localhost:8000/api/optimizer/resume/7/9/91/download?format=pdf");
-    expect(api.getFinalResumeDownloadUrl(7, 9, 91, "txt")).toBe("http://localhost:8000/api/optimizer/resume/7/9/91/download?format=txt");
-    expect(fetch).toHaveBeenCalledWith("http://localhost:8000/api/ats-optimizer/generate/7/9?force=true", { method: "POST" });
+    expect(api.getFinalResumeDownloadUrl(7, 9, 91, "docx")).toBe(`${API_BASE}/api/optimizer/resume/7/9/91/download`);
+    expect(api.getFinalResumeDownloadUrl(7, 9, 91, "pdf")).toBe(`${API_BASE}/api/optimizer/resume/7/9/91/download?format=pdf`);
+    expect(api.getFinalResumeDownloadUrl(7, 9, 91, "txt")).toBe(`${API_BASE}/api/optimizer/resume/7/9/91/download?format=txt`);
+    expect(fetch).toHaveBeenCalledWith(`${API_BASE}/api/ats-optimizer/generate/7/9?force=true`, { method: "POST" });
   });
 
   it("polls until terminal and supports compatibility optimizer routes", async () => {
@@ -164,8 +181,8 @@ describe("API contract", () => {
     await api.markJobEmailEventRead(7, 42);
     await api.toggleJobEmailEventStar(7, 42);
     const urls = fetch.mock.calls.map(([url]) => url);
-    expect(urls).toContain("http://localhost:8000/api/email/events/7/42/mark-read");
-    expect(urls).toContain("http://localhost:8000/api/email/events/7/42/toggle-star");
+    expect(urls).toContain(`${API_BASE}/api/email/events/7/42/mark-read`);
+    expect(urls).toContain(`${API_BASE}/api/email/events/7/42/toggle-star`);
   });
 
   it("rejects unsuccessful responses from every write and read contract", async () => {

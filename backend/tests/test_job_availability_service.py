@@ -57,7 +57,7 @@ def test_http_200_normal_employer_content_is_active():
 
 
 def test_http_200_normal_ats_content_is_active():
-    result = _check("https://careers-someemployer.icims.com/jobs/1/job", _response(200, b"<html>Job description details.</html>"))
+    result = _check("https://careers-someemployer.icims.com/jobs/48213/job", _response(200, b"<html>Job description details.</html>"))
     assert result["status"] == "ACTIVE"
 
 
@@ -230,6 +230,41 @@ def test_specific_url_rendering_generic_listing_text_without_redirect_is_unknown
     assert "generic_page_text" in result["reason"]
 
 
+def test_matching_jobposting_jsonld_can_confirm_a_specific_page_despite_generic_text():
+    """The structured object must confirm both the expected title and this
+    canonical detail page; title text on a generic page alone is not enough."""
+    body = b'''<html>Search Jobs
+    <script type="application/ld+json">
+    {"@context":"https://schema.org","@type":"JobPosting",
+     "title":"Senior Java Developer",
+     "url":"https://www.example.jobs/JobDetails"}
+    </script></html>'''
+    with patch("app.services.job_availability_service.url_safety.assert_public_http_url", return_value=None):
+        result = availability.check_url_availability(
+            "https://www.example.jobs/JobDetails?jobid=R266225",
+            session=_session(_response(200, body)),
+            expected_title="Senior Java Developer",
+        )
+    assert result["status"] == "ACTIVE"
+    assert result["reason"] == "jobposting_title_and_url_match"
+
+
+def test_wrong_jobposting_title_does_not_make_generic_page_active():
+    body = b'''<html>Search Jobs
+    <script type="application/ld+json">
+    {"@type":"JobPosting","title":"Marketing Manager",
+     "url":"https://www.example.jobs/JobDetails"}
+    </script></html>'''
+    with patch("app.services.job_availability_service.url_safety.assert_public_http_url", return_value=None):
+        result = availability.check_url_availability(
+            "https://www.example.jobs/JobDetails?jobid=R266225",
+            session=_session(_response(200, body)),
+            expected_title="Senior Java Developer",
+        )
+    assert result["status"] == "UNKNOWN"
+    assert "generic_page_text" in result["reason"]
+
+
 def test_specific_url_redirecting_to_another_specific_url_stays_active():
     """A redirect between two equally-specific URLs (e.g. a canonical
     redirect) is NOT evidence of anything wrong — stays ACTIVE."""
@@ -241,7 +276,7 @@ def test_specific_url_redirecting_to_another_specific_url_stays_active():
     assert result["status"] == "ACTIVE"
 
 
-def test_generic_url_returning_200_is_still_active_here():
+def test_generic_url_returning_200_is_unknown_not_active():
     """The specific-vs-generic response-evidence check only applies when
     the ORIGINAL url already looked specific — an originally-generic URL
     (e.g. a careers homepage) legitimately returning 200 just means the
@@ -249,7 +284,8 @@ def test_generic_url_returning_200_is_still_active_here():
     result (checked separately, in resolve_apply_action) is what keeps
     this from ever being labeled Apply, not this availability check."""
     result = _check("https://careers.example.com/jobs", _response(200, b"<html>Browse all open roles.</html>"))
-    assert result["status"] == "ACTIVE"
+    assert result["status"] == "UNKNOWN"
+    assert result["reason"] == "generic_or_unspecific_url"
 
 
 # ---------------------------------------------------------------------------

@@ -7,8 +7,8 @@ Summary: scanning only ever detects/proposes a possible application update
 changes ApplicationTracking itself, regardless of confidence; only the
 user's explicit Confirm action can do that (see
 application_tracking_service.apply_email_status_update). This is what both
-the scheduler-free "Scan Job Emails" button and (if ever wired to polling)
-any future automatic trigger call — there is only one scan pipeline.
+the manual "Scan Job Emails" button and the scheduled automatic trigger
+call — there is only one scan pipeline.
 """
 
 from __future__ import annotations
@@ -55,12 +55,10 @@ ALL_EMAIL_CATEGORIES = (
     CATEGORY_INTERVIEW_INVITATIONS,
 )
 
-# Which category key(s) gate a given classifier event_type. RECRUITER_OUTREACH
-# counts under both "job_opportunities" (a discovered lead) and its own
-# explicit "recruiter_messages" toggle, so disabling only one still lets it
-# through via the other.
+# Each classified type has one scan preference. Recruiter outreach requires
+# recruiter_messages even when job_opportunities remains enabled.
 _EVENT_TYPE_CATEGORIES: dict[str, tuple[str, ...]] = {
-    "RECRUITER_OUTREACH": (CATEGORY_JOB_OPPORTUNITIES, CATEGORY_RECRUITER_MESSAGES),
+    "RECRUITER_OUTREACH": (CATEGORY_RECRUITER_MESSAGES,),
     "OTHER": (CATEGORY_JOB_OPPORTUNITIES,),
     "APPLICATION_CONFIRMATION": (CATEGORY_APPLICATION_UPDATES,),
     "APPLICATION_UPDATE": (CATEGORY_APPLICATION_UPDATES,),
@@ -79,16 +77,16 @@ def _enabled_categories(db: Session, *, user_id: int) -> set[str] | None:
     from app.models.email_summary_preference_model import EmailSummaryPreference
 
     preference = db.query(EmailSummaryPreference).filter(EmailSummaryPreference.user_id == user_id).first()
-    if preference is None or not preference.email_types_to_scan:
+    if preference is None or preference.email_types_to_scan is None:
         return None
     try:
         values = json.loads(preference.email_types_to_scan)
     except (TypeError, ValueError):
         return None
-    if not isinstance(values, list) or not values:
+    if not isinstance(values, list):
         return None
     enabled = {value for value in values if value in ALL_EMAIL_CATEGORIES}
-    return enabled or None
+    return enabled
 
 
 def _category_enabled(event_type: str, enabled_categories: set[str] | None) -> bool:

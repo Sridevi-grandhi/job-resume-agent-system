@@ -207,13 +207,88 @@ def _extract_years_from_dates(dates: str) -> tuple[int | None, int | None]:
     return start, end
 
 
+# A short "City, ST" / "City, Country"-shaped line — used only to keep a
+# location line from being mistaken for the role title when a split header
+# spreads company/location/role/dates across separate lines (it must never
+# claim the "title" slot ahead of the real role line that follows it).
+_LOCATION_LIKE_RE = re.compile(r"^[A-Za-z][A-Za-z .'-]+,\s*[A-Za-z]{2,}$")
+
+
+def _reads_like_a_name(stripped: str) -> bool:
+    """Company names (and job titles) are conventionally Title-Cased or
+    ALL-CAPS on every significant word ("Acme Corp", "CISCO SYSTEMS",
+    "Northlight Analytics") — a prose fragment almost never is ("Cross-
+    functional stakeholder alignment" capitalizes only its first word).
+    This is what keeps a short, un-punctuated responsibility fragment from
+    being mistaken for a header line just because it's brief and a date
+    happens to follow it soon after — it generalizes past any fixed verb
+    allowlist, since it doesn't matter which verb (if any) the prose uses.
+    """
+    words = [w for w in re.split(r"\s+", stripped) if w and w[0].isalpha()]
+    if not words:
+        return False
+    if stripped == stripped.upper():
+        return True
+    lowercase_leads = sum(1 for w in words if w[0].islower())
+    return lowercase_leads <= 1
+
+
+def _looks_like_company_line(stripped: str) -> bool:
+    """A plausible employer/header line when a split header has no date on
+    it: short, not a bullet/date/client/metadata-label line, and not
+    prose. Prose almost always either opens with a resume action verb
+    (ACTION_VERB_BULLET_RE), reads as a full, period-terminated sentence,
+    or — unlike a real header — capitalizes only its first word. Excluding
+    all three is what keeps a marker-less accomplishment line ("Delivered
+    consistent results across teams.", "Cross-functional stakeholder
+    alignment") from ever being mistaken for a company name just because a
+    date happens to follow it a few lines later.
+    """
+    if not stripped or len(stripped) > 100:
+        return False
+    if stripped.startswith(("-", "•", "*")) or re.match(r"^\d+\.", stripped):
+        return False
+    if DATE_PATTERN.search(stripped):
+        return False
+    if METADATA_LABEL_RE.match(stripped) or CLIENT_PATTERN.search(stripped):
+        return False
+    if ACTION_VERB_BULLET_RE.match(stripped):
+        return False
+    if stripped.endswith(".") and len(stripped) >= 40:
+        return False
+    if not _reads_like_a_name(stripped):
+        return False
+    return True
+
+
+def _date_within_lookahead(stripped_lines: list[str], start_index: int, span: int = 3) -> bool:
+    """True when a date-range appears within the next few structural lines.
+    Stops at a bullet line — a header's date must appear before its own
+    accomplishment content begins, never be searched for past it.
+    """
+    for offset in range(span):
+        index = start_index + offset
+        if index >= len(stripped_lines):
+            break
+        candidate = stripped_lines[index]
+        if not candidate:
+            continue
+        if candidate.startswith(("-", "•", "*")) or re.match(r"^\d+\.", candidate):
+            break
+        if DATE_PATTERN.search(candidate):
+            return True
+    return False
+
+
 def _parse_employment_blocks(content: str) -> list[dict[str, Any]]:
     lines = [line.rstrip() for line in content.split("\n")]
+    stripped_lines = [line.strip() for line in lines]
     employments: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
+    awaiting_date = False
 
-    def start_new(header_line: str):
-        nonlocal current
+    def start_new(header_line: str, *, defer_date: bool):
+        nonlocal current, awaiting_date
         if current:
             employments.append(current)
         date_match = DATE_PATTERN.search(header_line)
@@ -233,9 +308,10 @@ def _parse_employment_blocks(content: str) -> list[dict[str, Any]]:
             "bullets": [],
             "raw_lines": [header_line],
         }
+        awaiting_date = defer_date and not dates
 
-    for line in lines:
-        stripped = line.strip()
+    for index, line in enumerate(lines):
+        stripped = stripped_lines[index]
         if not stripped:
             continue
         client_match = CLIENT_PATTERN.search(stripped)
@@ -243,33 +319,84 @@ def _parse_employment_blocks(content: str) -> list[dict[str, Any]]:
             current["client"] = client_match.group(1).strip()
             current["raw_lines"].append(line)
             continue
-        if DATE_PATTERN.search(stripped) and not stripped.startswith(("-", "•", "*")):
-            start_new(stripped)
+
+        line_has_date = bool(DATE_PATTERN.search(stripped)) and not stripped.startswith(("-", "•", "*"))
+
+        # A split header's date line arrives on its own, completing a block
+        # that was opened earlier from a bare company/location line. Fill
+        # the block's own dates instead of starting a brand-new (bogus,
+        # company-less) block from this date-only line.
+        if line_has_date and current is not None and awaiting_date and not current.get("dates"):
+            date_match = DATE_PATTERN.search(stripped)
+            current["dates"] = date_match.group(0)
+            current["start_year"], current["end_year"] = _extract_years_from_dates(current["dates"])
+            awaiting_date = False
+            residual = DATE_PATTERN.sub("", stripped).strip(" |-–—,")
+            if residual and not current.get("title") and len(residual) < 80:
+                current["title"] = residual
+            current["raw_lines"].append(line)
             continue
+
+        if line_has_date:
+            start_new(stripped, defer_date=False)
+            continue
+
         if current is None:
-            start_new(stripped)
+            # Multi-signal look-ahead: a company-shaped line with a date a
+            # few lines below it (and nothing bullet-like in between) opens
+            # a split-header block that defers its own date; anything else
+            # opens a block the same way it always has.
+            defer = _looks_like_company_line(stripped) and _date_within_lookahead(stripped_lines, index + 1)
+            start_new(stripped, defer_date=defer)
             continue
+
         if stripped.startswith(("-", "•", "*")) or re.match(r"^\d+\.", stripped):
             bullet = re.sub(r"^[-•*\d.]+\s*", "", stripped).strip()
             if bullet:
                 current["bullets"].append(bullet)
             current["raw_lines"].append(line)
-        else:
-            # PDF extractors often drop bullet markers. Long action-oriented lines under
-            # an employment header are still professional evidence, not titles.
-            looks_like_bullet = (
-                len(stripped) >= 40
-                and not DATE_PATTERN.search(stripped)
-                and ACTION_VERB_BULLET_RE.match(stripped)
+            continue
+
+        # A company-shaped line appearing mid-block, once the current block
+        # already looks structurally complete (has bullets or a resolved
+        # date) and isn't itself still waiting on its own date, is the next
+        # split-header employer starting — confirmed only when a date
+        # follows within a few lines, never on the shape of this line alone.
+        if (
+            not awaiting_date
+            and (current.get("bullets") or current.get("dates"))
+            and _looks_like_company_line(stripped)
+            and _date_within_lookahead(stripped_lines, index + 1)
+        ):
+            start_new(stripped, defer_date=True)
+            continue
+
+        # PDF extractors often drop bullet markers. Long action-oriented lines under
+        # an employment header are still professional evidence, not titles.
+        # Once the role title is already captured, a substantial marker-less
+        # line that isn't a recognized metadata label (Client:/Role:/etc.) is
+        # still real accomplishment content even when it doesn't start with
+        # one of the fixed action verbs below — the alternative was silently
+        # discarding it (only the 26-verb allowlist ever counted), which lost
+        # real bullets for any resume phrased with a different verb.
+        looks_like_bullet = (
+            len(stripped) >= 40
+            and not DATE_PATTERN.search(stripped)
+            and (
+                ACTION_VERB_BULLET_RE.match(stripped)
+                or (current.get("title") and not METADATA_LABEL_RE.match(stripped))
             )
-            if looks_like_bullet:
-                current["bullets"].append(stripped)
-                current["raw_lines"].append(line)
-            else:
-                # Possible title line under company
-                if not current.get("title") and len(stripped) < 80:
-                    current["title"] = stripped
-                current["raw_lines"].append(line)
+        )
+        if looks_like_bullet:
+            current["bullets"].append(stripped)
+            current["raw_lines"].append(line)
+        else:
+            # Possible title line under company — unless this reads as a
+            # location line, in which case leave the title slot open for
+            # the role line that (in a split header) still follows it.
+            if not current.get("title") and len(stripped) < 80 and not _LOCATION_LIKE_RE.match(stripped):
+                current["title"] = stripped
+            current["raw_lines"].append(line)
 
     if current:
         employments.append(current)
@@ -339,8 +466,18 @@ def parse_resume_structure(resume_text: str) -> dict[str, Any]:
             # entirely, collapsing the whole resume into one "Content" section. Date +
             # bullet structure is still a reliable, role-independent signal of real job
             # content, so recover it here instead of silently losing professional
-            # evidence for every skill mentioned in that block.
-            fallback_blocks = [block for block in _parse_employment_blocks(section["content"]) if block.get("bullets")]
+            # evidence for every skill mentioned in that block. A block with BOTH a
+            # company name AND a matched date range is real employment evidence even
+            # if zero of its lines were recognized as bullets — never drop it just
+            # because the bullet heuristic came up empty. `dates` is only ever set
+            # via the DATE_PATTERN branch of start_new(), so this still excludes a
+            # block that _parse_employment_blocks only opened because some
+            # unrelated non-bullet, non-date line (e.g. a stray summary sentence in
+            # a headingless resume) had nothing else to attach to.
+            fallback_blocks = [
+                block for block in _parse_employment_blocks(section["content"])
+                if block.get("bullets") or (block.get("company") and block.get("dates"))
+            ]
             employments.extend(fallback_blocks)
 
     return {

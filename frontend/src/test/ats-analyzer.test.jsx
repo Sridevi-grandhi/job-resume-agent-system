@@ -41,6 +41,7 @@ const groups = {
 };
 
 beforeEach(() => {
+  sessionStorage.clear();
   app = makeApp({ jobs: [job], latestResume: { id: 4, file_name: "resume.txt" }, atsSelectedJobId: "42", missingSkillsGroups: groups });
   app.loadMissingSkills.mockResolvedValue(groups);
   app.loadAtsResultForJob.mockResolvedValue(null);
@@ -145,7 +146,7 @@ describe("ATS optimizer", () => {
     };
     renderRoute(<AtsAnalyzerPage />, "/optimizer/42", "/optimizer/:jobId");
     fireEvent.click(screen.getByText(/Generate, Review/i));
-    expect(screen.getByText(/AI generation completed, but final resume validation failed/i)).toBeInTheDocument();
+    expect(screen.getByText(/AI draft could not pass validation/i)).toBeInTheDocument();
     expect(screen.queryByText(/AI Optimized · gpt-5-mini/)).not.toBeInTheDocument();
   });
 
@@ -160,7 +161,7 @@ describe("ATS optimizer", () => {
     };
     renderRoute(<AtsAnalyzerPage />, "/optimizer/42", "/optimizer/:jobId");
     fireEvent.click(screen.getByText(/Generate, Review/i));
-    expect(screen.getByText(/Optimized locally · AI response could not be safely applied/)).toBeInTheDocument();
+    expect(screen.getByText(/Safely adjusted using verified resume evidence/)).toBeInTheDocument();
     expect(screen.queryByText(/AI Optimized/)).not.toBeInTheDocument();
   });
 
@@ -292,14 +293,16 @@ describe("ATS optimizer", () => {
   });
 
   it("renders failure and retry without separate validation workflow steps", async () => {
-    app.messages = { ats: "Unsupported methodology introduced: Scrum" };
+    app.messages = { ats: "Validation failed. The generated resume contained unsupported information." };
     app.atsResult = { workflow_id: 10, workflow_status: "VALIDATION_FAILED", job, score_status: "NOT_RECOMMENDED", role_alignment: "MISMATCH", safe_to_apply: false, error_message: "Unsupported methodology introduced: Scrum", final_validation: { status: "failed", warnings: ["Unsupported claim"] } };
     renderRoute(<AtsAnalyzerPage />, "/optimizer/42", "/optimizer/:jobId");
     await userEvent.click(screen.getByRole("button", { name: /retry/i }));
     expect(app.retryAtsWorkflow).toHaveBeenCalledWith(10);
     fireEvent.click(screen.getByText(/Generate, Review/i));
     expect(screen.getByRole("heading", { name: /Step 5/i })).toBeInTheDocument();
-    expect(screen.getAllByText("Unsupported methodology introduced: Scrum")).toHaveLength(1);
+    expect(screen.getByText("Validation failed. The generated resume contained unsupported information.")).toBeInTheDocument();
+    expect(screen.getByText("Unsupported methodology: Scrum")).toBeInTheDocument();
+    expect(screen.queryAllByText("Unsupported methodology introduced: Scrum")).toHaveLength(0);
     expect(screen.getByText("Calculating Optimized Match").closest("li")).not.toHaveClass("done");
     expect(screen.getByText("Completed").closest("li")).not.toHaveClass("done");
   });

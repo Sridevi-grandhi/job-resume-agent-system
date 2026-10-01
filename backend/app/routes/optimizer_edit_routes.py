@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -200,6 +201,14 @@ def _safe_to_download(validation_status: str | None) -> bool:
     return (validation_status or "") in {"passed", "passed_with_warnings"}
 
 
+def _document_version(text: str) -> str:
+    """Stable content-based version for the editor/export consistency
+    guard — the same text always yields the same version, so the editor,
+    recalculate, and both download formats can be verified to agree on
+    exactly which content they're each looking at."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
+
 def _score_response_extras(
     *,
     previous_score: int | None,
@@ -268,11 +277,8 @@ def update_optimized_resume(user_id: int, job_id: int, payload: dict = Body(...)
     score = None
     score_view = None
     if not skip_score:
-        import hashlib
-        import logging
-
         recalc_logger = logging.getLogger(__name__)
-        document_hash = hashlib.sha256((edited or "").encode("utf-8")).hexdigest()[:16]
+        document_hash = _document_version(edited)
         denied = list(supported.get("denied_skill_names") or [])
         recalc_logger.info(
             "ATS_RECALCULATE_START optimized_resume_id=%s job_id=%s resume_id=%s "
@@ -326,6 +332,7 @@ def update_optimized_resume(user_id: int, job_id: int, payload: dict = Body(...)
             "safe_to_download": _safe_to_download(result.get("status")),
             "validation": result,
             "final_text": edited,
+            "document_version": _document_version(edited),
             "document": document,
             "score": score_view,
             **extras,
@@ -346,16 +353,14 @@ def update_optimized_resume(user_id: int, job_id: int, payload: dict = Body(...)
     db.add(optimized)
     db.commit()
     db.refresh(optimized)
-    import hashlib
-    import logging
-
+    document_version = _document_version(optimized.final_resume_text)
     save_logger = logging.getLogger(__name__)
     save_logger.info(
         "ATS_EDITOR_SAVE optimized_resume_id=%s resume_id=%s job_id=%s document_hash=%s persist=%s",
         optimized.id,
         resume.id,
         job_id,
-        hashlib.sha256((edited or "").encode("utf-8")).hexdigest()[:16],
+        document_version,
         persist,
     )
     return {
@@ -373,6 +378,7 @@ def update_optimized_resume(user_id: int, job_id: int, payload: dict = Body(...)
         "source_file_type": optimized.source_file_type,
         "template_note": rendered["template_note"],
         "final_text": optimized.final_resume_text,
+        "document_version": document_version,
         "document": document,
         "score": score_view,
         **extras,
@@ -400,6 +406,7 @@ def get_editable_resume(user_id: int, job_id: int, optimized_resume_id: int, db:
         "generated_text": optimized.generated_resume_text or optimized.optimized_text,
         "edited_text": optimized.edited_resume_text,
         "final_text": final_text,
+        "document_version": _document_version(final_text),
         "document": document,
         "generated_score": optimized.generated_score,
         "edited_score": current_score,
@@ -542,6 +549,7 @@ def download_final_resume(
     )
     if not plain.strip():
         raise HTTPException(status_code=400, detail="Optimized resume content is empty.")
+    document_version = _document_version(plain)
     # "Candidate" below is a DISPLAY fallback for the download filename only
     # (e.g. some resumes' name/contact lives in a DOCX header or text-box
     # that body-only text parsing never captures, so extraction can
@@ -557,21 +565,21 @@ def download_final_resume(
     fmt = (format or "docx").lower()
 
     if fmt == "txt":
-        import hashlib
-        import logging
-
         export_logger = logging.getLogger(__name__)
         export_logger.info(
             "ATS_EXPORT optimized_resume_id=%s resume_id=%s job_id=%s document_hash=%s txt_success=true",
             optimized.id,
             resume.id,
             job_id,
-            hashlib.sha256((plain or "").encode("utf-8")).hexdigest()[:16],
+            document_version,
         )
         return Response(
             content=plain,
             media_type="text/plain; charset=utf-8",
-            headers={"Content-Disposition": f'attachment; filename="{base}.txt"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{base}.txt"',
+                "X-Document-Version": document_version,
+            },
         )
 
     # Canonical finalized DOCX first (template-preserving when source is DOCX).
@@ -594,26 +602,21 @@ def download_final_resume(
             expected_name=extracted_name or None,
             expected_headings=["summary", "skills", "experience", "technical", "professional"],
         )
-        import hashlib
-        import logging
-
         export_logger = logging.getLogger(__name__)
         export_logger.info(
             "ATS_EXPORT optimized_resume_id=%s resume_id=%s job_id=%s document_hash=%s docx_success=true pdf_success=true",
             optimized.id,
             resume.id,
             job_id,
-            hashlib.sha256((plain or "").encode("utf-8")).hexdigest()[:16],
+            document_version,
         )
         return FileResponse(
             pdf_path,
             media_type="application/pdf",
             filename=f"{base}.pdf",
             content_disposition_type="attachment",
+            headers={"X-Document-Version": document_version},
         )
-
-    import hashlib
-    import logging
 
     export_logger = logging.getLogger(__name__)
     export_logger.info(
@@ -621,11 +624,12 @@ def download_final_resume(
         optimized.id,
         resume.id,
         job_id,
-        hashlib.sha256((plain or "").encode("utf-8")).hexdigest()[:16],
+        document_version,
     )
     return FileResponse(
         docx_path,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         filename=f"{base}.docx",
         content_disposition_type="attachment",
+        headers={"X-Document-Version": document_version},
     )

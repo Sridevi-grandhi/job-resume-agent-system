@@ -33,6 +33,7 @@ const TAB_DEFS = [
 ];
 
 const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const RESULTS_REFRESH_MS = 60 * 1000;
 
 function isWithinLastWeek(receivedAt) {
   if (!receivedAt) return false;
@@ -75,7 +76,6 @@ function isReliableMatch(event) {
 
 function GmailConnectionCard() {
   const app = useApp();
-  useEffect(() => { app.loadGmailStatus(); }, [app.currentUser]);
 
   const status = app.gmailStatus;
   const connected = status?.connected;
@@ -134,98 +134,6 @@ function EmailMetricCards({ events }) {
       <MetricCard label="Recruiter Outreach" value={counts.recruiterOutreach} detail="This Week" icon="matches" tone="amber" />
       <MetricCard label="Application Updates" value={counts.applicationUpdates} detail="This Week" icon="updatedJobs" tone="purple" />
     </div>
-  );
-}
-
-const SCAN_FREQUENCY_OPTIONS = [
-  ["daily", "Daily (Recommended)"],
-  ["every_12_hours", "Every 12 Hours"],
-  ["every_6_hours", "Every 6 Hours"],
-];
-
-const EMAIL_TYPE_OPTIONS = [
-  ["job_opportunities", "Job Opportunities"],
-  ["recruiter_messages", "Recruiter Messages"],
-  ["application_updates", "Application Updates"],
-  ["interview_invitations", "Interview Invitations"],
-];
-
-const ALL_EMAIL_TYPE_KEYS = EMAIL_TYPE_OPTIONS.map(([key]) => key);
-
-function EmailSummarySettings() {
-  const app = useApp();
-  const [settings, setSettings] = useState({ automatic_gmail_scan_enabled: false, gmail_scan_frequency: "daily", email_types_to_scan: ALL_EMAIL_TYPE_KEYS });
-  useEffect(() => { app.loadEmailSummaryPreferences(); }, [app.currentUser]);
-  useEffect(() => {
-    const preferences = app.emailSummaryPreferences;
-    setSettings({
-      automatic_gmail_scan_enabled: Boolean(preferences?.automatic_gmail_scan_enabled),
-      gmail_scan_frequency: preferences?.gmail_scan_frequency || "daily",
-      email_types_to_scan: Array.isArray(preferences?.email_types_to_scan) && preferences.email_types_to_scan.length
-        ? preferences.email_types_to_scan
-        : ALL_EMAIL_TYPE_KEYS,
-    });
-  }, [app.emailSummaryPreferences]);
-
-  const toggleCategory = (key) => setSettings((old) => ({
-    ...old,
-    email_types_to_scan: old.email_types_to_scan.includes(key)
-      ? old.email_types_to_scan.filter((value) => value !== key)
-      : [...old.email_types_to_scan, key],
-  }));
-
-  const save = (event) => {
-    event.preventDefault();
-    app.saveEmailSummaryPreferences(settings);
-  };
-
-  return (
-    <Panel className="email-settings-panel" title="Email Summary Settings" subtitle="Control automatic scanning and email summary preferences.">
-      <form className="email-settings-form" onSubmit={save}>
-        <label className="toggle-switch-label">
-          <span className="toggle-switch">
-            <input
-              type="checkbox"
-              checked={settings.automatic_gmail_scan_enabled}
-              onChange={(event) => setSettings((old) => ({ ...old, automatic_gmail_scan_enabled: event.target.checked }))}
-            />
-            <span className="toggle-switch-track" aria-hidden="true" />
-          </span>
-          <span className="toggle-switch-copy">
-            <b>Enable Automatic Gmail Scan</b>
-            <small>Automatically scan and summarize job-related emails</small>
-          </span>
-        </label>
-
-        <label className="email-settings-field">
-          <span>Scan Frequency</span>
-          <select
-            value={settings.gmail_scan_frequency}
-            onChange={(event) => setSettings((old) => ({ ...old, gmail_scan_frequency: event.target.value }))}
-          >
-            {SCAN_FREQUENCY_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-          </select>
-        </label>
-
-        <div className="email-settings-types">
-          <span className="email-settings-types-label">Email Types to Scan</span>
-          <div className="email-settings-checkboxes">
-            {EMAIL_TYPE_OPTIONS.map(([key, label]) => (
-              <label key={key}>
-                <input type="checkbox" checked={settings.email_types_to_scan.includes(key)} onChange={() => toggleCategory(key)} /> {label}
-              </label>
-            ))}
-          </div>
-        </div>
-
-        <div className="form-actions">
-          <button className="button primary" disabled={app.busy === "email-settings"}>
-            {app.busy === "email-settings" ? "Saving…" : "Save Settings"}
-          </button>
-        </div>
-      </form>
-      <Notice tone={/unable|invalid|error/i.test(app.messages["email-settings"] || "") ? "error" : undefined}>{app.messages["email-settings"]}</Notice>
-    </Panel>
   );
 }
 
@@ -432,8 +340,21 @@ export default function EmailSummaryPage() {
   const [detailsEventId, setDetailsEventId] = useState(null);
 
   useEffect(() => {
-    app.loadJobEmailEvents();
-    app.loadApplications();
+    const refresh = () => {
+      if (document.visibilityState === "hidden") return;
+      app.loadJobEmailEvents();
+      app.loadApplications();
+      app.loadGmailStatus();
+    };
+    refresh();
+    const interval = window.setInterval(refresh, RESULTS_REFRESH_MS);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
   }, [app.currentUser]);
 
   const events = app.jobEmailEvents;
@@ -471,8 +392,6 @@ export default function EmailSummaryPage() {
         <GmailConnectionCard />
         <EmailMetricCards events={events} />
       </div>
-
-      <EmailSummarySettings />
 
       <div className="emails-section">
         <EmailToolbar

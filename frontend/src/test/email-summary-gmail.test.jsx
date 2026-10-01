@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { screen, within } from "@testing-library/react";
+import { fireEvent, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderRoute } from "./render.jsx";
 import { makeApp } from "./mockApp";
@@ -15,6 +15,15 @@ beforeEach(() => {
 });
 
 describe("EmailSummaryPage — Gmail connection", () => {
+  it("refreshes stored results and connection status on focus without starting a Gmail scan", () => {
+    renderRoute(<EmailSummaryPage />, "/emails");
+    const initialLoads = app.loadJobEmailEvents.mock.calls.length;
+    fireEvent.focus(window);
+    expect(app.loadJobEmailEvents).toHaveBeenCalledTimes(initialLoads + 1);
+    expect(app.loadApplications).toHaveBeenCalledTimes(initialLoads + 1);
+    expect(app.loadGmailStatus).toHaveBeenCalledTimes(initialLoads + 1);
+    expect(app.scanGmailForJobs).not.toHaveBeenCalled();
+  });
   it("shows Connect Gmail when not connected", () => {
     renderRoute(<EmailSummaryPage />, "/emails");
     expect(screen.getByText(/not connected/i)).toBeInTheDocument();
@@ -98,44 +107,13 @@ describe("EmailSummaryPage — metric cards (computed from real event data, neve
   });
 });
 
-describe("EmailSummaryPage — Email Summary Settings", () => {
-  it("renders safe OFF defaults, loads stored settings, and never starts a scan on its own", () => {
+describe("EmailSummaryPage — scan configuration moved to Settings", () => {
+  it("has no duplicate scan settings and does not start a scan on mount", () => {
     renderRoute(<EmailSummaryPage />, "/emails");
-    expect(screen.getByRole("checkbox", { name: /enable automatic gmail scan/i })).not.toBeChecked();
-    expect(app.loadEmailSummaryPreferences).toHaveBeenCalled();
+    expect(screen.queryByRole("checkbox", { name: /automatic gmail scan|recruiter messages/i })).toBeNull();
+    expect(screen.queryByLabelText(/scan frequency/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: /save settings/i })).toBeNull();
     expect(app.scanGmailForJobs).not.toHaveBeenCalled();
-  });
-
-  it("all four Email Types to Scan checkboxes default to checked", () => {
-    renderRoute(<EmailSummaryPage />, "/emails");
-    ["Job Opportunities", "Recruiter Messages", "Application Updates", "Interview Invitations"].forEach((label) => {
-      expect(screen.getByRole("checkbox", { name: label })).toBeChecked();
-    });
-  });
-
-  it("toggling the scan switch, changing frequency, unchecking a category, and saving persists all three", async () => {
-    const user = userEvent.setup();
-    renderRoute(<EmailSummaryPage />, "/emails");
-    await user.click(screen.getByRole("checkbox", { name: /enable automatic gmail scan/i }));
-    await user.selectOptions(screen.getByLabelText(/scan frequency/i), "every_6_hours");
-    await user.click(screen.getByRole("checkbox", { name: "Recruiter Messages" }));
-    await user.click(screen.getByRole("button", { name: /save settings/i }));
-
-    expect(app.saveEmailSummaryPreferences).toHaveBeenCalledTimes(1);
-    const saved = app.saveEmailSummaryPreferences.mock.calls[0][0];
-    expect(saved.automatic_gmail_scan_enabled).toBe(true);
-    expect(saved.gmail_scan_frequency).toBe("every_6_hours");
-    expect(saved.email_types_to_scan).toEqual(expect.arrayContaining(["job_opportunities", "application_updates", "interview_invitations"]));
-    expect(saved.email_types_to_scan).not.toContain("recruiter_messages");
-    expect(app.scanGmailForJobs).not.toHaveBeenCalled();
-  });
-
-  it("shows a friendly message after saving, never raw backend validation JSON", () => {
-    app.messages = { "email-settings": "Please enter a valid setting." };
-    renderRoute(<EmailSummaryPage />, "/emails");
-    expect(screen.getByText("Please enter a valid setting.")).toBeInTheDocument();
-    expect(screen.queryByText(/value_error/i)).toBeNull();
-    expect(screen.queryByText(/\[\{"type"/i)).toBeNull();
   });
 });
 

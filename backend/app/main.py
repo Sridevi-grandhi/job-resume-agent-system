@@ -83,7 +83,7 @@ app.add_middleware(
     # Content-Disposition isn't in the CORS "safelisted" response headers by
     # default — without this, the frontend's resume-download fetch() can't
     # read the server-generated filename (falls back to a generic name).
-    expose_headers=["Content-Disposition"],
+    expose_headers=["Content-Disposition", "X-Document-Version"],
 )
 
 app.include_router(auth_router)

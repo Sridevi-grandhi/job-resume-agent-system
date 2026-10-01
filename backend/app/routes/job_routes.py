@@ -27,6 +27,7 @@ from app.services.ats_optimization_workflow_service import (
     start_workflow_for_saved_job,
     RUNNING_WORKFLOW_STATUSES,
 )
+from app.services.canonical_resume_match import is_original_resume_version
 
 
 router = APIRouter(
@@ -63,7 +64,7 @@ def _selected_job_payload(job: Job, db: Session) -> dict:
         .all()
     )
     original = next(
-        (match for match in matches if (match.resume_version or "original") == "original"),
+        (match for match in matches if is_original_resume_version(match.resume_version)),
         None,
     )
     optimized = next(

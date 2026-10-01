@@ -273,7 +273,7 @@ def test_expired_candidate_availability_is_not_enriched():
                return_value={"status": "EXPIRED", "reason": "http_404", "final_url": None}):
         result = enrich_job(job, provider=greenhouse_lever_provider)
 
-    assert result.status == "REJECTED"
+    assert result.status == "EXPIRED"
     assert job.direct_url is None
     action = resolve_apply_action(job)
     assert action["action_label"] == "View Listing"  # never falsely promoted

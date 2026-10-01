@@ -11,6 +11,7 @@ from app.services.client_domain_validator import (
 from app.services.keyword_utils import contains_keyword, find_keywords_in_text
 from app.services.resume_structure_parser import parse_resume_structure
 from app.services.skill_analysis_service import USAGE_CONTEXT_VERBS
+from app.services.technology_catalog import PROFESSIONAL_ROLE_CLAIMS
 from app.services.technology_timeline_validator import filter_technologies_for_period
 
 
@@ -26,6 +27,156 @@ FAKE_METRIC_PATTERN = re.compile(
     r"(?i)(\b\d{1,3}%|\b\d+\s*(million|billion|k)\b|\b\d{2,}\+?\s*(users|customers|transactions)\b|"
     r"\$\d|\b99\.9%|\breduced by\s+\d|\bincreased by\s+\d)"
 )
+
+
+def unsupported_invented_metrics(text: str, evidence_baseline: str = "") -> list[str]:
+    """Return quantitative snippets in `text` that are absent from evidence."""
+    baseline = evidence_baseline or ""
+    leftover: list[str] = []
+    for match in FAKE_METRIC_PATTERN.finditer(text or ""):
+        compact = re.sub(r"\s+", " ", match.group(0)).strip()
+        if compact and not re.search(re.escape(compact), baseline, flags=re.I):
+            leftover.append(compact)
+    return leftover
+
+
+def sanitize_invented_metrics(text: str, evidence_baseline: str = "") -> tuple[str, list[str]]:
+    """Remove quantitative claims that are not present in original resume/evidence.
+
+    Returns (cleaned_text, removed_snippets). Supported metrics that already
+    appear in `evidence_baseline` are kept. Trailing prepositions left after
+    stripping a number ("by 40%") are cleaned so the rest of a truthful bullet
+    survives.
+    """
+    source = text or ""
+    if not FAKE_METRIC_PATTERN.search(source):
+        return source, []
+    baseline = evidence_baseline or ""
+    removed: list[str] = []
+
+    def keep_or_drop(match: re.Match) -> str:
+        snippet = match.group(0)
+        compact = re.sub(r"\s+", " ", snippet).strip()
+        if compact and re.search(re.escape(compact), baseline, flags=re.I):
+            return snippet
+        if compact:
+            removed.append(compact)
+        return ""
+
+    cleaned = FAKE_METRIC_PATTERN.sub(keep_or_drop, source)
+    if not removed:
+        return source, []
+    cleaned = re.sub(r"(?i)\s+(?:by|of|to)\s*([,.;:])", r"\1", cleaned)
+    cleaned = re.sub(r"(?i)[ \t]+(?:by|of|to)[ \t]*$", "", cleaned, flags=re.M)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = cleaned.strip()
+    return (cleaned or source, removed)
+
+
+def _cleanup_claim_whitespace(text: str) -> str:
+    cleaned = re.sub(r"[ \t]{2,}", " ", text or "")
+    cleaned = re.sub(r" ?,\s*,+", ",", cleaned)
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"\s+([,.;:])", r"\1", cleaned)
+    cleaned = re.sub(r"(?m)^[\s•\-]*$", "", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
+
+
+def sanitize_unsupported_claim_term(
+    text: str,
+    term: str,
+    *,
+    original_text: str = "",
+    replacement: str | None = None,
+) -> tuple[str, bool]:
+    """Remove or rewrite one unsupported claim without nuking the surrounding bullet.
+
+    Slash compounds keep the supported sibling (Agile/Scrum → Agile when Agile
+    is evidenced). Whole-word remaining mentions use `replacement` when given,
+    otherwise drop only the unsupported term.
+    """
+    source = text or ""
+    label = str(term or "").strip()
+    if not label or not contains_keyword(source, label):
+        return source, False
+    escaped = re.escape(label)
+
+    def _keep_supported_side(match: re.Match) -> str:
+        parts = [group for group in match.groups() if group]
+        kept = [part for part in parts if not re.fullmatch(escaped, part, flags=re.I)]
+        return kept[0] if kept else (replacement or "")
+
+    updated = re.sub(
+        rf"(?i)\b({escaped})\s*/\s*([A-Za-z][\w+#.]*(?:\s+[A-Za-z][\w+#.]*){{0,3}})\b"
+        rf"|\b([A-Za-z][\w+#.]*(?:\s+[A-Za-z][\w+#.]*){{0,3}})\s*/\s*({escaped})\b",
+        _keep_supported_side,
+        source,
+    )
+    updated = re.sub(rf"(?im)^[\s•\-*]*{escaped}\s*$", "", updated)
+    updated = re.sub(rf"(?i),\s*{escaped}\b", "", updated)
+    updated = re.sub(rf"(?i)\b{escaped}\s*,", "", updated)
+    updated = re.sub(rf"(?i)\s+(?:and|&)\s+{escaped}\b", "", updated)
+    updated = re.sub(rf"(?i)\b{escaped}\s+(?:and|&)\s+", "", updated)
+    if replacement:
+        updated = re.sub(rf"(?i)\b{escaped}\b", replacement, updated)
+    else:
+        updated = re.sub(
+            rf"(?i)\b{escaped}(\s+(?:teams?|ceremonies|methodology|framework|environment))?\b",
+            lambda match: (match.group(1) or "").strip(),
+            updated,
+        )
+    updated = _cleanup_claim_whitespace(updated)
+    return updated, updated != _cleanup_claim_whitespace(source)
+
+
+def apply_truthfulness_corrections(
+    text: str,
+    *,
+    original_text: str = "",
+    unsupported_terms: list[str] | None = None,
+    confirmed_evidence_text: str = "",
+) -> tuple[str, list[str]]:
+    """Rewrite unsupported metrics, role escalations, and JD-only claims in place."""
+    evidence_baseline = "\n".join(
+        part for part in [original_text or "", confirmed_evidence_text or ""] if part
+    )
+    updated, removed = sanitize_invented_metrics(text, evidence_baseline)
+    for role in sorted(PROFESSIONAL_ROLE_CLAIMS, key=len, reverse=True):
+        if contains_keyword(updated, role) and not contains_keyword(original_text or "", role):
+            escaped_role = re.escape(role)
+            rewritten = re.sub(
+                rf"(?i)\b(?:served as|acted as|worked as|was the)\s+{escaped_role}\b",
+                "Worked with",
+                updated,
+            )
+            rewritten, changed = sanitize_unsupported_claim_term(
+                rewritten,
+                role,
+                original_text=original_text or "",
+            )
+            if changed or rewritten != updated:
+                removed.append(role)
+                updated = rewritten
+    agile_supported = contains_keyword(original_text or "", "Agile") or contains_keyword(
+        confirmed_evidence_text or "", "Agile"
+    )
+    for term in sorted({str(item).strip() for item in (unsupported_terms or []) if str(item).strip()}, key=len, reverse=True):
+        if contains_keyword(evidence_baseline, term):
+            continue
+        replacement = None
+        if term.lower() == "scrum" and agile_supported:
+            replacement = "Agile"
+        updated, changed = sanitize_unsupported_claim_term(
+            updated,
+            term,
+            original_text=original_text or "",
+            replacement=replacement,
+        )
+        if changed:
+            removed.append(term)
+    return updated, list(dict.fromkeys(removed))
 
 
 def _years_of_experience_phrase(resume_text: str) -> str:
@@ -689,7 +840,7 @@ def generate_optimized_resume(
         ]
     )
     if FAKE_METRIC_PATTERN.search(plain) and not FAKE_METRIC_PATTERN.search(evidence_baseline):
-        plain = FAKE_METRIC_PATTERN.sub("", plain)
+        plain, _removed = sanitize_invented_metrics(plain, evidence_baseline)
         plain = re.sub(r"\s{2,}", " ", plain)
 
     return {

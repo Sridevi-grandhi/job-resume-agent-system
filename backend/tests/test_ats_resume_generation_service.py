@@ -367,6 +367,35 @@ def test_preserve_previously_supported_keywords_restores_weak_evidence_via_skill
     assert "Agile" in skills_block
 
 
+def test_preserve_exact_weak_skill_without_promoting_indirect_evidence():
+    job = SimpleNamespace(
+        title="Developer", company="Acme",
+        description="Use Jira and Scrum to coordinate delivery.",
+        skills_required="Jira, Scrum",
+    )
+    original = (
+        "Jane Developer\n\nTechnical Skills\nJava, Jira\n\n"
+        "Professional Experience\nAcme Corp | Developer\n"
+        "- Participated in sprint planning and retrospectives.\n"
+    )
+    generated = (
+        "Jane Developer\n\nTechnical Skills\nJava\n\n"
+        "Professional Experience\nAcme Corp | Developer\n"
+        "- Participated in sprint planning and retrospectives.\n"
+    )
+
+    result_text, dropped = _preserve_previously_supported_keywords(
+        generated, original_resume_text=original, job=job,
+    )
+
+    assert "Jira" in dropped
+    assert "Scrum" not in dropped
+    summary_and_experience = result_text.split("Technical Skills")[0] + result_text.split("Professional Experience")[1]
+    assert "Jira" not in summary_and_experience
+    assert "Jira" in result_text.split("Technical Skills")[1].split("Professional Experience")[0]
+    assert "Scrum" not in result_text
+
+
 def test_preserve_previously_supported_keywords_noop_when_nothing_dropped(java_resume_text):
     job = SimpleNamespace(
         title="Java Developer", company="Acme",

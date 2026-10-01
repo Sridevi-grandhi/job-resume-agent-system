@@ -125,7 +125,7 @@ class GreenhouseAdapter(JobSourceAdapter):
             title=title,
             location=location,
             work_mode="Remote" if "remote" in location.lower() else "Not specified",
-            job_type="Full-time",
+            job_type="",
             description=content,
             skills=skills,
             posted_at=posted_at,

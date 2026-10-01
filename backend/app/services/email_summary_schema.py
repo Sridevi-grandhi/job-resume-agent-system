@@ -33,6 +33,9 @@ TABLE_COLUMN_DDL = {
     "email_summary_preferences": {
         "gmail_scan_frequency": "ALTER TABLE email_summary_preferences ADD COLUMN gmail_scan_frequency VARCHAR(20) NOT NULL DEFAULT 'daily'",
         "email_types_to_scan": "ALTER TABLE email_summary_preferences ADD COLUMN email_types_to_scan TEXT",
+        "job_alerts_enabled": "ALTER TABLE email_summary_preferences ADD COLUMN job_alerts_enabled BOOLEAN NOT NULL DEFAULT TRUE",
+        "application_updates_enabled": "ALTER TABLE email_summary_preferences ADD COLUMN application_updates_enabled BOOLEAN NOT NULL DEFAULT TRUE",
+        "interview_alerts_enabled": "ALTER TABLE email_summary_preferences ADD COLUMN interview_alerts_enabled BOOLEAN NOT NULL DEFAULT TRUE",
     },
     "email_connections": {
         "auto_scan_running": "ALTER TABLE email_connections ADD COLUMN auto_scan_running BOOLEAN NOT NULL DEFAULT FALSE",

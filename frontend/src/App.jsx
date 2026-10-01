@@ -6,6 +6,7 @@ import Layout from "./components/Layout";
 import AuthPage from "./pages/AuthPage";
 import DashboardPage from "./pages/DashboardPage";
 import PreferencesPage from "./pages/PreferencesPage";
+import SettingsPage from "./pages/SettingsPage";
 import ResumePage from "./pages/ResumePage";
 import JobSearchPage from "./pages/JobSearchPage";
 import UpdatedJobSearchPage from "./pages/UpdatedJobSearchPage";
@@ -27,6 +28,7 @@ export default function App() {
             <Route element={<Layout />}>
               <Route path="/dashboard" element={<DashboardPage />} />
               <Route path="/preferences" element={<PreferencesPage />} />
+              <Route path="/settings" element={<SettingsPage />} />
               <Route path="/resume" element={<ResumePage />} />
               <Route path="/jobs" element={<JobSearchPage />} />
               <Route path="/updated-jobs" element={<UpdatedJobSearchPage />} />

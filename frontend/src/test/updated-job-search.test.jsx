@@ -20,6 +20,7 @@ const discoveredJob = {
   skills: "Selenium, Java, API Testing",
   source: "greenhouse",
   source_mode: "live",
+  action_label: "Apply on Company Site",
   direct_url: "https://boards.greenhouse.io/example-employer/jobs/1",
   application_url: "https://boards.greenhouse.io/example-employer/jobs/1",
   status: "ACTIVE",
@@ -100,8 +101,28 @@ afterEach(() => {
 });
 
 describe("UpdatedJobSearchPage", () => {
+  it.each(["adzuna", "jsearch", "apify_dice"].flatMap((source) =>
+    ["Apply on Company Site", "Open Career Page", "Apply on Dice", "Job Closed"].flatMap((label) =>
+      [true, false].map((hasUrl) => [source, label, hasUrl]))
+  ))("renders %s using backend action %s with URL=%s", async (source, label, hasUrl) => {
+    mockFetchWith({ jobsBody: {
+      jobs: [{ ...discoveredJob, source, action_label: label, application_url: hasUrl ? discoveredJob.application_url : null }],
+      summary: {}, sources: [], has_resume: true, has_preferences: true,
+    } });
+    renderRoute(<UpdatedJobSearchPage />, "/updated-jobs");
+    const action = await screen.findByRole("button", { name: label, exact: true });
+    if (label === "Job Closed" || !hasUrl) expect(action).toBeDisabled();
+    else expect(action).toBeEnabled();
+    await userEvent.click(screen.getByRole("button", { name: /^details$/i }));
+    const drawer = screen.getByRole("dialog", { name: /job details/i });
+    const drawerAction = within(drawer).getByRole("button", { name: label, exact: true });
+    if (label === "Job Closed" || !hasUrl) expect(drawerAction).toBeDisabled();
+    else expect(drawerAction).toBeEnabled();
+  });
+
   it.each([
     [100, "Strong Match", "tone-strong"],
+    [84, "Good Match", "tone-good"],
     [79, "Good Match", "tone-good"],
   ])("shows the unchanged %s%% score in the circular match UI", async (score, label, tone) => {
     const scoredJob = { ...discoveredJob, match: { ...discoveredJob.match, match_score: score } };
@@ -143,16 +164,19 @@ describe("UpdatedJobSearchPage", () => {
     expect(screen.queryByText("0%")).toBeNull();
   });
 
-  it("keeps the Optimize Resume save-and-navigation handler unchanged", async () => {
+  it("Optimize Resume selects the saved job without starting generation", async () => {
     mockFetchWith();
     renderRoute(<UpdatedJobSearchPage />, "/updated-jobs");
     await screen.findByText("Senior QA Automation Engineer");
 
     await userEvent.click(screen.getAllByRole("button", { name: /^optimize resume$/i })[0]);
 
-    await waitFor(() => expect(app.setAtsSelectedJobId).toHaveBeenCalledWith("555"));
+    await waitFor(() => expect(app.startAtsForSelectedJob).toHaveBeenCalledWith(555));
     expect(sessionStorage.getItem("atsSelectedJobId")).toBe("555");
-    expect(globalThis.fetch.mock.calls.some(([url]) => String(url).includes("/api/job-discovery/save/"))).toBe(true);
+    expect(sessionStorage.getItem("atsFreshSelected:7:555")).toBe("1");
+    const saveCall = globalThis.fetch.mock.calls.find(([url]) => String(url).includes("/api/job-discovery/save/"));
+    expect(JSON.parse(saveCall[1].body)).toEqual({ discovered_job_id: 101, start_workflow: false });
+    expect(app.analyzeAndOptimize).not.toHaveBeenCalled();
   });
 
   it("loads and renders discovered jobs by real company — no ATS/connector name, no mock label", async () => {
@@ -174,7 +198,7 @@ describe("UpdatedJobSearchPage", () => {
     const tab = mockWindowOpen();
     renderRoute(<UpdatedJobSearchPage />, "/updated-jobs");
     await waitFor(() => expect(screen.getByText("Senior QA Automation Engineer")).toBeInTheDocument());
-    await userEvent.click(screen.getAllByRole("button", { name: /^apply$/i })[0]);
+    await userEvent.click(screen.getAllByRole("button", { name: /^apply on company site$/i })[0]);
     await waitFor(() => expect(tab.location.href).toBe(discoveredJob.application_url));
     expect(globalThis.fetch.mock.calls.some(([url]) => String(url).includes("/api/job-discovery/apply/"))).toBe(true);
   });
@@ -189,7 +213,7 @@ describe("UpdatedJobSearchPage", () => {
     const tab = mockWindowOpen();
     renderRoute(<UpdatedJobSearchPage />, "/updated-jobs");
     await waitFor(() => expect(screen.getByText("Senior QA Automation Engineer")).toBeInTheDocument());
-    await userEvent.click(screen.getAllByRole("button", { name: /^apply$/i })[0]);
+    await userEvent.click(screen.getAllByRole("button", { name: /^apply on company site$/i })[0]);
     await waitFor(() => expect(tab.close).toHaveBeenCalled());
     expect(tab.location.href).toBe("");
     await waitFor(() => expect(screen.getAllByRole("button", { name: /^job closed$/i }).length).toBeGreaterThan(0));
@@ -203,7 +227,7 @@ describe("UpdatedJobSearchPage", () => {
       apply_destination_type: "DIRECT_EMPLOYER",
       destination_specificity: "SPECIFIC_JOB",
       availability_status: "UNKNOWN",
-      action_label: "Open Employer Site",
+      action_label: "Open Career Page",
       can_apply: false,
     };
     mockFetchWith({
@@ -215,13 +239,13 @@ describe("UpdatedJobSearchPage", () => {
       },
       applyResponse: {
         status: "EMPLOYER_SITE_OPENED", application_url: openEmployerJob.application_url,
-        action_label: "Open Employer Site", can_apply: false,
+        action_label: "Open Career Page", can_apply: false,
       },
     });
     const tab = mockWindowOpen();
     renderRoute(<UpdatedJobSearchPage />, "/updated-jobs");
     await waitFor(() => expect(screen.getByText("Senior QA Automation Engineer")).toBeInTheDocument());
-    const button = screen.getByRole("button", { name: /open employer site/i });
+    const button = screen.getByRole("button", { name: /open career page/i });
     await userEvent.click(button);
     await waitFor(() => expect(tab.location.href).toBe(openEmployerJob.application_url));
     expect(tab.closed).toBe(false);
@@ -262,7 +286,7 @@ describe("UpdatedJobSearchPage", () => {
       apply_destination_type: "DIRECT_EMPLOYER",
       destination_specificity: "SPECIFIC_JOB",
       availability_status: "UNKNOWN",
-      action_label: "Open Employer Site",
+      action_label: "Open Career Page",
       can_apply: false,
     };
     mockFetchWith({
@@ -274,7 +298,7 @@ describe("UpdatedJobSearchPage", () => {
       },
       applyResponse: {
         status: "EMPLOYER_SITE_OPENED", application_url: openEmployerJob.application_url,
-        action_label: "Open Employer Site", can_apply: false,
+        action_label: "Open Career Page", can_apply: false,
       },
     });
     const tab = mockWindowOpen();
@@ -282,7 +306,7 @@ describe("UpdatedJobSearchPage", () => {
     await waitFor(() => expect(screen.getByText("Senior QA Automation Engineer")).toBeInTheDocument());
     await userEvent.click(screen.getAllByRole("button", { name: /^details$/i })[0]);
     const drawer = screen.getByRole("dialog", { name: /job details/i });
-    await userEvent.click(within(drawer).getByRole("button", { name: /open employer site/i }));
+    await userEvent.click(within(drawer).getByRole("button", { name: /open career page/i }));
     await waitFor(() => expect(tab.location.href).toBe(openEmployerJob.application_url));
   });
 
@@ -402,7 +426,7 @@ describe("UpdatedJobSearchPage", () => {
     await waitFor(() => expect(screen.getAllByRole("button", { name: /^saved$/i }).length).toBeGreaterThan(0));
   });
 
-  it("a Remotive-only listing (no verified employer URL) shows 'View Listing', never a false 'Apply'", async () => {
+  it("a Remotive-only listing (no verified employer URL) shows 'Apply on Remotive', never a false 'Apply on Company Site'", async () => {
     const remotiveOnlyJob = {
       ...discoveredJob,
       discovered_job_id: 202,
@@ -411,7 +435,7 @@ describe("UpdatedJobSearchPage", () => {
       application_url: "https://remotive.com/remote-jobs/software-dev/example-88888",
       is_direct_apply: false,
       apply_destination_type: "AGGREGATOR_LISTING",
-      action_label: "View Listing",
+      action_label: "Apply on Remotive",
       can_apply: true,
     };
     mockFetchWith({
@@ -426,8 +450,8 @@ describe("UpdatedJobSearchPage", () => {
     const tab = mockWindowOpen();
     renderRoute(<UpdatedJobSearchPage />, "/updated-jobs");
     await waitFor(() => expect(screen.getByText("Senior QA Automation Engineer")).toBeInTheDocument());
-    expect(screen.queryByRole("button", { name: /^apply$/i })).toBeNull();
-    await userEvent.click(screen.getByRole("button", { name: /view listing/i }));
+    expect(screen.queryByRole("button", { name: /^apply on company site$/i })).toBeNull();
+    await userEvent.click(screen.getByRole("button", { name: /apply on remotive/i }));
     await waitFor(() => expect(tab.location.href).toBe(remotiveOnlyJob.application_url));
   });
 
@@ -440,7 +464,7 @@ describe("UpdatedJobSearchPage", () => {
       application_url: "https://company.com/careers/job/123",
       is_direct_apply: true,
       apply_destination_type: "DIRECT_EMPLOYER",
-      action_label: "Apply",
+      action_label: "Apply on Company Site",
       can_apply: true,
     };
     mockFetchWith({
@@ -455,12 +479,12 @@ describe("UpdatedJobSearchPage", () => {
     const tab = mockWindowOpen();
     renderRoute(<UpdatedJobSearchPage />, "/updated-jobs");
     await waitFor(() => expect(screen.getByText("Senior QA Automation Engineer")).toBeInTheDocument());
-    await userEvent.click(screen.getByRole("button", { name: /^apply$/i }));
+    await userEvent.click(screen.getByRole("button", { name: /^apply on company site$/i }));
     await waitFor(() => expect(tab.location.href).toBe("https://company.com/careers/job/123"));
     expect(tab.location.href).not.toMatch(/remotive\.com/);
   });
 
-  it("Details drawer shows 'View Listing' instead of Apply for an aggregator-only job", async () => {
+  it("Details drawer shows 'Apply on Remotive' instead of Apply on Company Site for an aggregator-only job", async () => {
     const remotiveOnlyJob = {
       ...discoveredJob,
       discovered_job_id: 404,
@@ -469,7 +493,7 @@ describe("UpdatedJobSearchPage", () => {
       application_url: "https://remotive.com/remote-jobs/software-dev/example-404",
       is_direct_apply: false,
       apply_destination_type: "AGGREGATOR_LISTING",
-      action_label: "View Listing",
+      action_label: "Apply on Remotive",
       can_apply: true,
     };
     mockFetchWith({
@@ -488,8 +512,8 @@ describe("UpdatedJobSearchPage", () => {
     const drawer = screen.getByRole("dialog", { name: /job details/i });
     // No "View Original Posting" link either — there's no direct_url, only the listing itself.
     expect(within(drawer).queryByRole("link", { name: /view original posting/i })).toBeNull();
-    expect(within(drawer).queryByRole("button", { name: /^apply$/i })).toBeNull();
-    await userEvent.click(within(drawer).getByRole("button", { name: /view listing/i }));
+    expect(within(drawer).queryByRole("button", { name: /^apply on company site$/i })).toBeNull();
+    await userEvent.click(within(drawer).getByRole("button", { name: /apply on remotive/i }));
     await waitFor(() => expect(tab.location.href).toBe(remotiveOnlyJob.application_url));
   });
 
@@ -508,5 +532,114 @@ describe("UpdatedJobSearchPage", () => {
     await userEvent.click(screen.getAllByRole("button", { name: /^details$/i })[0]);
     const drawer = screen.getByRole("dialog", { name: /job details/i });
     expect(within(drawer).getByText(/^active$/i)).toBeInTheDocument();
+  });
+
+  it("job cards stay compact: match ring and actions stay, resume verdict stays in Details", async () => {
+    mockFetchWith();
+    renderRoute(<UpdatedJobSearchPage />, "/updated-jobs");
+    await waitFor(() => expect(screen.getByText("Senior QA Automation Engineer")).toBeInTheDocument());
+    expect(screen.getByText("Example Employer")).toBeInTheDocument();
+    expect(screen.getByLabelText(/resume match 84 percent/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^save$/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^details$/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^optimize resume$/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^apply on company site$/i })).toBeInTheDocument();
+    expect(screen.queryByText(discoveredJob.match.verdict)).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: /^details$/i }));
+    const drawer = screen.getByRole("dialog", { name: /job details/i });
+    expect(within(drawer).getByText(discoveredJob.match.verdict)).toBeInTheDocument();
+    expect(within(drawer).getByText(/required \/ preferred skills/i)).toBeInTheDocument();
+    expect(within(drawer).getAllByText("Selenium").length).toBeGreaterThan(0);
+    expect(within(drawer).getByText(/^source:/i)).toBeInTheDocument();
+    expect(within(drawer).getByText("Greenhouse")).toBeInTheDocument();
+  });
+
+  it("shows a View Source fallback when the backend provides a distinct listing URL", async () => {
+    mockFetchWith({
+      jobsBody: {
+        jobs: [{
+          ...discoveredJob,
+          secondary_action: { label: "View Source", url: "https://www.linkedin.com/jobs/view/12345" },
+        }],
+        summary: { recently_detected: 1, strong_matches: 1, companies_monitored: 1, sources_checked: 4, last_updated: new Date().toISOString() },
+        sources: [],
+        has_resume: true,
+        has_preferences: true,
+      },
+    });
+    renderRoute(<UpdatedJobSearchPage />, "/updated-jobs");
+    await waitFor(() => expect(screen.getByText("Senior QA Automation Engineer")).toBeInTheDocument());
+    const link = screen.getByRole("link", { name: /view source/i });
+    expect(link).toHaveAttribute("href", "https://www.linkedin.com/jobs/view/12345");
+  });
+
+  it("shows the saved preference context without treating search filters as a preference change", async () => {
+    mockFetchWith({
+      jobsBody: {
+        jobs: [discoveredJob],
+        summary: { recently_detected: 1, strong_matches: 1, companies_monitored: 1, sources_checked: 4, last_updated: new Date().toISOString() },
+        sources: [],
+        has_resume: true,
+        has_preferences: true,
+        preference_summary: {
+          job_title: "DevOps", location: "USA", work_mode: "Remote",
+          job_type: "Full-time", skills: "aws",
+        },
+      },
+    });
+    renderRoute(<UpdatedJobSearchPage />, "/updated-jobs");
+    await waitFor(() => expect(screen.getByText(/showing roles matching/i)).toBeInTheDocument());
+    expect(screen.getByText("DevOps")).toBeInTheDocument();
+    expect(screen.getByText("Top Job Matches")).toBeInTheDocument();
+    expect(screen.getByText(/already relevant to your saved job preference/i)).toBeInTheDocument();
+  });
+
+  it("renders the backend 'Apply on Dice' action on the card and in Details", async () => {
+    const providerJob = {
+      ...discoveredJob,
+      discovered_job_id: 909,
+      application_url: "https://www.dice.com/job-detail/4821301-senior-devops-engineer",
+      action_label: "Apply on Dice",
+      apply_destination_type: "PROVIDER_JOB_APPLY",
+      can_apply: true,
+    };
+    mockFetchWith({
+      jobsBody: {
+        jobs: [providerJob],
+        summary: { recently_detected: 1, strong_matches: 1, companies_monitored: 1, sources_checked: 4, last_updated: new Date().toISOString() },
+        sources: [],
+        has_resume: true,
+        has_preferences: true,
+      },
+      applyResponse: {
+        status: "LISTING_OPENED",
+        application_url: providerJob.application_url,
+        action_label: "Apply on Dice",
+        can_apply: true,
+      },
+    });
+    const tab = mockWindowOpen();
+    renderRoute(<UpdatedJobSearchPage />, "/updated-jobs");
+    await waitFor(() => expect(screen.getByRole("button", { name: /apply on dice/i })).toBeInTheDocument());
+    await userEvent.click(screen.getByRole("button", { name: /^details$/i }));
+    const drawer = screen.getByRole("dialog", { name: /job details/i });
+    await userEvent.click(within(drawer).getByRole("button", { name: /apply on dice/i }));
+    await waitFor(() => expect(tab.location.href).toBe(providerJob.application_url));
+  });
+
+  it("does not render Apply when the backend says no usable URL exists", async () => {
+    mockFetchWith({
+      jobsBody: {
+        jobs: [{ ...discoveredJob, application_url: null, action_label: "Unavailable", can_apply: false }],
+        summary: { recently_detected: 1, strong_matches: 1, companies_monitored: 1, sources_checked: 4, last_updated: new Date().toISOString() },
+        sources: [],
+        has_resume: true,
+        has_preferences: true,
+      },
+    });
+    renderRoute(<UpdatedJobSearchPage />, "/updated-jobs");
+    await waitFor(() => expect(screen.getByRole("button", { name: /unavailable/i })).toBeDisabled());
+    expect(screen.queryByRole("button", { name: /^apply on company site$/i })).toBeNull();
   });
 });

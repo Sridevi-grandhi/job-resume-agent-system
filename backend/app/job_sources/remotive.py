@@ -59,7 +59,7 @@ class RemotiveAdapter(JobSourceAdapter):
 
         tags = raw.get("tags") or []
         skills = ", ".join(str(tag).strip() for tag in tags if str(tag).strip()) if isinstance(tags, list) else str(tags)
-        job_type = str(raw.get("job_type") or "").replace("_", " ").title() or "Full-time"
+        job_type = str(raw.get("job_type") or "").replace("_", " ").title() or "Not specified"
 
         posted_at = None
         publication_date = raw.get("publication_date")

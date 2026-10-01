@@ -2,6 +2,7 @@ import { useNavigate } from "react-router-dom";
 import { useApp } from "../context/AppContext";
 import MatchScoreBadge from "./MatchScoreBadge";
 import MatchScoreRing from "./MatchScoreRing";
+import { ATS_ENTRY_MODE, writeStartOptimizationIntent } from "../utils/atsWizardState";
 
 const genericSearchSources = new Set([
   "LinkedIn Jobs",
@@ -68,15 +69,20 @@ export default function JobCard({ job, compact = false, selected = false, showRi
     const jobId = String(job.id || job.job_id);
     setAtsSelectedJobId(jobId);
     sessionStorage.setItem("atsSelectedJobId", jobId);
-    navigate(`/optimizer/${jobId}`, {
-      state: {
-        job_id: Number(jobId),
-        title: job.title,
-        company: job.company,
-        job_url: job.job_url,
-        source: job.source,
-      },
-    });
+    const state = {
+      job_id: Number(jobId),
+      title: job.title,
+      company: job.company,
+      job_url: job.job_url,
+      source: job.source,
+    };
+    // Selected Jobs: start the guided wizard at Step 1 for this job.
+    // Job Search / other cards keep the existing restore-on-open behavior.
+    if (selected) {
+      state.atsEntryMode = ATS_ENTRY_MODE.START_OPTIMIZATION;
+      writeStartOptimizationIntent(jobId);
+    }
+    navigate(`/optimizer/${jobId}`, { state });
   };
 
   return <article className={`job-card ${compact ? "compact" : ""}`}>

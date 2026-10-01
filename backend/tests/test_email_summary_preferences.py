@@ -16,6 +16,9 @@ def test_new_user_gets_safe_defaults_without_a_row(client, test_user, db_session
         "effective_daily_summary_recipient": test_user.email,
         "gmail_scan_frequency": "daily",
         "email_types_to_scan": ["job_opportunities", "recruiter_messages", "application_updates", "interview_invitations"],
+        "job_alerts_enabled": True,
+        "application_updates_enabled": True,
+        "interview_alerts_enabled": True,
     }
     assert db_session.query(EmailSummaryPreference).count() == 0
 
@@ -122,3 +125,47 @@ def test_email_types_default_to_all_four_until_saved(client, test_user, db_sessi
         "job_opportunities", "recruiter_messages", "application_updates", "interview_invitations",
     ]
     assert payload["gmail_scan_frequency"] == "daily"
+
+
+def test_explicit_empty_email_types_round_trip_as_none_selected(client, test_user):
+    response = client.patch(f"/api/email/preferences/{test_user.id}", json={"email_types_to_scan": []})
+    assert response.status_code == 200
+    assert response.json()["email_types_to_scan"] == []
+    assert client.get(f"/api/email/preferences/{test_user.id}").json()["email_types_to_scan"] == []
+
+
+def test_one_hour_interval_and_notification_preferences_round_trip_independently(client, test_user, db_session):
+    response = client.patch(f"/api/email/preferences/{test_user.id}", json={
+        "gmail_scan_frequency": "every_1_hour",
+        "email_types_to_scan": ["interview_invitations"],
+        "job_alerts_enabled": False,
+        "application_updates_enabled": True,
+        "interview_alerts_enabled": False,
+    })
+    assert response.status_code == 200
+    payload = client.get(f"/api/email/preferences/{test_user.id}").json()
+    assert payload["gmail_scan_frequency"] == "every_1_hour"
+    assert payload["email_types_to_scan"] == ["interview_invitations"]
+    assert payload["job_alerts_enabled"] is False
+    assert payload["application_updates_enabled"] is True
+    assert payload["interview_alerts_enabled"] is False
+    preference = db_session.query(EmailSummaryPreference).filter_by(user_id=test_user.id).one()
+    assert preference.gmail_scan_frequency == "every_1_hour"
+    assert preference.interview_alerts_enabled is False
+    assert preference.email_types_to_scan == '["interview_invitations"]'
+
+
+def test_notification_preference_change_does_not_change_scan_selection(client, test_user):
+    url = f"/api/email/preferences/{test_user.id}"
+    client.patch(url, json={"email_types_to_scan": ["interview_invitations"]})
+    response = client.patch(url, json={"interview_alerts_enabled": False})
+    assert response.status_code == 200
+    assert response.json()["email_types_to_scan"] == ["interview_invitations"]
+    assert client.get(url).json()["email_types_to_scan"] == ["interview_invitations"]
+
+
+def test_notification_preferences_reject_non_boolean_values(client, test_user):
+    response = client.patch(f"/api/email/preferences/{test_user.id}", json={"interview_alerts_enabled": "false"})
+    null_response = client.patch(f"/api/email/preferences/{test_user.id}", json={"interview_alerts_enabled": None})
+    assert response.status_code == 422
+    assert null_response.status_code == 422

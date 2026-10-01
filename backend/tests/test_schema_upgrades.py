@@ -152,6 +152,33 @@ def test_ensure_ats_schema_preserves_existing_data(monkeypatch, sqlite_engine):
     assert tuple(row) == (7, 8, 9, 42, "optimized")
 
 
+def test_ensure_ats_schema_adds_nullable_unverified_apply_url_to_legacy_discovered_jobs(monkeypatch, sqlite_engine):
+    """The Dice candidate column must upgrade an existing jobs table without
+    changing legacy destinations or rows that never had a provider candidate."""
+    monkeypatch.setattr(schema_upgrades, "engine", sqlite_engine)
+    monkeypatch.setattr(schema_upgrades, "Base", Base)
+
+    with sqlite_engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE discovered_jobs (id INTEGER PRIMARY KEY, application_url TEXT, direct_url TEXT)"
+        ))
+        conn.execute(text(
+            "INSERT INTO discovered_jobs (id, application_url, direct_url) "
+            "VALUES (1, 'https://careers.example/jobs/123', 'https://careers.example/jobs/123')"
+        ))
+
+    schema_upgrades.ensure_ats_schema()
+
+    columns = {column["name"]: column for column in inspect(sqlite_engine).get_columns("discovered_jobs")}
+    assert "unverified_application_url" in columns
+    assert columns["unverified_application_url"]["nullable"] is True
+    with sqlite_engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT application_url, direct_url, unverified_application_url FROM discovered_jobs WHERE id = 1"
+        )).one()
+    assert tuple(row) == ("https://careers.example/jobs/123", "https://careers.example/jobs/123", None)
+
+
 def test_ensure_ats_schema_handles_missing_table_gracefully(monkeypatch, sqlite_engine):
     monkeypatch.setattr(schema_upgrades, "engine", sqlite_engine)
     monkeypatch.setattr(schema_upgrades, "Base", Base)

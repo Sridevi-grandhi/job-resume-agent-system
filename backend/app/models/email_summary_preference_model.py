@@ -30,10 +30,16 @@ class EmailSummaryPreference(Base):
     # "recruiter_messages", "application_updates", "interview_invitations")
     # the user wants CareerBoost to surface/process from Gmail. NULL means
     # "all four" — the same effective behavior as before this field
-    # existed, so no existing scan/test is affected. Never used to request
+    # existed, while an explicit [] disables all categories. Never used to request
     # additional Gmail scopes; it only filters which classified JobEmailEvent
     # rows job_email_scan_service persists.
     email_types_to_scan = Column(Text, nullable=True)
+
+    # Visibility in the existing in-app notification bell. Defaults preserve
+    # every notification users received before these controls existed.
+    job_alerts_enabled = Column(Boolean, nullable=False, default=True)
+    application_updates_enabled = Column(Boolean, nullable=False, default=True)
+    interview_alerts_enabled = Column(Boolean, nullable=False, default=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())

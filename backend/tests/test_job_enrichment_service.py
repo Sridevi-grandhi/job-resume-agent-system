@@ -25,6 +25,7 @@ from app.services.job_enrichment_service import (
     enrichment_provider,
 )
 from app.services.job_normalization_service import resolve_apply_action
+from app.services import job_normalization_service as normalization
 
 
 def _aggregator_job(**overrides):
@@ -72,6 +73,47 @@ def test_exact_employer_candidate_enriches_successfully():
     assert action["can_apply"] is True
 
 
+def test_explicit_verified_employer_domain_alias_can_pass_shared_verification(monkeypatch):
+    """Brand/parent relationships require a reviewed exact-domain entry;
+    they are never inferred from a provider-supplied URL."""
+    monkeypatch.setitem(
+        normalization._VERIFIED_EMPLOYER_DOMAIN_ALIASES,
+        "exampletalentbrand",
+        frozenset({"example-parent-careers.com"}),
+    )
+    job = _aggregator_job(company="Example Talent Brand LLC")
+    provider = _mock_provider([
+        EnrichmentCandidateResult(
+            url="https://jobs.example-parent-careers.com/job/48213/senior-java-developer",
+            matched_title="Senior Java Developer", matched_company="Example Talent Brand",
+            matched_location="Austin, TX",
+        ),
+    ])
+    with patch("app.services.job_enrichment_service.availability.check_url_availability",
+               return_value={"status": "ACTIVE", "reason": "http_200", "final_url": None}):
+        result = enrich_job(job, provider=provider)
+    assert result.status == "ENRICHED"
+    evidence = next(item for item in result.diagnostics if item.get("employer_identity") == "VERIFIED_ALIAS")
+    assert evidence["employer_alias"] == "example-parent-careers.com"
+
+
+def test_unconfirmed_app_domain_remains_rejected_before_availability_lookup():
+    job = _aggregator_job(company="Example Talent Brand LLC")
+    provider = _mock_provider([
+        EnrichmentCandidateResult(
+            url="https://hrmsportal.app/job/48213/senior-java-developer",
+            matched_title="Senior Java Developer", matched_company="Example Talent Brand",
+            matched_location="Austin, TX",
+        ),
+    ])
+    with patch("app.services.job_enrichment_service.availability.check_url_availability") as mocked_availability:
+        result = enrich_job(job, provider=provider)
+    assert result.status == "REJECTED"
+    evidence = next(item for item in result.diagnostics if item.get("employer_identity") == "UNRECOGNIZED_DOMAIN")
+    assert evidence["url_safety"] == "PASSED"
+    mocked_availability.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # 2. Same company, wrong role -> reject -> View Listing
 # ---------------------------------------------------------------------------
@@ -88,8 +130,9 @@ def test_same_company_wrong_role_is_rejected():
     assert result.status == "REJECTED"
     assert result.url is None
 
-    action = resolve_apply_action(job)  # job untouched — still aggregator
-    assert action["action_label"] == "View Listing"
+    action = resolve_apply_action(job)  # employer candidate rejected; exact listing remains
+    assert action["action_label"] == "View on LinkedIn"
+    assert action["is_direct"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -205,9 +248,11 @@ def test_candidate_blocked_at_availability_check_is_not_enriched():
         result = enrich_job(job, provider=provider, employer_website="https://www.example-corp.com")
     assert result.status == "REJECTED"
 
-    # The job stays a plain aggregator listing — never falsely UNKNOWN-direct.
+    # Availability failure never promotes a verified direct apply. The exact
+    # provider listing remains an application fallback.
     action = resolve_apply_action(job)
-    assert action["action_label"] == "View Listing"
+    assert action["action_label"] == "View on LinkedIn"
+    assert action["is_direct"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +269,7 @@ def test_direct_job_with_aggregator_source_keeps_secondary_action():
     )
     action = resolve_apply_action(job)
     assert action["action_label"] == "Apply"
-    assert action["secondary_action"] == {"label": "View Source Listing", "url": "https://www.linkedin.com/jobs/view/12345"}
+    assert action["secondary_action"] == {"label": "View Source", "url": "https://www.linkedin.com/jobs/view/12345"}
 
 
 def test_direct_job_with_no_alternate_source_has_no_secondary_action():
@@ -242,7 +287,8 @@ def test_aggregator_only_job_has_no_secondary_action():
     """The primary action already IS the listing — nothing to fall back to."""
     job = _aggregator_job()
     action = resolve_apply_action(job)
-    assert action["action_label"] == "View Listing"
+    assert action["action_label"] == "View on LinkedIn"
+    assert action["is_direct"] is False
     assert action["secondary_action"] is None
 
 
@@ -262,7 +308,8 @@ def test_no_provider_configured_leaves_job_untouched():
     assert job.application_url is None
 
     action = resolve_apply_action(job)
-    assert action["action_label"] == "View Listing"
+    assert action["action_label"] == "View on LinkedIn"
+    assert action["is_direct"] is False
     assert action["can_apply"] is True
 
 
@@ -395,11 +442,16 @@ def test_broad_provider_used_when_greenhouse_lever_finds_nothing_and_broad_is_co
     assert result.provider_name == "broad_search_enrichment"
 
 
-def test_provider_error_from_greenhouse_lever_falls_through_to_broad_or_view_listing():
+def test_provider_error_from_greenhouse_lever_falls_through_to_broad_or_view_listing(monkeypatch):
     """Item 9: a provider-level error never propagates as a crash — the
     job simply stays View Listing (broad disabled by default in this test
     too, so the orchestration returns the Greenhouse/Lever error result
     directly)."""
+    # This test exercises the no-broad-provider branch. Developer .env files
+    # may legitimately configure SerpAPI, so make that branch explicit and
+    # guarantee no external broad-provider client can be reached.
+    monkeypatch.setenv("JOB_ENRICHMENT_BROAD_PROVIDER", "none")
+    monkeypatch.delenv("JOB_ENRICHMENT_BROAD_API_KEY", raising=False)
     job = _aggregator_job()
 
     def broken_provider(_query):

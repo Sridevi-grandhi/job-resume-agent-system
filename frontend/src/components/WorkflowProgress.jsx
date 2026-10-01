@@ -14,7 +14,7 @@ export default function WorkflowProgress(){
     ["/jobs","jobs","Job Search",a.jobs.length?`${a.jobs.length} jobs`:"Pending",!!a.jobs.length],
     ["/selected-jobs","selected","Selected Jobs",a.selectedJobs.length?`${a.selectedJobs.length} added`:"Optional",!!a.selectedJobs.length],
     ["/ats-analyzer","optimizer","ATS Analyzer",a.atsResult?"Analyzed":a.optimizedResumes.length?`${a.optimizedResumes.length} optimized`:"Pending",!!(a.atsResult||a.optimizedResumes.length||a.matches.length)],
-    ["/emails","emails","Email Summary",a.emailLogs.length?`${a.emailLogs.length} sent`:"Pending",!!a.emailLogs.length],
+    ["/emails","emails","Email Summary",a.emailLogs.length?`${a.emailLogs.length} logs`:"Pending",!!a.emailLogs.length],
     ["/workflow","workflow","Workflow",workflowDone?"Complete":"Ready",workflowDone],
   ];
   return <section className="workflow-progress">{items.map(([to,icon,label,status,done],i)=><Link key={to} to={to} className={done?"done":""}><div className="flow-icon"><Icon name={icon} size={18}/></div><b>{label}</b><small>{status}</small>{i<items.length-1&&<i className="connector"/>}</Link>)}</section>;

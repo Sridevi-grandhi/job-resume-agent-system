@@ -43,13 +43,16 @@ class JobSourceAdapter(ABC):
 
     def fetch_normalized_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
         jobs = []
-        for raw in self.fetch_jobs(limit=limit):
+        raw_jobs = self.fetch_jobs(limit=limit)
+        self.last_counts = {"raw": len(raw_jobs), "normalized": 0, "rejected": 0}
+        for raw in raw_jobs:
             try:
                 normalized = self.normalize_job(raw)
             except Exception:
                 normalized = None
             if normalized:
                 jobs.append(normalized)
+        self.last_counts.update(normalized=len(jobs), rejected=len(raw_jobs) - len(jobs))
         return jobs
 
 

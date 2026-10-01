@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime
 
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -36,8 +35,8 @@ def _run_scheduled_poll() -> None:
 
 def schedule_updated_job_poll() -> None:
     """Register (or refresh) the recurring poll job on the shared scheduler.
-    Fires once immediately (next_run_time=now) so newly discovered jobs are
-    available on first login, then repeats every poll_interval_minutes()."""
+    The first run waits one interval so a process restart does not spend
+    discovery quota; Refresh Jobs still polls immediately."""
     if not tracker_enabled():
         logger.info("Updated Job Search tracker disabled (UPDATED_JOB_TRACKER_ENABLED=false)")
         return
@@ -48,7 +47,10 @@ def schedule_updated_job_poll() -> None:
         trigger=IntervalTrigger(minutes=poll_interval_minutes()),
         id=JOB_ID,
         replace_existing=True,
-        next_run_time=datetime.now(),
+        # First fire is after one interval, not immediately on process start.
+        # An immediate next_run_time would spend JSearch quota on every
+        # backend restart / deploy; operators still have the explicit
+        # Refresh Jobs button for an on-demand poll.
     )
     logger.info("Updated Job Search polling scheduled every %s minute(s)", poll_interval_minutes())
 

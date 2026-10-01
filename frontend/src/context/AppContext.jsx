@@ -1,6 +1,8 @@
 /* eslint-disable react-hooks/exhaustive-deps, react-refresh/only-export-components */
 import { createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
 import * as api from "../api";
+import { mergeAtsResult } from "../utils/atsWizardState";
+import { averageCompletedMatch } from "../utils/matchScoreUtils";
 
 const AppContext = createContext(null);
 const emptyPreferences = { job_title:"", location:"", experience:"", work_mode:"", job_type:"", skills:"", schedule_time:"08:00", timezone:"America/Chicago" };
@@ -8,6 +10,7 @@ const ALL_EMAIL_CATEGORIES = ["job_opportunities", "recruiter_messages", "applic
 const emptyEmailSummaryPreferences = {
   daily_summary_delivery_enabled: false, automatic_gmail_scan_enabled: false, daily_summary_recipient: "", effective_daily_summary_recipient: "",
   gmail_scan_frequency: "daily", email_types_to_scan: ALL_EMAIL_CATEGORIES,
+  job_alerts_enabled: true, application_updates_enabled: true, interview_alerts_enabled: true,
 };
 const emptySelectedJob = { title:"", company:"", location:"", work_mode:"Remote", job_type:"Full-time", description:"", skills_required:"", source:"User Selected Job", job_url:"" };
 const messageOf = (error) => error?.message || "Something went wrong.";
@@ -40,6 +43,9 @@ const TERMINAL_ATS_START_STATUSES = new Set([
 ]);
 
 function statusLabel(status, detail) {
+  if (status === "VALIDATION_FAILED") {
+    return "Validation failed. The generated resume contained unsupported information.";
+  }
   const base = STATUS_LABELS[status] || status || "Processing…";
   return detail ? `${base}: ${detail}` : base;
 }
@@ -78,6 +84,10 @@ export function AppProvider({ children }) {
   const activeAtsWorkflowIdRef = useRef(null);
   const atsPollGenerationRef = useRef(0);
   const atsGeneratingLockRef = useRef(false);
+  const busyTicketRef = useRef(0);
+  const busyKeyRef = useRef("");
+  const missingSkillsGroupsRef = useRef(null);
+  const emailPreferencesSaveVersionRef = useRef(0);
   const tell = (key, value) => setMessages((old) => ({ ...old, [key]: value }));
   const clearMessage = (key) => setMessages((old) => {
     if (!(key in old)) return old;
@@ -87,16 +97,25 @@ export function AppProvider({ children }) {
   });
   const task = async (key, fn) => {
     if (key === "ats") {
-      if (atsGeneratingLockRef.current || busy === "ats") {
-        throw new Error("Resume generation is already in progress.");
+      if (atsGeneratingLockRef.current || busyKeyRef.current === "ats") {
+        tell("ats", "Resume generation is already in progress.");
+        return null;
       }
       atsGeneratingLockRef.current = true;
     }
-    setBusy(key);
-    clearMessage(key);
+    const stealBusy = !(atsGeneratingLockRef.current && key !== "ats");
+    const ticket = ++busyTicketRef.current;
+    if (stealBusy) {
+      busyKeyRef.current = key;
+      setBusy(key);
+      clearMessage(key);
+    }
     try { return await fn(); } catch (e) { tell(key, messageOf(e)); } finally {
       if (key === "ats") atsGeneratingLockRef.current = false;
-      setBusy("");
+      if (stealBusy && busyTicketRef.current === ticket && busyKeyRef.current === key) {
+        busyKeyRef.current = "";
+        setBusy("");
+      }
     }
   };
 
@@ -113,7 +132,7 @@ export function AppProvider({ children }) {
       onProgress: (status) => {
         if (generation !== atsPollGenerationRef.current) return;
         if (Number(status?.workflow_id) !== Number(workflowId)) return;
-        setAtsResult(status);
+        setAtsResult((current) => mergeAtsResult(status, current) || current);
         tell("ats", statusLabel(status.workflow_status));
       },
     };
@@ -122,6 +141,20 @@ export function AppProvider({ children }) {
   const cancelAtsPolling = () => {
     atsPollGenerationRef.current += 1;
     activeAtsWorkflowIdRef.current = null;
+  };
+
+  const startAtsForSelectedJob = (jobId) => {
+    cancelAtsPolling();
+    setActiveAtsWorkflowId(null);
+    setPreviousAtsResult(null);
+    setAtsResult(null);
+    setRequirementAnalysis(null);
+    setMissingSkillsGroups(null);
+    missingSkillsGroupsRef.current = null;
+    setConfirmedSkills([]);
+    clearMessage("ats");
+    clearMessage("ats-requirements");
+    setAtsSelectedJobId(String(jobId));
   };
 
   useEffect(() => { api.checkBackendHealth().then((d) => setBackendStatus(d.status || "Backend is running")).catch(() => setBackendStatus("Backend not connected")); }, []);
@@ -139,7 +172,7 @@ export function AppProvider({ children }) {
   };
   const authenticate = async (mode, form) => task(mode === "signup" ? "authSignup" : "authLogin", async () => {
     const data = mode === "login" ? await api.loginUser(form) : await api.signupUser(form);
-    const user = { user_id:data.user_id, email:data.email, name:data.name || form.name || "" };
+    const user = { user_id:data.user_id, email:data.email, name:String(data.name || form.name || "").trim() };
     localStorage.setItem("currentUser", JSON.stringify(user)); resetData(); setCurrentUser(user); return true;
   });
   const clearAuthMessages = () => {
@@ -164,6 +197,14 @@ export function AppProvider({ children }) {
     return data;
   });
   const logout = () => { localStorage.removeItem("currentUser"); resetData(); setCurrentUser(null); };
+  const saveProfileName = ({ name, current_password }) => task("profile", async () => {
+    const data = await api.updateProfileName(userId, { name, current_password });
+    const user = { ...currentUser, user_id: data.user_id, name: data.name, email: data.email };
+    localStorage.setItem("currentUser", JSON.stringify(user));
+    setCurrentUser(user);
+    tell("profile", "Profile saved.");
+    return data;
+  });
   const changePreferences = (e) => { setPreferences((p) => ({...p,[e.target.name]:e.target.value})); setPreferencesSaved(false); };
   const savePreferences = (e) => { e?.preventDefault(); return task("preferences", async () => { const d=await api.saveUserPreferences({...preferences,user_id:Number(userId)}); setPreferencesSaved(true); tell("preferences",d.message||"Preferences saved."); }); };
   const loadPreferences = () => task("preferences", async () => { const d=await api.getUserPreferences(userId); setPreferences({...emptyPreferences,...d,schedule_time:d.schedule_time?.slice(0,5)||"08:00"}); setPreferencesSaved(true); tell("preferences","Saved preferences loaded."); });
@@ -369,7 +410,7 @@ export function AppProvider({ children }) {
         return finalResult;
       }
       if (Number(finalResult?.workflow_id) === Number(workflowId)) {
-        setAtsResult(finalResult);
+        setAtsResult((current) => mergeAtsResult(finalResult, current) || finalResult);
         setPreviousAtsResult(null);
       }
     }
@@ -428,7 +469,7 @@ export function AppProvider({ children }) {
       timeoutSeconds: started.poll_timeout_seconds,
     });
     if (poll.isCancelled() || d?.poll_cancelled) return d;
-    setAtsResult(d);
+    setAtsResult((current) => mergeAtsResult(d, current) || d);
     if (d.workflow_status === "COMPLETED") {
       tell(
         "ats",
@@ -439,18 +480,20 @@ export function AppProvider({ children }) {
     }
     return d;
   });
-  const loadAtsResultForJob = (jobId) => task("ats", async () => {
+  const loadAtsResultForJob = async (jobId) => {
     const id = jobId || atsSelectedJobId;
     if (!id) return null;
+    // Status GET is read-only and must never occupy the generate busy channel
+    // or overwrite an in-flight Step-5 workflow with a stale job lookup.
     if (atsGeneratingLockRef.current || activeAtsWorkflowIdRef.current) {
-      return atsResult;
+      return null;
     }
     try {
       const d = await api.getAtsResultByJob(userId, id);
       if (atsGeneratingLockRef.current || activeAtsWorkflowIdRef.current) {
-        return atsResult;
+        return null;
       }
-      setAtsResult(d);
+      setAtsResult((current) => mergeAtsResult(d, current) || d);
       const status = String(d.workflow_status || "");
       // Do not stamp Step 2 Analyze Requirements with a historical generation failure.
       // Keep the workflow record available for Step 5 retry without a sticky Failed banner.
@@ -461,16 +504,19 @@ export function AppProvider({ children }) {
         );
       } else if (status === "FAILED" || status === "VALIDATION_FAILED") {
         clearMessage("ats");
-      } else {
+      } else if (status) {
         tell("ats", statusLabel(d.workflow_status));
       }
       return d;
     } catch {
+      if (atsGeneratingLockRef.current || activeAtsWorkflowIdRef.current) {
+        return null;
+      }
       setAtsResult(null);
       clearMessage("ats");
       return null;
     }
-  });
+  };
   const loadJobRequirements = (jobId) => task("ats-requirements", async () => {
     const id = jobId || atsSelectedJobId;
     if (!id) throw new Error("Select a job before analyzing its requirements.");
@@ -480,22 +526,32 @@ export function AppProvider({ children }) {
     tell("ats-requirements", "Job requirements analyzed successfully.");
     return d;
   });
-  const loadMissingSkills = (jobId, { forceRefresh = true } = {}) => task("ats-requirements", async () => {
+  const loadMissingSkills = (jobId, { forceRefresh = true } = {}) => {
+    if (atsGeneratingLockRef.current) {
+      return Promise.resolve(missingSkillsGroupsRef.current);
+    }
+    return task("ats-requirements", async () => {
     const id = jobId || atsSelectedJobId;
     if (!id) throw new Error("Select a job before analyzing its requirements.");
     const d = forceRefresh
       ? await api.analyzeOptimizerRequirements(userId, id, { forceRefresh: true })
       : await api.getMissingSkills(userId, id, { forceRefresh: false });
+    if (atsGeneratingLockRef.current) {
+      return missingSkillsGroupsRef.current;
+    }
     // Full replace — never merge evidence-only payloads over analysis arrays.
     setMissingSkillsGroups(d);
+    missingSkillsGroupsRef.current = d;
     if (d?.analysis_status === "REQUIREMENT_EXTRACTION_FAILED" || d?.analysis_status === "ANALYSIS_CONSISTENCY_FAILED") {
       tell("ats-requirements", d.analysis_error || "We could not extract requirements from this job description. Please retry.");
     } else {
       // Successful analysis must replace any prior generation Failed banner.
-      clearMessage("ats");
+      if (!atsGeneratingLockRef.current) {
+        clearMessage("ats");
+      }
       tell("ats-requirements", "Job requirements analyzed successfully.");
       setAtsResult((current) => {
-        if (!current) return current;
+        if (!current || atsGeneratingLockRef.current) return current;
         const status = String(current.workflow_status || "");
         const staleFailure = status === "FAILED"
           || status === "VALIDATION_FAILED"
@@ -505,6 +561,7 @@ export function AppProvider({ children }) {
     }
     return d;
   });
+  };
   const applyEvidenceWorkflowState = (d, current = null) => {
     // Evidence endpoints intentionally omit skill classification arrays. Never invent
     // a "successful" empty analysis from readiness-only payloads.
@@ -541,7 +598,11 @@ export function AppProvider({ children }) {
     if (!id) return null;
     const d = await api.getEvidence(userId, id);
     setConfirmedSkills(Array.isArray(d.evidence) ? d.evidence : []);
-    setMissingSkillsGroups((current) => applyEvidenceWorkflowState(d, current));
+    setMissingSkillsGroups((current) => {
+      const next = applyEvidenceWorkflowState(d, current);
+      missingSkillsGroupsRef.current = next;
+      return next;
+    });
     return d;
   });
   const saveConfirmedSkills = (jobId, items) => task("ats-skills", async () => {
@@ -550,7 +611,11 @@ export function AppProvider({ children }) {
     const d = await api.saveEvidence(userId, id, items);
     setConfirmedSkills(Array.isArray(d.evidence) ? d.evidence : []);
     // Apply readiness immediately so Continue enables without reload.
-    setMissingSkillsGroups((current) => applyEvidenceWorkflowState(d, current));
+    setMissingSkillsGroups((current) => {
+      const next = applyEvidenceWorkflowState(d, current);
+      missingSkillsGroupsRef.current = next;
+      return next;
+    });
     // Clear stale generation failures once current evidence unblocks generation.
     if (d.can_generate_resume) {
       setAtsResult((current) => {
@@ -584,7 +649,11 @@ export function AppProvider({ children }) {
     if (!id) throw new Error("Select a job first.");
     const d = await api.deleteEvidence(userId, id, evidenceId);
     setConfirmedSkills(Array.isArray(d.evidence) ? d.evidence : []);
-    setMissingSkillsGroups((current) => applyEvidenceWorkflowState(d, current));
+    setMissingSkillsGroups((current) => {
+      const next = applyEvidenceWorkflowState(d, current);
+      missingSkillsGroupsRef.current = next;
+      return next;
+    });
     try {
       const refreshed = await api.analyzeOptimizerRequirements(userId, id, { forceRefresh: true });
       setMissingSkillsGroups(refreshed);
@@ -600,12 +669,16 @@ export function AppProvider({ children }) {
   const loadEmailLogs = () => task("emails",async()=>{ const d=await api.getEmailLogs(userId); setEmailLogs(Array.isArray(d)?d:d.logs||[]); tell("emails","Email logs loaded."); });
   const generateEmailSummary = () => task("emails",async()=>{ const d=await api.generateEmailSummary(userId); tell("emails",d.message||"Email summary generated."); const list=await api.getEmailLogs(userId); setEmailLogs(Array.isArray(list)?list:list.logs||[]); });
   const loadEmailSummaryPreferences = () => task("email-settings", async () => {
+    const saveVersion = emailPreferencesSaveVersionRef.current;
     const data = await api.getEmailSummaryPreferences(userId);
-    setEmailSummaryPreferences({ ...emptyEmailSummaryPreferences, ...data, daily_summary_recipient: data.daily_summary_recipient || "" });
+    if (saveVersion === emailPreferencesSaveVersionRef.current) {
+      setEmailSummaryPreferences({ ...emptyEmailSummaryPreferences, ...data, daily_summary_recipient: data.daily_summary_recipient || "" });
+    }
     return data;
   });
   const saveEmailSummaryPreferences = (values) => task("email-settings", async () => {
     const data = await api.updateEmailSummaryPreferences(userId, values);
+    emailPreferencesSaveVersionRef.current += 1;
     setEmailSummaryPreferences({ ...emptyEmailSummaryPreferences, ...data, daily_summary_recipient: data.daily_summary_recipient || "" });
     tell("email-settings", "Email Summary settings saved.");
     return data;
@@ -639,8 +712,8 @@ export function AppProvider({ children }) {
   // Email Summary — Gmail connection, application tracking, recruiter drafts
   const loadGmailStatus = () => task("gmail",async()=>{ const d=await api.getGmailStatus(userId); setGmailStatus(d); });
   const connectGmailAccount = () => task("gmail",async()=>{ const d=await api.connectGmail(userId); if(d.authorization_url) window.location.href=d.authorization_url; });
-  const disconnectGmailAccount = () => task("gmail",async()=>{ await api.disconnectGmail(userId); tell("gmail","Gmail disconnected."); await loadGmailStatus(); });
-  const scanGmailForJobs = () => task("gmail",async()=>{ const d=await api.scanJobEmails(userId); tell("gmail",`Scan complete — checked ${d.messages_checked||0} message(s).`); await Promise.all([loadGmailStatus(),loadApplications(),loadJobEmailEvents()]); });
+  const disconnectGmailAccount = () => task("gmail",async()=>{ await api.disconnectGmail(userId); await loadGmailStatus(); tell("gmail","Gmail disconnected."); });
+  const scanGmailForJobs = () => task("gmail",async()=>{ const d=await api.scanJobEmails(userId); await Promise.all([loadGmailStatus(),loadApplications(),loadJobEmailEvents()]); tell("gmail",`Scan complete — checked ${d.messages_checked||0} message(s).`); });
   const loadApplications = () => task("applications",async()=>{ const d=await api.getApplications(userId); setApplications(Array.isArray(d.applications)?d.applications:[]); });
   const updateApplicationStatusAction = (applicationId,newStatus) => task("applications",async()=>{ await api.updateApplicationStatus(userId,applicationId,newStatus); tell("applications","Status updated."); await loadApplications(); });
   const loadJobEmailEvents = () => task("applications",async()=>{ const d=await api.getJobEmailEvents(userId); setJobEmailEvents(Array.isArray(d.events)?d.events:[]); });
@@ -655,13 +728,13 @@ export function AppProvider({ children }) {
     const updated = await api.toggleJobEmailEventStar(userId,eventId);
     setJobEmailEvents((old)=>old.map((event)=>(event.id===updated.id?updated:event)));
   });
-  const averageMatch = matches.length ? Math.round(matches.reduce((s,m)=>s+Number(m.match_percentage||0),0)/matches.length) : 0;
+  const averageMatch = averageCompletedMatch(matches) ?? 0;
   const value = useMemo(()=>({
     currentUser,backendStatus,preferences,preferencesSaved,latestResume,selectedResumeFile,jobs,selectedJobs,selectedJobForm,selectedJobImportReady,selectedJobImportStatus,
     optimizedResumes,matches,atsResult,activeAtsWorkflowId,previousAtsResult,atsSelectedJobId,requirementAnalysis,missingSkillsGroups,confirmedSkills,emailLogs,workflowResult,messages,busy,deletingJobId,averageMatch,
     gmailStatus,applications,jobEmailEvents,
-    authenticate,clearAuthMessages,requestPasswordReset,submitPasswordReset,logout,changePreferences,savePreferences,loadPreferences,setSelectedResumeFile,uploadResume,loadLatestResume,loadJobs,search,
-    changeSelectedJob,previewSelectedJobUrl,clearSelectedJob,saveSelectedJob,loadSelectedJobs,removeSelectedJob,verifyLatestResume,optimizeResume,loadOptimizedResumes,analyzeAndOptimize,retryAtsWorkflow,loadAtsResultForJob,setAtsSelectedJobId,setAtsResult,
+    authenticate,clearAuthMessages,requestPasswordReset,submitPasswordReset,logout,saveProfileName,changePreferences,savePreferences,loadPreferences,setSelectedResumeFile,uploadResume,loadLatestResume,loadJobs,search,
+    changeSelectedJob,previewSelectedJobUrl,clearSelectedJob,saveSelectedJob,loadSelectedJobs,removeSelectedJob,verifyLatestResume,optimizeResume,loadOptimizedResumes,analyzeAndOptimize,retryAtsWorkflow,loadAtsResultForJob,setAtsSelectedJobId,setAtsResult,startAtsForSelectedJob,
     loadJobRequirements,loadMissingSkills,loadSkillConfirmations,saveConfirmedSkills,deleteConfirmedSkill,setMissingSkillsGroups,
     calculateMatches,loadMatches,generateEmailSummary,loadEmailLogs,runWorkflow,refreshUserWorkspaceState,emailSummaryPreferences,loadEmailSummaryPreferences,saveEmailSummaryPreferences,
     loadGmailStatus,connectGmailAccount,disconnectGmailAccount,scanGmailForJobs,loadApplications,updateApplicationStatusAction,loadJobEmailEvents,resolveJobEmailEventAction,markJobEmailEventReadAction,toggleJobEmailEventStarAction

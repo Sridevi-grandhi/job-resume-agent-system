@@ -44,5 +44,8 @@ class JobSourceRun(Base):
     errors = Column(Integer, nullable=False, default=0)
     duration_ms = Column(Integer, nullable=True)
     error_message = Column(Text, nullable=True)
+    user_id = Column(Integer, nullable=True)
+    outcome = Column(String(30), nullable=True)
+    diagnostics = Column(Text, nullable=True)
 
     created_at = Column(DateTime(timezone=True), server_default=func.now())

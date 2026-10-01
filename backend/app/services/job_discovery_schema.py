@@ -23,6 +23,20 @@ TABLE_COLUMN_DDL = {
     "discovered_jobs": {
         "company_logo_url": "ALTER TABLE discovered_jobs ADD COLUMN company_logo_url TEXT",
         "application_url": "ALTER TABLE discovered_jobs ADD COLUMN application_url TEXT",
+        "candidate_application_type": "ALTER TABLE discovered_jobs ADD COLUMN candidate_application_type VARCHAR(40)",
+        "source_provenance": "ALTER TABLE discovered_jobs ADD COLUMN source_provenance TEXT",
+        "verified_destination_url": "ALTER TABLE discovered_jobs ADD COLUMN verified_destination_url TEXT",
+        "enrichment_checked_at": "ALTER TABLE discovered_jobs ADD COLUMN enrichment_checked_at TIMESTAMP WITH TIME ZONE",
+        "enrichment_input_hash": "ALTER TABLE discovered_jobs ADD COLUMN enrichment_input_hash VARCHAR(64)",
+        "enrichment_status": "ALTER TABLE discovered_jobs ADD COLUMN enrichment_status VARCHAR(40)",
+        "enrichment_diagnostics": "ALTER TABLE discovered_jobs ADD COLUMN enrichment_diagnostics TEXT",
+        "career_page_url": "ALTER TABLE discovered_jobs ADD COLUMN career_page_url TEXT",
+        "career_metadata": "ALTER TABLE discovered_jobs ADD COLUMN career_metadata TEXT",
+    },
+    "job_source_runs": {
+        "user_id": "ALTER TABLE job_source_runs ADD COLUMN user_id INTEGER",
+        "outcome": "ALTER TABLE job_source_runs ADD COLUMN outcome VARCHAR(30)",
+        "diagnostics": "ALTER TABLE job_source_runs ADD COLUMN diagnostics TEXT",
     },
 }
 
@@ -41,7 +55,7 @@ TABLE_COLUMN_WIDEN = {
     # fine for Greenhouse/Lever's short numeric/slug ids, but a real,
     # live-verified JSearch job_id is an opaque ~400-character base64
     # token. external_id ("{source}:{source_job_id}") widened to match.
-    "discovered_jobs": {"source_job_id": 512, "external_id": 600},
+    "discovered_jobs": {"source_job_id": 512, "external_id": 600, "direct_url_source": 80},
 }
 
 

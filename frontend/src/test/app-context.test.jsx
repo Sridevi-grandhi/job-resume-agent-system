@@ -6,12 +6,14 @@ import * as api from "../api";
 vi.mock("../api", () => {
   const fn = () => vi.fn().mockResolvedValue({});
   return {
-    checkBackendHealth: fn(), loginUser: fn(), signupUser: fn(), saveUserPreferences: fn(), getUserPreferences: fn(),
+    checkBackendHealth: fn(), loginUser: fn(), signupUser: fn(), updateProfileName: fn(), saveUserPreferences: fn(), getUserPreferences: fn(),
     uploadResume: fn(), getLatestResume: fn(), getJobs: fn(), searchJobs: fn(), searchUpdatedJobs: fn(), importJobByUrl: fn(),
     getSelectedJobs: fn(), addSelectedJob: fn(), deleteSelectedJob: fn(), getOptimizedResumes: fn(), optimizeResume: fn(),
     startAtsOptimization: fn(), pollAtsWorkflow: fn(), retryAtsWorkflow: fn(), getAtsResultByJob: fn(), getJobRequirements: fn(),
     analyzeOptimizerRequirements: fn(), getMissingSkills: fn(), getEvidence: fn(), saveEvidence: fn(), deleteEvidence: fn(),
     getMatches: fn(), calculateMatches: fn(), getEmailLogs: fn(), generateEmailSummary: fn(), runFullWorkflow: fn(),
+    getGmailStatus: fn(), disconnectGmail: fn(), scanJobEmails: fn(), getApplications: fn(), getJobEmailEvents: fn(),
+    getEmailSummaryPreferences: fn(), updateEmailSummaryPreferences: fn(),
   };
 });
 
@@ -27,13 +29,60 @@ beforeEach(() => {
 });
 
 describe("application state provider", () => {
+  it("keeps a newly saved notification preference when an older settings load finishes late", async () => {
+    localStorage.setItem("currentUser", JSON.stringify({ user_id: 7, email: "candidate@example.test" }));
+    let finishLoad;
+    api.getEmailSummaryPreferences.mockImplementation(() => new Promise((resolve) => { finishLoad = resolve; }));
+    api.updateEmailSummaryPreferences.mockResolvedValue({
+      gmail_scan_frequency: "every_1_hour", job_alerts_enabled: false,
+      application_updates_enabled: true, interview_alerts_enabled: true,
+    });
+    mount();
+    let loading;
+    await act(async () => { loading = app.loadEmailSummaryPreferences(); await Promise.resolve(); });
+    await act(() => app.saveEmailSummaryPreferences({ job_alerts_enabled: false }));
+    await act(async () => {
+      finishLoad({ gmail_scan_frequency: "daily", job_alerts_enabled: true });
+      await loading;
+    });
+    expect(app.emailSummaryPreferences.job_alerts_enabled).toBe(false);
+    expect(app.emailSummaryPreferences.gmail_scan_frequency).toBe("every_1_hour");
+  });
+  it("keeps Gmail scan and disconnect completion messages after refreshing status", async () => {
+    localStorage.setItem("currentUser", JSON.stringify({ user_id: 7, email: "candidate@example.test" }));
+    api.scanJobEmails.mockResolvedValue({ messages_checked: 2 });
+    api.getGmailStatus.mockResolvedValue({ connected: true });
+    api.getApplications.mockResolvedValue({ applications: [] });
+    api.getJobEmailEvents.mockResolvedValue({ events: [] });
+    mount();
+    await act(() => app.scanGmailForJobs());
+    expect(app.messages.gmail).toBe("Scan complete — checked 2 message(s).");
+    await act(() => app.disconnectGmailAccount());
+    expect(app.messages.gmail).toBe("Gmail disconnected.");
+  });
+
   it("authenticates, persists, restores, and logs out", async () => {
     api.loginUser.mockResolvedValue({ user_id: 7, email: "candidate@example.test", name: "Candidate" });
     mount();
     await act(() => app.authenticate("login", { email: "candidate@example.test", password: "secret" }));
     expect(JSON.parse(localStorage.getItem("currentUser")).user_id).toBe(7);
+    expect(JSON.parse(localStorage.getItem("currentUser")).name).toBe("Candidate");
     act(() => app.logout());
     expect(localStorage.getItem("currentUser")).toBeNull();
+  });
+
+  it("synchronizes a saved profile name in shared state and local storage only after success", async () => {
+    localStorage.setItem("currentUser", JSON.stringify({ user_id: 7, name: "Tanishka", email: "candidate@example.test" }));
+    api.updateProfileName.mockResolvedValueOnce({ user_id: 7, name: "Tanishka Test", email: "candidate@example.test" });
+    mount();
+    await act(() => app.saveProfileName({ name: "Tanishka Test", current_password: "secret123" }));
+    expect(api.updateProfileName).toHaveBeenCalledWith(7, { name: "Tanishka Test", current_password: "secret123" });
+    expect(app.currentUser.name).toBe("Tanishka Test");
+    expect(JSON.parse(localStorage.getItem("currentUser")).name).toBe("Tanishka Test");
+    api.updateProfileName.mockRejectedValueOnce(new Error("backend detail"));
+    await act(() => app.saveProfileName({ name: "Wrong", current_password: "wrong" }));
+    expect(app.currentUser.name).toBe("Tanishka Test");
+    expect(JSON.parse(localStorage.getItem("currentUser")).name).toBe("Tanishka Test");
   });
 
   it("handles preferences and resume lifecycle", async () => {
@@ -394,5 +443,97 @@ describe("refreshUserWorkspaceState — Dashboard hydration", () => {
     await act(() => app.refreshUserWorkspaceState());
 
     expect(app.latestResume).toBeNull();
+  });
+
+  it("D/J. overlapping generate clicks start one workflow and ignore status reloads", async () => {
+    localStorage.setItem("currentUser", JSON.stringify({ user_id: 7 }));
+    api.startAtsOptimization.mockResolvedValue({
+      workflow_id: 3,
+      workflow_status: "PENDING",
+      created_new: true,
+      result: { workflow_id: 3, workflow_status: "PENDING" },
+    });
+    let finishPoll;
+    api.pollAtsWorkflow.mockImplementation(async (_id, { onProgress } = {}) => {
+      onProgress?.({
+        workflow_id: 3,
+        workflow_status: "ANALYZING_ORIGINAL",
+        updated_at: "2026-09-23T18:00:01Z",
+        major_step: 5,
+      });
+      return new Promise((resolve) => {
+        finishPoll = resolve;
+      });
+    });
+    api.getOptimizedResumes.mockResolvedValue({ optimized_resumes: [] });
+    api.getMatches.mockResolvedValue([]);
+    mount();
+    let first;
+    await act(async () => {
+      first = app.analyzeAndOptimize(9, true);
+      await Promise.resolve();
+      const second = await app.analyzeAndOptimize(9, true);
+      expect(second).toBeNull();
+      await app.loadAtsResultForJob(9);
+      await app.loadMissingSkills(9);
+    });
+    expect(api.startAtsOptimization).toHaveBeenCalledTimes(1);
+    expect(api.getAtsResultByJob).not.toHaveBeenCalled();
+    expect(api.analyzeOptimizerRequirements).not.toHaveBeenCalled();
+    expect(app.messages.ats).toMatch(/already in progress|Analyzing Original Resume/i);
+    expect(app.atsResult.workflow_status).toBe("ANALYZING_ORIGINAL");
+    await act(async () => {
+      finishPoll({
+        workflow_id: 3,
+        workflow_status: "COMPLETED",
+        updated_at: "2026-09-23T18:00:20Z",
+        original_match_percentage: 57,
+        optimized_match_percentage: 82,
+      });
+      await first;
+    });
+    expect(app.atsResult.workflow_status).toBe("COMPLETED");
+    expect(api.startAtsOptimization).toHaveBeenCalledTimes(1);
+  });
+
+  it("C. older ANALYZING_ORIGINAL payload cannot overwrite a newer completed result", async () => {
+    localStorage.setItem("currentUser", JSON.stringify({ user_id: 7 }));
+    api.getAtsResultByJob.mockResolvedValue({
+      workflow_id: 10,
+      workflow_status: "ANALYZING_ORIGINAL",
+      updated_at: "2026-09-23T17:00:00Z",
+    });
+    mount();
+    act(() => app.setAtsResult({
+      workflow_id: 10,
+      workflow_status: "COMPLETED",
+      updated_at: "2026-09-23T18:00:00Z",
+      optimized_resume_id: 91,
+      generated_resume: { plain_text: "Kept" },
+      optimized_match_percentage: 82,
+    }));
+    await act(() => app.loadAtsResultForJob(9));
+    expect(app.atsResult.workflow_status).toBe("COMPLETED");
+    expect(app.atsResult.optimized_resume_id).toBe(91);
+    expect(app.atsResult.generated_resume.plain_text).toBe("Kept");
+  });
+
+  it("F. retry does not re-run requirement analysis", async () => {
+    localStorage.setItem("currentUser", JSON.stringify({ user_id: 7 }));
+    api.retryAtsWorkflow.mockResolvedValue({ workflow_id: 5, workflow_status: "PENDING" });
+    api.pollAtsWorkflow.mockResolvedValue({
+      workflow_id: 5,
+      workflow_status: "COMPLETED",
+      original_match_percentage: 57,
+      optimized_match_percentage: 82,
+    });
+    api.getEvidence.mockResolvedValue({ evidence: [], can_generate_resume: true });
+    api.getOptimizedResumes.mockResolvedValue({ optimized_resumes: [] });
+    mount();
+    act(() => app.setAtsSelectedJobId("9"));
+    await act(() => app.retryAtsWorkflow(5));
+    expect(api.retryAtsWorkflow).toHaveBeenCalledWith(5);
+    expect(api.analyzeOptimizerRequirements).not.toHaveBeenCalled();
+    expect(api.startAtsOptimization).not.toHaveBeenCalled();
   });
 });

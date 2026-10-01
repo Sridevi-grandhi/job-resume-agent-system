@@ -421,7 +421,7 @@ def _validate_llm_result(
         supported_by_authoritative_evidence,
         unsupported_claim_message,
     )
-    from app.services.resume_generator import FAKE_METRIC_PATTERN
+    from app.services.resume_generator import sanitize_invented_metrics, unsupported_invented_metrics, apply_truthfulness_corrections
 
     normalized_valid_ids = {
         _normalize_evidence_id(item) for item in valid_evidence_ids if item
@@ -462,23 +462,51 @@ def _validate_llm_result(
         )
         raise GenerationValidationError("LLM returned empty generated_resume_plain_text")
 
+    evidence_baseline = "\n".join(
+        part for part in [resume_text or "", confirmed_evidence_text or ""] if part
+    )
     # Denied / unsupported JD skills must not appear as newly introduced claims,
     # unless covered by accepted USER_CONFIRMED_* evidence.
-    blocked_terms = []
-    for term in list(denied_skills or []) + list(unsupported_keywords or []):
+    denied_blocked = []
+    unsupported_blocked = []
+    for term in list(denied_skills or []):
         label = str(term or "").strip()
-        if not label:
+        if not label or not contains_keyword(plain, label):
             continue
-        if contains_keyword(plain, label):
-            if supported_by_authoritative_evidence(
-                label,
-                original_text=resume_text,
-                allowed_confirmed_skills=allowed_confirmed_skills,
-            ):
-                continue
-            blocked_terms.append(label)
-    if blocked_terms:
-        unique_blocked = list(dict.fromkeys(blocked_terms))
+        if supported_by_authoritative_evidence(
+            label,
+            original_text=resume_text,
+            allowed_confirmed_skills=allowed_confirmed_skills,
+        ):
+            continue
+        denied_blocked.append(label)
+    for term in list(unsupported_keywords or []):
+        label = str(term or "").strip()
+        if not label or not contains_keyword(plain, label):
+            continue
+        if supported_by_authoritative_evidence(
+            label,
+            original_text=resume_text,
+            allowed_confirmed_skills=allowed_confirmed_skills,
+        ):
+            continue
+        unsupported_blocked.append(label)
+    if denied_blocked:
+        unique_denied = list(dict.fromkeys(denied_blocked))
+        _log_truthfulness_failure(
+            workflow_id=workflow_id,
+            rule="unsupported_or_rejected_skill_introduced",
+            section="generated_resume_plain_text",
+            field="skills_or_experience",
+            reason="generated resume introduced rejected/unsupported skills",
+            unsupported_terms=unique_denied,
+            source="job_description",
+        )
+        raise GenerationValidationError(
+            "; ".join(unsupported_claim_message(term) for term in unique_denied)
+        )
+    if unsupported_blocked:
+        unique_blocked = list(dict.fromkeys(unsupported_blocked))
         _log_truthfulness_failure(
             workflow_id=workflow_id,
             rule="unsupported_or_rejected_skill_introduced",
@@ -488,26 +516,64 @@ def _validate_llm_result(
             unsupported_terms=unique_blocked,
             source="job_description",
         )
-        raise GenerationValidationError(
-            "; ".join(unsupported_claim_message(term) for term in unique_blocked)
+        corrected, removed = apply_truthfulness_corrections(
+            plain,
+            original_text=resume_text,
+            unsupported_terms=unique_blocked,
+            confirmed_evidence_text=confirmed_evidence_text or "",
+        )
+        if removed:
+            logger.warning(
+                "TRUTHFULNESS_CORRECTION_APPLIED workflow_id=%s removed_or_rewritten=%s",
+                workflow_id or "n/a",
+                removed,
+            )
+            plain = corrected
+            result["generated_resume_plain_text"] = plain
+            result["truthfulness_correction_applied"] = True
+        leftover_blocked = [
+            term for term in unique_blocked
+            if contains_keyword(plain, term)
+            and not supported_by_authoritative_evidence(
+                term,
+                original_text=resume_text,
+                allowed_confirmed_skills=allowed_confirmed_skills,
+            )
+        ]
+        if leftover_blocked:
+            raise GenerationValidationError(
+                "; ".join(unsupported_claim_message(term) for term in leftover_blocked)
+            )
+        logger.info(
+            "TRUTHFULNESS_REVALIDATION_PASSED workflow_id=%s rule=unsupported_claim",
+            workflow_id or "n/a",
         )
 
-    evidence_baseline = "\n".join(
-        part for part in [resume_text or "", confirmed_evidence_text or ""] if part
-    )
-    # Invented metrics (not present in original resume or confirmed evidence) are not allowed.
-    if FAKE_METRIC_PATTERN.search(plain) and not FAKE_METRIC_PATTERN.search(evidence_baseline):
+    # Invented metrics: rewrite/remove only the unsupported number, then re-check.
+    corrected, removed_metrics = sanitize_invented_metrics(plain, evidence_baseline)
+    if removed_metrics:
         _log_truthfulness_failure(
             workflow_id=workflow_id,
             rule="invented_metrics",
             section="generated_resume_plain_text",
             field="metrics",
             reason="generated resume introduced metrics absent from original resume/confirmed evidence",
+            unsupported_terms=removed_metrics,
             source="resume",
         )
-        raise GenerationValidationError(
-            "LLM introduced metrics not present in the original resume"
+        logger.warning(
+            "TRUTHFULNESS_CORRECTION_APPLIED workflow_id=%s removed_or_rewritten=%s",
+            workflow_id or "n/a",
+            removed_metrics,
         )
+        plain = corrected
+        result["generated_resume_plain_text"] = plain
+        leftover = unsupported_invented_metrics(plain, evidence_baseline)
+        if leftover:
+            raise GenerationValidationError(
+                "LLM introduced metrics not present in the original resume"
+            )
+        logger.info("TRUTHFULNESS_REVALIDATION_PASSED workflow_id=%s rule=invented_metrics", workflow_id or "n/a")
 
     original_norm = re.sub(r"\s+", " ", (resume_text or "").strip().lower())
     generated_norm = re.sub(r"\s+", " ", plain.lower())
@@ -727,7 +793,28 @@ def _preserve_previously_supported_keywords(plain_text: str, *, original_resume_
         "SUMMARY_GENERATED_SCORE jd_skill_count=%s credited=%s", len(skills), generated_credit_count_before_fix
     )
 
-    dropped = [skill for skill in skills if _rank(generated_evidence, skill) < _rank(original_evidence, skill)]
+    dropped = []
+    for skill in skills:
+        original_item = original_evidence.get(skill) or {}
+        # A bare, exact Skills-list mention remains weak and may need user
+        # confirmation, but preserving that same mention does not add a claim.
+        # Indirect evidence (e.g. sprint planning ↛ Scrum) cannot justify it.
+        explicit_weak_skill = (
+            original_item.get("resume_status") == "VERIFIED"
+            and original_item.get("match_type") == "EXACT"
+            and original_item.get("found_in_resume") is True
+            and original_item.get("evidence_strength") == "weak"
+            and any(
+                _SKILLS_HEADING_PATTERN.match(str(section or ""))
+                for section in original_item.get("evidence_sections") or []
+            )
+        )
+        if original_item.get("resume_status") == "INDIRECT" or (
+            original_item.get("needs_user_confirmation") and not explicit_weak_skill
+        ):
+            continue
+        if _rank(generated_evidence, skill) < _rank(original_evidence, skill):
+            dropped.append(skill)
     if not dropped:
         return plain_text, []
 

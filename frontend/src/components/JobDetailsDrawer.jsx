@@ -12,6 +12,23 @@ function formatDateLabel(value, prefix) {
   }
 }
 
+function skillList(value) {
+  if (Array.isArray(value)) return value.map((item) => String(item).trim()).filter(Boolean);
+  return String(value || "").split(/[,;/|\n]+/).map((item) => item.trim()).filter(Boolean);
+}
+
+function sourceLabel(source) {
+  const names = {
+    jsearch: "JSearch",
+    greenhouse: "Greenhouse",
+    lever: "Lever",
+    remotive: "Remotive",
+    workday: "Workday",
+  };
+  const key = String(source || "").trim().toLowerCase();
+  return names[key] || (source ? String(source) : "");
+}
+
 // Backend is the single source of truth for availability display (Step 10)
 // — never re-derived from age or anything else on the frontend.
 function availabilityDisplay(job) {
@@ -43,8 +60,10 @@ export default function JobDetailsDrawer({ job, userId, onClose, onSave, onOptim
   // resolve_apply_action) — the frontend never re-derives Apply vs Job
   // Closed vs View Listing itself. Fallback only covers a payload from
   // before this field existed.
-  const applyLabel = job.action_label || (job.is_direct_apply !== false ? "Apply" : "View Listing");
+  const applyLabel = job.action_label || "View Listing";
   const availability = availabilityDisplay(job);
+  const requiredSkills = skillList(job.skills);
+  const provider = sourceLabel(job.source);
 
   const handleApplyClick = async () => {
     if (!userId || !job.discovered_job_id || applying) return;
@@ -78,10 +97,20 @@ export default function JobDetailsDrawer({ job, userId, onClose, onSave, onOptim
           <p><b>Employment type:</b> {job.job_type || "Not specified"}</p>
           {postedLabel && <p><b>{postedLabel}</b></p>}
           <p><b>{job.detected_label}</b></p>
+          {provider && <p><b>Source:</b> {provider}</p>}
           {job.apply_destination_type !== "AGGREGATOR_LISTING" && (
             <p><b>Availability:</b> <StatusBadge tone={availability.tone}>{availability.label}</StatusBadge></p>
           )}
         </div>
+
+        {requiredSkills.length > 0 && (
+          <div className="uj-drawer-skills uj-drawer-required">
+            <h4>Required / Preferred Skills</h4>
+            <div className="uj-skill-chips">
+              {requiredSkills.slice(0, 16).map((skill) => <span key={skill} className="uj-skill-chip">{skill}</span>)}
+            </div>
+          </div>
+        )}
 
         {match ? (
           <div className="uj-drawer-match">
@@ -137,10 +166,10 @@ export default function JobDetailsDrawer({ job, userId, onClose, onSave, onOptim
               onClick={handleApplyClick}
               disabled={applying}
               title={
-                applyLabel === "View Listing"
-                  ? "Only a source listing is available for this job — not a direct employer link."
-                  : applyLabel === "Open Employer Site"
-                    ? "This is a real employer/ATS link, but we haven't recently confirmed the posting is still open."
+                applyLabel.startsWith("Apply on ") && applyLabel !== "Apply on Company Site"
+                  ? "Only a source listing is available for this job — not a direct employer application page."
+                  : applyLabel === "Open Career Page"
+                    ? "This opens the employer career site. The exact job posting was not confirmed."
                     : undefined
               }
             >
@@ -148,11 +177,11 @@ export default function JobDetailsDrawer({ job, userId, onClose, onSave, onOptim
             </button>
           ) : (
             <button className="button primary" disabled title="No application link is available for this job">
-              Apply
+              {applyLabel}
             </button>
           )}
         </footer>
-        {job.secondary_action?.url && (
+        {job.secondary_action?.url && job.secondary_action.url !== job.application_url && (
           // Step 8/9: the employer/ATS destination above may itself be
           // blocked for this user (403, Cloudflare, geo restriction) —
           // CareerBoost cannot bypass that. This is the actual stored

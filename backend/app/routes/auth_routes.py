@@ -12,7 +12,7 @@ import os
 
 import bcrypt
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -62,6 +62,7 @@ class SignupResponse(BaseModel):
     message: str
     user_id: int
     email: str
+    name: str
 
 
 class LoginRequest(BaseModel):
@@ -72,6 +73,20 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     message: str
     user_id: int
+    email: str
+    name: str
+
+
+class ProfileNameUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    current_password: str
+
+
+class ProfileResponse(BaseModel):
+    user_id: int
+    name: str
     email: str
 
 
@@ -197,6 +212,7 @@ def signup(user_data: SignupRequest, db: Session = Depends(get_db)):
         "message": "User registered successfully",
         "user_id": new_user.id,
         "email": new_user.email,
+        "name": new_user.name,
     }
 
 
@@ -215,7 +231,25 @@ def login(login_data: LoginRequest, db: Session = Depends(get_db)):
         "message": "Login successful",
         "user_id": user.id,
         "email": user.email,
+        "name": user.name,
     }
+
+
+@router.patch("/profile/{user_id}", response_model=ProfileResponse)
+def update_profile_name(user_id: int, payload: ProfileNameUpdateRequest, db: Session = Depends(get_db)):
+    """Update only the existing account's name after password verification."""
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None or not verify_password(payload.current_password, user.password):
+        raise HTTPException(status_code=401, detail="Unable to verify your current password.")
+
+    name = payload.name.strip()
+    if not name or len(name) > 100:
+        raise HTTPException(status_code=400, detail="Name must be between 1 and 100 characters.")
+
+    user.name = name
+    db.commit()
+    db.refresh(user)
+    return {"user_id": user.id, "name": user.name, "email": user.email}
 
 
 @router.post("/forgot-password", response_model=ForgotPasswordResponse)

@@ -202,7 +202,7 @@ def test_expired_candidate_is_not_promoted_to_apply(monkeypatch):
     with patch("app.services.job_enrichment_service.availability.check_url_availability",
                return_value={"status": "EXPIRED", "reason": "http_404", "final_url": None}):
         result = enrich_job(job, provider=broad_search_provider, employer_website="https://www.acmewidgets.com")
-    assert result.status == "REJECTED"
+    assert result.status == "EXPIRED"
     assert job.direct_url is None
     action = resolve_apply_action(job)
     assert action["action_label"] == "View Listing"

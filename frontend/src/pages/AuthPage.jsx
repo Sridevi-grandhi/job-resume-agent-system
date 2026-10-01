@@ -75,7 +75,8 @@ export default function AuthPage({ mode }) {
     setForm({ name: "", email: "", password: "", confirmPassword: "" });
   }, [mode]);
 
-  if (app.currentUser && mode !== "reset") {
+  // An existing account can use the supported email reset flow from Settings.
+  if (app.currentUser && mode !== "reset" && mode !== "forgot") {
     return <Navigate to="/dashboard" replace />;
   }
 

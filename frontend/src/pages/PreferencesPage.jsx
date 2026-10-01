@@ -1,3 +1,5 @@
+/* eslint-disable react-hooks/exhaustive-deps */
+import { useEffect } from "react";
 import { useApp } from "../context/AppContext";
 import { Page, Panel, Notice } from "../components/Page";
 import StatusBadge from "../components/StatusBadge";
@@ -16,6 +18,9 @@ function SelectField({ name, label, value, options, onChange }) {
 export default function PreferencesPage() {
   const app = useApp();
   const preferences = app.preferences;
+  useEffect(() => {
+    app.loadPreferences();
+  }, [app.currentUser?.user_id]);
   return <Page title="Preferences" subtitle="Update your job preferences and search settings." actions={
     <StatusBadge tone={app.preferencesSaved ? "success" : "warning"}>{app.preferencesSaved ? "Saved" : "Unsaved changes"}</StatusBadge>
   }>

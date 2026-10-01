@@ -16,7 +16,7 @@ from app.services.resume_assembly_service import (
     headings_match,
     normalize_section_heading,
 )
-from app.services.resume_generator import FAKE_METRIC_PATTERN
+from app.services.resume_generator import unsupported_invented_metrics
 from app.services.technology_catalog import PROFESSIONAL_ROLE_CLAIMS
 
 
@@ -63,12 +63,19 @@ def validate_final_resume(
 ) -> dict:
     warnings = []
     errors = []
+    findings: list[dict] = []
 
     # Contact / identity
     for field in ("email", "phone", "name"):
         value = (original_structure or {}).get(field) or ""
         if value and value not in (generated_text or ""):
             errors.append(f"Protected field changed or missing: {field}")
+            findings.append({
+                "rule": "protected_field",
+                "category": "structure",
+                "term": field,
+                "correctable": False,
+            })
             logger.warning(
                 "TRUTHFULNESS_VALIDATION_FAILED workflow_id=%s rule=protected_field "
                 "section=contact field=%s reason=missing_or_changed source=resume",
@@ -120,6 +127,12 @@ def validate_final_resume(
     structure_preserved = mismatch_index is None
     if original_keys and not structure_preserved:
         errors.append("Section order or headings were not preserved.")
+        findings.append({
+            "rule": "section_order",
+            "category": "structure",
+            "term": "section_order",
+            "correctable": False,
+        })
         logger.warning(
             "TRUTHFULNESS_VALIDATION_FAILED workflow_id=%s rule=section_order "
             "section=structure field=section_order reason=order_or_heading_changed "
@@ -136,6 +149,12 @@ def validate_final_resume(
         dates = emp.get("dates") or ""
         if company and company not in (generated_text or ""):
             errors.append(f"Company name missing or changed: {company}")
+            findings.append({
+                "rule": "employer_preserved",
+                "category": "structure",
+                "term": company,
+                "correctable": False,
+            })
             logger.warning(
                 "TRUTHFULNESS_VALIDATION_FAILED workflow_id=%s rule=employer_preserved "
                 "section=experience field=company reason=missing_or_changed source=resume",
@@ -143,6 +162,12 @@ def validate_final_resume(
             )
         if dates and dates not in (generated_text or ""):
             errors.append(f"Employment dates missing or changed: {dates}")
+            findings.append({
+                "rule": "dates_preserved",
+                "category": "structure",
+                "term": dates,
+                "correctable": False,
+            })
             logger.warning(
                 "TRUTHFULNESS_VALIDATION_FAILED workflow_id=%s rule=dates_preserved "
                 "section=experience field=dates reason=missing_or_changed source=resume",
@@ -164,6 +189,12 @@ def validate_final_resume(
                     break
             if original_content and generated_content != original_content:
                 errors.append(f"Protected section modified: {section.get('heading')}")
+                findings.append({
+                    "rule": "protected_section",
+                    "category": "structure",
+                    "term": section.get("heading") or "education_or_certification",
+                    "correctable": False,
+                })
                 logger.warning(
                     "TRUTHFULNESS_VALIDATION_FAILED workflow_id=%s rule=protected_section "
                     "section=%s field=content reason=modified source=resume",
@@ -192,6 +223,12 @@ def validate_final_resume(
             continue
         category = skill_category(skill)
         errors.append(unsupported_claim_message(skill))
+        findings.append({
+            "rule": f"unsupported_{category.replace(' ', '_')}",
+            "category": category,
+            "term": skill,
+            "correctable": True,
+        })
         logger.warning(
             "TRUTHFULNESS_VALIDATION_FAILED workflow_id=%s rule=unsupported_%s "
             "section=skills_or_experience field=%s reason=introduced_unsupported "
@@ -209,6 +246,12 @@ def validate_final_resume(
     for role in PROFESSIONAL_ROLE_CLAIMS:
         if contains_keyword(generated_text or "", role) and not contains_keyword(original_text or "", role):
             errors.append(f"Unsupported professional role introduced: {role}")
+            findings.append({
+                "rule": "unsupported_professional_role",
+                "category": "role",
+                "term": role,
+                "correctable": True,
+            })
             logger.warning(
                 "TRUTHFULNESS_VALIDATION_FAILED workflow_id=%s rule=unsupported_professional_role "
                 "section=skills_or_experience field=role reason=introduced_unsupported "
@@ -217,13 +260,23 @@ def validate_final_resume(
                 [role],
             )
 
-    # Fake metrics — allow only if present in original resume OR confirmed evidence text.
-    if FAKE_METRIC_PATTERN.search(generated_text or "") and not FAKE_METRIC_PATTERN.search(evidence_baseline):
+    # Fake metrics — allow only snippets already present in original resume OR confirmed evidence.
+    leftover_metrics = unsupported_invented_metrics(generated_text or "", evidence_baseline)
+    if leftover_metrics:
         errors.append("Generated resume introduced metrics not present in the original resume.")
+        findings.append({
+            "rule": "invented_metrics",
+            "category": "metric",
+            "term": leftover_metrics[0],
+            "correctable": True,
+            "unsupported_terms": leftover_metrics,
+        })
         logger.warning(
             "TRUTHFULNESS_VALIDATION_FAILED workflow_id=%s rule=invented_metrics "
-            "section=generated_resume field=metrics reason=invented_metric source=resume",
+            "section=generated_resume field=metrics reason=invented_metric "
+            "unsupported_terms=%s source=resume",
             workflow_id or "n/a",
+            leftover_metrics,
         )
 
     if not (generated_text or "").strip():
@@ -253,6 +306,7 @@ def validate_final_resume(
         "status": status,
         "warnings": warnings,
         "errors": errors,
+        "findings": findings,
         "protectedFieldsVerified": not any("Protected field" in e for e in errors),
         "structurePreserved": structure_preserved and not any("Section order" in e for e in errors),
     }

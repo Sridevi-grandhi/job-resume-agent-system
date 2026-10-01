@@ -934,20 +934,33 @@ def test_disabled_category_is_skipped_and_not_persisted(db_session, test_user):
     assert db_session.query(JobEmailEvent).filter_by(user_id=test_user.id).count() == 0
 
 
-def test_recruiter_outreach_passes_via_either_of_its_two_categories(db_session, test_user):
-    """RECRUITER_OUTREACH belongs to both "job_opportunities" and
-    "recruiter_messages" — enabling only one of the two is still enough."""
+def test_recruiter_outreach_requires_recruiter_messages_even_with_job_opportunities_enabled(db_session, test_user):
+    """Turning Recruiter Messages off excludes recruiter-only mail."""
     _connected(db_session, test_user.id)
-    _set_email_types_to_scan(db_session, test_user.id, ["job_opportunities"])
+    _set_email_types_to_scan(db_session, test_user.id, ["job_opportunities", "application_updates", "interview_invitations"])
     provider = FakeProvider({
         "m1": _message("m1", subject="Exciting opportunity for you", sender="jane@recruiting-agency.com", body="I came across your profile. Are you open to new opportunities?"),
+        "m2": _message("m2", subject="Interview Invitation - Python Developer", sender="hr@example.com", body="We would like to schedule a technical interview for your Python Developer application."),
     })
     with _patched_provider(provider), _patched_profile():
-        job_email_scan_service.scan_for_job_emails(db_session, user_id=test_user.id)
+        summary = job_email_scan_service.scan_for_job_emails(db_session, user_id=test_user.id)
 
+    assert summary["outcomes"] == {"category_disabled_skipped": 1, "needs_confirmation": 1}
     events = db_session.query(JobEmailEvent).filter_by(user_id=test_user.id).all()
     assert len(events) == 1
-    assert events[0].event_type == "RECRUITER_OUTREACH"
+    assert events[0].event_type == "INTERVIEW_INVITE"
+
+
+def test_explicit_empty_category_list_disables_all_event_types(db_session, test_user):
+    _connected(db_session, test_user.id)
+    _set_email_types_to_scan(db_session, test_user.id, [])
+    provider = FakeProvider({
+        "m1": _message("m1", subject="Interview Invitation", sender="hr@example.com", body="We would like to schedule an interview for your job application."),
+    })
+    with _patched_provider(provider), _patched_profile():
+        summary = job_email_scan_service.scan_for_job_emails(db_session, user_id=test_user.id)
+    assert summary["outcomes"] == {"category_disabled_skipped": 1}
+    assert db_session.query(JobEmailEvent).filter_by(user_id=test_user.id).count() == 0
 
 
 def test_application_update_category_gates_all_five_status_event_types(db_session, test_user):

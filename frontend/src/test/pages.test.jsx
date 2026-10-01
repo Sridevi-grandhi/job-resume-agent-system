@@ -243,6 +243,11 @@ describe("authentication", () => {
 });
 
 describe("preferences", () => {
+  it("hydrates saved preferences on mount so refresh does not require visiting Dashboard first", async () => {
+    renderRoute(<PreferencesPage />, "/preferences");
+    await waitFor(() => expect(app.loadPreferences).toHaveBeenCalled());
+  });
+
   it("renders every field and delegates changes and save", async () => {
     app.preferences = { ...app.preferences, job_title: "Engineer", location: "Chicago", work_mode: "Remote", job_type: "Full-time", skills: "Java", timezone: "America/Chicago" };
     renderRoute(<PreferencesPage />, "/preferences");
@@ -263,6 +268,11 @@ describe("preferences", () => {
 });
 
 describe("resume", () => {
+  it("hydrates the latest resume on mount so the page does not depend on visiting Dashboard first", () => {
+    renderRoute(<ResumePage />, "/resume");
+    expect(app.verifyLatestResume).toHaveBeenCalled();
+  });
+
   it.each(["resume.pdf", "resume.docx", "resume.txt"])("accepts %s and uploads it", async (name) => {
     renderRoute(<ResumePage />, "/resume");
     const input = document.querySelector('input[type="file"]');
@@ -295,6 +305,13 @@ describe("job search", () => {
     renderRoute(<JobSearchPage />, "/jobs");
     await userEvent.click(screen.getByRole("button", { name: /search job links/i }));
     expect(app.search).toHaveBeenCalledWith(false);
+  });
+
+  it("loads preferences, resume, and jobs on mount so search links appear without visiting Dashboard first", () => {
+    renderRoute(<JobSearchPage />, "/jobs");
+    expect(app.loadPreferences).toHaveBeenCalled();
+    expect(app.verifyLatestResume).toHaveBeenCalled();
+    expect(app.loadJobs).toHaveBeenCalled();
   });
 
   it("no longer exposes 'Search updated jobs' here — replaced by the dedicated Updated Job Search page", () => {

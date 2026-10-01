@@ -30,6 +30,7 @@ persisted.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 import requests
@@ -38,6 +39,7 @@ from app.services import url_safety
 from app.services.broad_search_enrichment_provider import broad_provider_api_key
 from app.services.job_enrichment_service import EnrichmentQuery
 from app.services.job_normalization_service import classify_url_domain
+from app.services.job_enrichment_context import record_event
 
 logger = logging.getLogger(__name__)
 
@@ -54,10 +56,10 @@ def _build_query_text(query: EnrichmentQuery) -> str:
     keyword one (e.g. '"Senior Java Developer" "Example Corp" Dallas TX')."""
     parts: list[str] = []
     if query.title:
-        parts.append(f'"{query.title}"')
+        parts.append('"' + re.sub(r'\s+', ' ', query.title.replace('"', ' ')).strip() + '"')
     if query.company:
-        parts.append(f'"{query.company}"')
-    if query.location:
+        parts.append('"' + re.sub(r'\s+', ' ', query.company.replace('"', ' ')).strip() + '"')
+    if query.location and query.location.strip().lower() not in {"remote", "anywhere", "not specified", "usa", "united states"}:
         parts.append(query.location)
     return " ".join(parts)
 
@@ -122,14 +124,17 @@ class SerpApiGoogleJobsClient:
         # called directly (Task 6/7).
         if not self._api_key:
             return []
+        if not all((value or "").replace('"', ' ').strip() for value in (query.title, query.company)):
+            return []
 
         params: dict[str, Any] = {"engine": ENGINE, "q": _build_query_text(query), "api_key": self._api_key}
-        if query.location:
-            params["location"] = query.location
+        # Provider job locations are free text, not validated Google geotargets.
+        # Keep useful location text in q; do not submit it as API `location`.
 
         session = self._session or requests.Session()
         owns_session = self._session is None
         try:
+            record_event("serpapi_attempts")
             response = self._request_once_with_bounded_retry(session, params)
             if response is None:
                 return []
@@ -138,6 +143,14 @@ class SerpApiGoogleJobsClient:
                 # never retried, never treated as EXPIRED, always just "no
                 # candidates this time" (Task 8).
                 logger.warning("serpapi_google_jobs_http_error status=%s", response.status_code)
+                record_event("serpapi_failed", http_status=response.status_code)
+                # Safe categorical reason only; never log the response/error text.
+                try:
+                    raw_error = str(response.json().get("error", "")).lower()
+                except (ValueError, AttributeError):
+                    raw_error = ""
+                code = "invalid_location" if "location" in raw_error else "invalid_request" if response.status_code == 400 else "rate_limited" if response.status_code == 429 else "provider_http_error"
+                record_event("serpapi_error_reason", code=code)
                 return []
             try:
                 payload = response.json()
@@ -151,6 +164,7 @@ class SerpApiGoogleJobsClient:
             for job in jobs:
                 if isinstance(job, dict):
                     candidates.extend(_job_to_candidates(job))
+            record_event("serpapi_response", candidates=len(candidates))
             return candidates
         finally:
             if owns_session:

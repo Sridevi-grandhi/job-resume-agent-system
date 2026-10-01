@@ -10,7 +10,8 @@ is mocked.
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+import socket
+from unittest.mock import MagicMock, call, patch
 
 from app.job_sources.generic_feed import GenericCareerFeedAdapter
 from app.job_sources.greenhouse import GreenhouseAdapter
@@ -23,6 +24,19 @@ from app.services.job_normalization_service import NORMALIZED_JOB_FIELDS
 def _assert_normalized_shape(job: dict):
     for field in NORMALIZED_JOB_FIELDS:
         assert field in job
+
+
+def _mock_public_provider_dns(monkeypatch, expected_host):
+    """Keep real URL validation; resolve only this test's expected public host."""
+    def resolve(host, port, **kwargs):
+        if host != expected_host:
+            raise socket.gaierror("Unexpected hostname in mocked provider DNS")
+        return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP,
+                 "", ("93.184.216.34", 0))]
+
+    dns = MagicMock(side_effect=resolve)
+    monkeypatch.setattr("app.services.url_safety.socket.getaddrinfo", dns)
+    return dns
 
 
 # ---------------------------------------------------------------------------
@@ -53,13 +67,17 @@ def test_workday_adapter_produces_no_jobs_when_not_demo_mode():
 
 
 def test_greenhouse_source_failure_does_not_fabricate_a_job(monkeypatch):
+    dns = _mock_public_provider_dns(monkeypatch, "boards-api.greenhouse.io")
     adapter = GreenhouseAdapter(
         company_sources=[{"company_name": "Real Employer", "source_identifier": "real-employer", "company_logo_url": None, "career_page_url": None}],
         demo_mode=False,
     )
-    with patch("requests.Session.get", side_effect=Exception("network down")):
+    with patch("requests.Session.get", side_effect=Exception("network down")) as http_get:
         jobs = adapter.fetch_jobs(limit=10)
     assert jobs == []  # never invents a "Real Employer" job when the fetch failed
+    dns.assert_called_once_with("boards-api.greenhouse.io", None, type=socket.SOCK_STREAM)
+    http_get.assert_called_once()
+    assert http_get.call_args.args[0] == "https://boards-api.greenhouse.io/v1/boards/real-employer/jobs"
 
 
 # ---------------------------------------------------------------------------
@@ -118,7 +136,8 @@ def test_greenhouse_adapter_live_mode_uses_configured_company_name():
     assert normalized["application_url"] == "https://boards.greenhouse.io/example-employer/jobs/555"
 
 
-def test_greenhouse_adapter_fetch_jobs_isolates_per_company_failure():
+def test_greenhouse_adapter_fetch_jobs_isolates_per_company_failure(monkeypatch):
+    dns = _mock_public_provider_dns(monkeypatch, "boards-api.greenhouse.io")
     adapter = GreenhouseAdapter(
         company_sources=[
             {"company_name": "Failing Co", "source_identifier": "failing-co", "company_logo_url": None, "career_page_url": None},
@@ -132,7 +151,10 @@ def test_greenhouse_adapter_fetch_jobs_isolates_per_company_failure():
     good_response.raise_for_status.return_value = None
     good_response.json.return_value = {"jobs": [{"id": 1, "title": "Engineer", "absolute_url": "https://boards.greenhouse.io/working-co/jobs/1"}]}
 
+    requested_urls = []
+
     def fake_get(self, url, **kwargs):
+        requested_urls.append(url)
         if "failing-co" in url:
             raise Exception("boom")
         return good_response
@@ -141,6 +163,14 @@ def test_greenhouse_adapter_fetch_jobs_isolates_per_company_failure():
         jobs = adapter.fetch_jobs(limit=10)
     assert len(jobs) == 1
     assert jobs[0]["_company_name"] == "Working Co"
+    assert dns.call_args_list == [
+        call("boards-api.greenhouse.io", None, type=socket.SOCK_STREAM),
+        call("boards-api.greenhouse.io", None, type=socket.SOCK_STREAM),
+    ]
+    assert requested_urls == [
+        "https://boards-api.greenhouse.io/v1/boards/failing-co/jobs",
+        "https://boards-api.greenhouse.io/v1/boards/working-co/jobs",
+    ]
 
 
 def test_lever_adapter_live_mode_uses_configured_company_name():
@@ -219,11 +249,15 @@ def test_remotive_adapter_normalizes_real_shaped_payload():
 
 
 def test_remotive_adapter_fetch_jobs_uses_mocked_http(monkeypatch):
+    dns = _mock_public_provider_dns(monkeypatch, "remotive.com")
     adapter = RemotiveAdapter()
     response = MagicMock()
     response.status_code = 200
     response.is_redirect = False
     response.json.return_value = {"jobs": [{"id": 1, "title": "T", "company_name": "C", "url": "https://remotive.com/remote-jobs/x-1"}]}
-    with patch("requests.Session.get", return_value=response):
+    with patch("requests.Session.get", return_value=response) as http_get:
         jobs = adapter.fetch_jobs(limit=10)
     assert len(jobs) == 1
+    dns.assert_called_once_with("remotive.com", None, type=socket.SOCK_STREAM)
+    http_get.assert_called_once()
+    assert http_get.call_args.args[0] == "https://remotive.com/api/remote-jobs"

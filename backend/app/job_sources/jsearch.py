@@ -24,6 +24,7 @@ import requests
 
 from app.job_sources.base import BroadJobProviderAdapter, SourceHealth
 from app.services import url_safety
+from app.services.employer_career_service import matching_career_url
 from app.services.job_normalization_service import (
     build_normalized_job,
     rank_apply_candidates,
@@ -52,6 +53,10 @@ def max_pages_per_query() -> int:
 
 def max_retries() -> int:
     return max(0, min(3, int(os.getenv("JSEARCH_MAX_RETRIES") or "1")))
+
+
+def lookup_max_per_cycle() -> int:
+    return max(1, int(os.getenv("JSEARCH_LOOKUP_MAX_PER_CYCLE") or "25"))
 
 
 def _build_query_string(spec: dict[str, str]) -> str:
@@ -159,6 +164,96 @@ def _parse_posted_at(raw: dict[str, Any]):
     return None
 
 
+def _lookup_company_matches(raw_employer_name: str, company: str) -> bool:
+    from app.services.provider_apply_resolver import _company_slug
+
+    candidate_slug = _company_slug(raw_employer_name)
+    company_slug = _company_slug(company)
+    if not candidate_slug or not company_slug:
+        return False
+    return (
+        candidate_slug == company_slug
+        or candidate_slug.startswith(company_slug)
+        or company_slug.startswith(candidate_slug)
+    )
+
+
+def lookup_direct_apply(title: str, company: str, location: str = "") -> dict[str, Any]:
+    """Targeted, single-page JSearch lookup for a job another provider (Dice,
+    Adzuna, ...) only ever supplied as a listing — tries to find that SAME
+    posting's own employer/ATS apply link so a provider-only job can be
+    promoted to a real "Apply on Company Site" destination.
+
+    Never invents a URL: a result is only ever returned after (1) its
+    employer_name matches `company` and its title matches `title`
+    (job_enrichment_service._titles_match — same bidirectional-overlap check
+    used everywhere else in this pipeline), (2) its own apply_options/
+    job_apply_link are ranked through the exact same shared pipeline
+    `_pick_apply_urls` uses, and (3) the winning URL passes
+    provider_apply_resolver.is_safe_employer_or_ats_destination against this
+    SAME (title, company) — never merely "some real employer/ATS site".
+
+    Returns {"url": str | None, "rate_limited": bool}. Never raises — any
+    failure (not configured, network error, bad response, no match) is just
+    "no better destination found than the listing already on file", not an
+    error the caller needs to handle specially, EXCEPT rate_limited=True,
+    which the caller uses to stop attempting further lookups this cycle.
+    """
+    if not api_key() or not title or not company:
+        return {"url": None, "rate_limited": False}
+
+    query = " ".join(part for part in (title, company, location) if part).strip()
+    if not query:
+        return {"url": None, "rate_limited": False}
+
+    headers = {"x-api-key": api_key(), "Accept": "application/json", "User-Agent": USER_AGENT}
+    try:
+        with requests.Session() as session:
+            response = url_safety.safe_get(session, base_url(), params={"query": query}, headers=headers, timeout=TIMEOUT)
+    except Exception:  # noqa: BLE001 — a lookup failure is never fatal to discovery
+        return {"url": None, "rate_limited": False}
+
+    if response.status_code == 429:
+        logger.warning("JSEARCH_LOOKUP_RATE_LIMITED")
+        return {"url": None, "rate_limited": True}
+    if not 200 <= response.status_code < 300:
+        return {"url": None, "rate_limited": False}
+    try:
+        payload = response.json()
+    except ValueError:
+        return {"url": None, "rate_limited": False}
+
+    from app.services.job_enrichment_service import _titles_match
+    from app.services.provider_apply_resolver import is_safe_employer_or_ats_destination
+
+    jobs, _cursor = _extract_jobs_and_cursor(payload)
+    match = next(
+        (
+            raw for raw in jobs
+            if isinstance(raw, dict)
+            and _lookup_company_matches(raw.get("employer_name") or "", company)
+            and _titles_match(title, raw.get("job_title"))
+        ),
+        None,
+    )
+    if match is None:
+        logger.info("JSEARCH_LOOKUP_MISS")
+        return {"url": None, "rate_limited": False}
+
+    application_url, direct_url, _source_url = _pick_apply_urls(match)
+    candidate_url = application_url or direct_url
+    identity = (
+        is_safe_employer_or_ats_destination(candidate_url, {"company": company, "title": title})
+        if candidate_url else None
+    )
+    if identity not in ("employer", "ats"):
+        logger.info("JSEARCH_LOOKUP_MISS")
+        return {"url": None, "rate_limited": False}
+
+    logger.info("JSEARCH_LOOKUP_HIT")
+    return {"url": candidate_url, "rate_limited": False}
+
+
 class JSearchAdapter(BroadJobProviderAdapter):
     source_name = "jsearch"
     source_type = "broad_provider"
@@ -197,6 +292,7 @@ class JSearchAdapter(BroadJobProviderAdapter):
                 last_error = error
             else:
                 if response.status_code == 429:
+                    self._rate_limited = True
                     logger.warning("JSEARCH_RATE_LIMITED query=%r cursor=%s", query, bool(cursor))
                     self._last_fetch_error = "rate_limited"
                     return None
@@ -212,6 +308,7 @@ class JSearchAdapter(BroadJobProviderAdapter):
         return None
 
     def fetch_jobs(self, limit: int = 100) -> list[dict[str, Any]]:
+        self._rate_limited = False
         if not self.is_configured:
             logger.warning("JSEARCH_NOT_CONFIGURED")
             return []
@@ -263,7 +360,9 @@ class JSearchAdapter(BroadJobProviderAdapter):
         # returned zero results is still success; only a transport/HTTP
         # failure on every attempted query marks the provider unhealthy.
         self._last_fetch_ok = any_success or not any(_build_query_string(spec) for spec in self.preference_queries)
-        self._last_fetch_error = last_error if not self._last_fetch_ok else None
+        self._last_fetch_error = "rate_limited" if self._rate_limited else last_error if not self._last_fetch_ok else None
+        if self._rate_limited:
+            self._last_fetch_ok = False
         return jobs[:limit]
 
     def normalize_job(self, raw: dict[str, Any]) -> dict[str, Any] | None:
@@ -313,6 +412,7 @@ class JSearchAdapter(BroadJobProviderAdapter):
             direct_url=direct_url,
             source_url=source_url,
             application_url=application_url,
+            career_page_url=matching_career_url(raw.get("employer_website"), company),
         )
 
     def health_check(self) -> SourceHealth:

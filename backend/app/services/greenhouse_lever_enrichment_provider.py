@@ -221,33 +221,46 @@ def greenhouse_lever_provider(query: EnrichmentQuery) -> list[EnrichmentCandidat
     if not query.company:
         return []
 
+    from app.services.provider_apply_resolver import ATS_LOOKUP_SKIP
+
+    if query.ats_hint in ATS_LOOKUP_SKIP:
+        return []
+
     session = requests.Session()
     try:
         candidates: list[EnrichmentCandidateResult] = []
+        slugs = candidate_slugs(query.company)
+        if query.ats_board_token and query.ats_board_token not in slugs:
+            slugs = [query.ats_board_token, *slugs]
 
-        for token in candidate_slugs(query.company):
-            jobs = _fetch_greenhouse_jobs(token, session)
-            if jobs is None:
-                continue
-            candidates.extend(
-                candidate for candidate in (
-                    _greenhouse_job_to_candidate(job, matched_company=query.company)
-                    for job in jobs if isinstance(job, dict)
-                ) if candidate is not None
-            )
-            break  # stop guessing more Greenhouse slugs once a board is confirmed
+        run_greenhouse = query.ats_hint in {None, "", "greenhouse"}
+        run_lever = query.ats_hint in {None, "", "lever"}
 
-        for slug in candidate_slugs(query.company):
-            postings = _fetch_lever_postings(slug, session)
-            if postings is None:
-                continue
-            candidates.extend(
-                candidate for candidate in (
-                    _lever_job_to_candidate(job, matched_company=query.company)
-                    for job in postings if isinstance(job, dict)
-                ) if candidate is not None
-            )
-            break  # stop guessing more Lever slugs once a board is confirmed
+        if run_greenhouse:
+            for token in slugs[:MAX_CANDIDATES_PER_PROVIDER]:
+                jobs = _fetch_greenhouse_jobs(token, session)
+                if jobs is None:
+                    continue
+                candidates.extend(
+                    candidate for candidate in (
+                        _greenhouse_job_to_candidate(job, matched_company=query.company)
+                        for job in jobs if isinstance(job, dict)
+                    ) if candidate is not None
+                )
+                break  # stop guessing more Greenhouse slugs once a board is confirmed
+
+        if run_lever:
+            for slug in slugs[:MAX_CANDIDATES_PER_PROVIDER]:
+                postings = _fetch_lever_postings(slug, session)
+                if postings is None:
+                    continue
+                candidates.extend(
+                    candidate for candidate in (
+                        _lever_job_to_candidate(job, matched_company=query.company)
+                        for job in postings if isinstance(job, dict)
+                    ) if candidate is not None
+                )
+                break  # stop guessing more Lever slugs once a board is confirmed
 
         return candidates
     finally:

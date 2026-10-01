@@ -228,6 +228,19 @@ describe("ResumeWorkspace — Download", () => {
     expect(screen.queryByText(/traceback|stack|error:/i)).toBeNull();
   });
 
+  it("surfaces the backend's own reason for a failed download instead of masking it", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
+      ok: false,
+      status: 404,
+      json: () => Promise.resolve({ detail: "Optimized resume not found for this user and job." }),
+    }));
+    render(<ResumeWorkspace initialDocument={buildDocument()} downloadDocxUrl="http://api.test/download" onSave={vi.fn().mockResolvedValue({})} />);
+    await userEvent.click(screen.getByRole("button", { name: /^download docx$/i }));
+    expect(await screen.findByText(
+      "Unable to prepare the resume download: Optimized resume not found for this user and job.",
+    )).toBeInTheDocument();
+  });
+
   it("shows a safe generic error message when the network request itself throws", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
     render(<ResumeWorkspace initialDocument={buildDocument()} downloadDocxUrl="http://api.test/download" onSave={vi.fn().mockResolvedValue({})} />);

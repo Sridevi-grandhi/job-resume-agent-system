@@ -220,18 +220,26 @@ def test_apply_tracking_is_scoped_per_user(client, db_session, test_user, second
 def test_config_status_endpoint_never_leaks_the_api_key(client, monkeypatch):
     monkeypatch.setenv("JSEARCH_API_KEY", "super-secret-key")
     monkeypatch.setenv("UPDATED_JOB_PRIMARY_PROVIDER", "jsearch")
+    monkeypatch.setenv("JOB_ENRICHMENT_BROAD_PROVIDER", "serpapi_google_jobs")
+    monkeypatch.setenv("JOB_ENRICHMENT_BROAD_API_KEY", "serpapi-secret-key")
     response = client.get("/api/job-discovery/config-status")
     assert response.status_code == 200
     body = response.json()
     assert body["primary_provider"] == "jsearch"
     assert body["configured"] is True
+    assert body["enrichment"]["broad_provider"] == "serpapi_google_jobs"
+    assert body["enrichment"]["configured"] is True
     assert "super-secret-key" not in response.text
+    assert "serpapi-secret-key" not in response.text
 
 
 def test_config_status_endpoint_reports_not_configured_without_key(client, monkeypatch):
     monkeypatch.delenv("JSEARCH_API_KEY", raising=False)
+    monkeypatch.setenv("JOB_ENRICHMENT_BROAD_PROVIDER", "none")
+    monkeypatch.delenv("JOB_ENRICHMENT_BROAD_API_KEY", raising=False)
     response = client.get("/api/job-discovery/config-status")
     assert response.json()["configured"] is False
+    assert response.json()["enrichment"]["configured"] is False
 
 
 def test_refresh_endpoint_runs_poll_and_reports_summary(client, test_user):
@@ -240,7 +248,7 @@ def test_refresh_endpoint_runs_poll_and_reports_summary(client, test_user):
         response = client.post(f"/api/job-discovery/refresh/{test_user.id}")
     assert response.status_code == 200
     assert response.json()["total_new"] == 3
-    mock_run.assert_called_once_with(triggered_by="manual")
+    mock_run.assert_called_once_with(triggered_by="manual", user_id=test_user.id)
 
 
 def test_save_discovered_job_creates_selected_job_and_is_idempotent(client, test_user, db_session):
@@ -265,6 +273,28 @@ def test_save_discovered_job_creates_selected_job_and_is_idempotent(client, test
 
     selected_again = client.get(f"/api/jobs/selected/{test_user.id}")
     assert len(selected_again.json()) == 1
+
+
+def test_optimize_handoff_saves_job_without_starting_generation(client, test_user, second_user, db_session):
+    discovered = _seed_job(db_session)
+    with patch("app.routes.job_discovery_routes.start_workflow_for_saved_job") as start_workflow:
+        first = client.post(
+            f"/api/job-discovery/save/{test_user.id}",
+            json={"discovered_job_id": discovered.id, "start_workflow": False},
+        )
+        second = client.post(
+            f"/api/job-discovery/save/{second_user.id}",
+            json={"discovered_job_id": discovered.id, "start_workflow": False},
+        )
+        repeated = client.post(
+            f"/api/job-discovery/save/{test_user.id}",
+            json={"discovered_job_id": discovered.id, "start_workflow": False},
+        )
+    assert first.status_code == second.status_code == repeated.status_code == 200
+    assert first.json()["job_id"] != second.json()["job_id"]
+    assert repeated.json()["job_id"] == first.json()["job_id"]
+    assert first.json()["workflow_status"] is None
+    start_workflow.assert_not_called()
 
 
 def test_save_discovered_job_missing_returns_404(client, test_user):
@@ -352,7 +382,8 @@ def test_apply_does_not_open_remotive_listing_when_direct_employer_url_exists(cl
 def test_apply_remotive_only_listing_is_truthfully_classified_as_aggregator(client, test_user, db_session):
     """When Remotive is genuinely the only source (no employer URL was ever
     obtainable), the destination must be classified AGGREGATOR_LISTING —
-    the frontend uses this to show "View Listing" instead of "Apply"."""
+    the frontend uses this to show "Apply on Remotive" instead of
+    "Apply on Company Site"."""
     job = _seed_job(
         db_session, source="remotive", source_job_id="12345", fingerprint="fp-remotive-2",
         direct_url=None, application_url=None,
@@ -363,7 +394,8 @@ def test_apply_remotive_only_listing_is_truthfully_classified_as_aggregator(clie
     body = response.json()
     assert body["application_url"] == "https://remotive.com/remote-jobs/software-dev/example-12345"
     assert body["is_direct_apply"] is False
-    assert body["apply_destination_type"] == "AGGREGATOR_LISTING"
+    assert body["apply_destination_type"] == "PROVIDER_JOB_APPLY"
+    assert body["action_label"] == "Apply on Remotive"
 
 
 def test_job_payload_includes_apply_destination_classification(client, test_user, db_session):
@@ -384,7 +416,8 @@ def test_job_payload_remotive_only_listing_is_not_direct_apply(client, test_user
     response = client.get(f"/api/job-discovery/jobs/{test_user.id}")
     payload = response.json()["jobs"][0]
     assert payload["is_direct_apply"] is False
-    assert payload["apply_destination_type"] == "AGGREGATOR_LISTING"
+    assert payload["apply_destination_type"] == "PROVIDER_JOB_APPLY"
+    assert payload["action_label"] == "Apply on Remotive"
     assert payload["application_url"] == "https://remotive.com/remote-jobs/software-dev/example-55555"
 
 
@@ -457,7 +490,7 @@ def test_apply_click_unknown_availability_uses_safe_fallback_and_still_navigates
         response = client.post(f"/api/job-discovery/apply/{test_user.id}", json={"discovered_job_id": job.id})
     assert response.status_code == 200
     body = response.json()
-    assert body["action_label"] == "Open Employer Site"
+    assert body["action_label"] == "Open Career Page"
     assert body["can_apply"] is False
     assert body["status"] == "EMPLOYER_SITE_OPENED"
     # Still a real, safe destination — navigation must still occur.
@@ -484,7 +517,7 @@ def test_apply_click_on_aggregator_listing_never_triggers_availability_check(cli
     body = response.json()
     # A listing click is real navigation but never a verified apply — must
     # not be recorded as APPLY_STARTED.
-    assert body["action_label"] == "View Listing"
+    assert body["action_label"] == "Apply on LinkedIn"
     assert body["status"] == "LISTING_OPENED"
 
 
@@ -510,7 +543,7 @@ def test_apply_endpoint_never_returns_generic_page_as_verified_apply(client, tes
         response = client.post(f"/api/job-discovery/apply/{test_user.id}", json={"discovered_job_id": job.id})
     body = response.json()
     assert response.status_code == 200
-    assert body["action_label"] == "Open Employer Site"
+    assert body["action_label"] == "Open Career Page"
     assert body["destination_specificity"] == "GENERIC_EMPLOYER_PAGE"
     assert body["can_apply"] is False
     # Still a real, navigable destination — never null.
@@ -539,7 +572,7 @@ def test_apply_endpoint_generic_page_never_shown_as_apply_in_listing(client, tes
     response = client.get(f"/api/job-discovery/jobs/{test_user.id}")
     payload = response.json()["jobs"][0]
     assert payload["destination_specificity"] == "GENERIC_EMPLOYER_PAGE"
-    assert payload["action_label"] == "Open Employer Site"
+    assert payload["action_label"] == "Open Career Page"
     assert payload["can_apply"] is False
 
 
@@ -556,7 +589,7 @@ def test_apply_endpoint_specific_job_still_gets_apply_after_specificity_fix(clie
         response = client.post(f"/api/job-discovery/apply/{test_user.id}", json={"discovered_job_id": job.id})
     body = response.json()
     assert response.status_code == 200
-    assert body["action_label"] == "Apply"
+    assert body["action_label"] == "Apply on Company Site"
     assert body["destination_specificity"] == "SPECIFIC_JOB"
     assert body["can_apply"] is True
     assert body["application_url"] == job.application_url

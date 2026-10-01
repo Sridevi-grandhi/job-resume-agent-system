@@ -51,3 +51,27 @@ postgres-data/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local generated test/build output — never committed
+backend/.coverage
+pytest-temp-*/
+pytest-cache-*/
+backend/test-results-after-fix.txt
+frontend-ats-test.txt
+frontend-build.txt
+frontend-test.txt
+frontend-test2.txt
+frontend-test-genfix.txt
+pytest-core.txt
+pytest-final.txt
+pytest-fix1.txt
+pytest-full.txt
+pytest-full2.txt
+pytest-genfix.txt
+pytest-out.txt
+docker-rebuild.txt
+
+# Local-only files that must never be accidentally staged
+rudratanishka1@gmail.com.txt
+careerboost-ai-chatbot.zip
+careerboost-ai-chatbot/

@@ -569,3 +569,222 @@ def test_max_optimizations_per_run_default(monkeypatch):
 def test_max_optimizations_per_run_respects_env_override(monkeypatch):
     monkeypatch.setenv("MAX_OPTIMIZATIONS_PER_RUN", "7")
     assert max_optimizations_per_run() == 7
+
+
+def _candidate_from_resume(text: str, sections: list | None = None) -> dict:
+    return {
+        "plain_text": text,
+        "sections": list(sections or []),
+        "generation_mode": "llm",
+        "generation_warnings": [],
+        "llm_provider": "openai",
+        "llm_model": "gpt-test",
+        "prompt_version": "ats-optimizer-v1",
+        "generation_method": "llm",
+        "llm_used": True,
+        "fallback_used": False,
+    }
+
+
+def test_invented_metric_is_corrected_then_completed(db_session, test_user, test_resume, java_job):
+    from app.services.resume_structure_parser import parse_resume_structure
+
+    original = test_resume.parsed_text or ""
+    dirty = original + "\nImproved API performance by 40%."
+    sections = parse_resume_structure(original).get("sections") or []
+    workflow = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+    statuses = []
+    original_set = workflow_service._set_status
+
+    def tracking_set(wf, status, db, error=None):
+        statuses.append(status)
+        return original_set(wf, status, db, error)
+
+    scored = []
+    original_score = workflow_service.calculate_weighted_ats_score
+
+    def scoring_spy(text, job, **kwargs):
+        scored.append(text)
+        return original_score(text, job, **kwargs)
+
+    with patch.object(workflow_service, "generate_with_llm_or_fallback", return_value=_candidate_from_resume(dirty, sections)), \
+         patch.object(workflow_service, "_set_status", side_effect=tracking_set), \
+         patch.object(workflow_service, "calculate_weighted_ats_score", side_effect=scoring_spy):
+        result = execute_workflow(db_session, workflow.id)
+
+    assert result.workflow_status == "COMPLETED"
+    assert "40%" not in (result.generated_resume_plain_text or "")
+    assert "Improved API performance" in (result.generated_resume_plain_text or "")
+    assert result.optimized_resume_id
+    assert workflow_to_dict(result)["major_step"] == 5
+    assert all(workflow_service.major_step_for_workflow(result, status) == 5
+               for status in statuses if status in workflow_service.STEP5_WORKFLOW_STATUSES)
+    assert scored
+    assert "40%" not in scored[-1]
+
+
+def test_supported_metric_is_kept_and_completed(db_session, test_user, test_resume, java_job):
+    from app.services.resume_structure_parser import parse_resume_structure
+
+    original = (test_resume.parsed_text or "") + "\nReduced processing time by 40%."
+    test_resume.parsed_text = original
+    db_session.add(test_resume)
+    db_session.commit()
+    generated = original + "\nReduced processing time by 40% on nightly jobs."
+    sections = parse_resume_structure(original).get("sections") or []
+    workflow = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+    with patch.object(workflow_service, "generate_with_llm_or_fallback", return_value=_candidate_from_resume(generated, sections)):
+        result = execute_workflow(db_session, workflow.id)
+    assert result.workflow_status == "COMPLETED"
+    assert "40%" in (result.generated_resume_plain_text or "")
+
+
+def test_uncorrected_invented_metric_does_not_complete(db_session, test_user, test_resume, java_job):
+    from app.services.resume_structure_parser import parse_resume_structure
+
+    original = test_resume.parsed_text or ""
+    dirty = original + "\nImproved API performance by 40%."
+    sections = parse_resume_structure(original).get("sections") or []
+    workflow = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+    with patch.object(workflow_service, "generate_with_llm_or_fallback", return_value=_candidate_from_resume(dirty, sections)), \
+         patch.object(workflow_service, "apply_truthfulness_corrections", return_value=(dirty, [])):
+        result = execute_workflow(db_session, workflow.id)
+    assert result.workflow_status == "VALIDATION_FAILED"
+    assert result.optimization_status == "VALIDATION_FAILED"
+    assert workflow_to_dict(result)["major_step"] == 5
+
+
+def test_unsupported_scrum_is_corrected_then_completed(db_session, test_user, test_resume, java_job):
+    from app.services.resume_structure_parser import parse_resume_structure
+
+    java_job.description = (java_job.description or "") + " Scrum is required."
+    java_job.skills_required = (java_job.skills_required or "") + ", Scrum"
+    db_session.add(java_job)
+    db_session.commit()
+
+    original = test_resume.parsed_text or ""
+    dirty = original + "\nWorked in Agile/Scrum teams to deliver Spring Boot microservices."
+    sections = parse_resume_structure(original).get("sections") or []
+    workflow = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+    with patch.object(workflow_service, "generate_with_llm_or_fallback", return_value=_candidate_from_resume(dirty, sections)):
+        result = execute_workflow(db_session, workflow.id)
+    assert result.workflow_status == "COMPLETED"
+    assert "Scrum" not in (result.generated_resume_plain_text or "")
+    assert "Agile" in (result.generated_resume_plain_text or "")
+    assert result.optimized_match_score is not None
+    remaining = workflow_to_dict(result).get("unsupported_keywords_not_added") or []
+    assert any("scrum" in str(item).lower() for item in remaining)
+    assert workflow_to_dict(result)["major_step"] == 5
+
+
+def test_unsupported_technology_is_corrected_then_completed(
+    db_session, test_user, test_resume, java_job
+):
+    from app.services.resume_structure_parser import parse_resume_structure
+
+    java_job.description = (java_job.description or "") + " Kubernetes is required."
+    java_job.skills_required = (java_job.skills_required or "") + ", Kubernetes"
+    db_session.add(java_job)
+    db_session.commit()
+
+    original = test_resume.parsed_text or ""
+    dirty = original + "\nIntroducing brand-new Kubernetes expertise never mentioned before."
+    sections = parse_resume_structure(original).get("sections") or []
+    workflow = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+    with patch.object(workflow_service, "generate_with_llm_or_fallback", return_value=_candidate_from_resume(dirty, sections)):
+        result = execute_workflow(db_session, workflow.id)
+    assert result.workflow_status == "COMPLETED"
+    assert "Kubernetes" not in (result.generated_resume_plain_text or "")
+    assert result.optimized_match_score is not None
+    assert workflow_to_dict(result)["major_step"] == 5
+
+
+def test_unsupported_claim_still_fails_when_correction_cannot_clean(
+    db_session, test_user, test_resume, java_job
+):
+    from app.services.resume_structure_parser import parse_resume_structure
+
+    java_job.description = (java_job.description or "") + " Scrum is required."
+    java_job.skills_required = (java_job.skills_required or "") + ", Scrum"
+    db_session.add(java_job)
+    db_session.commit()
+    original = test_resume.parsed_text or ""
+    dirty = original + "\nWorked within Scrum teams."
+    sections = parse_resume_structure(original).get("sections") or []
+    workflow = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+    with patch.object(workflow_service, "generate_with_llm_or_fallback", return_value=_candidate_from_resume(dirty, sections)), \
+         patch.object(workflow_service, "apply_truthfulness_corrections", return_value=(dirty, [])):
+        result = execute_workflow(db_session, workflow.id)
+    assert result.workflow_status == "VALIDATION_FAILED"
+    assert result.optimized_match_score is None
+    assert workflow_to_dict(result)["major_step"] == 5
+
+
+def test_execute_workflow_stale_status_update_marks_failed_without_poisoning_session(
+    db_session, test_user, test_resume, java_job, monkeypatch
+):
+    from sqlalchemy.orm.exc import StaleDataError
+
+    workflow = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+    workflow_id = workflow.id
+    real_set_status = workflow_service._set_status
+    calls = {"n": 0}
+
+    def explode_first_status(wf, status, db, error=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise StaleDataError(
+                "UPDATE statement on table 'ats_optimization_workflows' expected to "
+                "update 1 row(s); 0 were matched."
+            )
+        return real_set_status(wf, status, db, error)
+
+    monkeypatch.setattr(workflow_service, "_set_status", explode_first_status)
+
+    result = execute_workflow(db_session, workflow_id)
+    assert result.workflow_status == "FAILED"
+    leftover = (
+        db_session.query(AtsOptimizationWorkflow)
+        .filter(AtsOptimizationWorkflow.id == workflow_id)
+        .first()
+    )
+    assert leftover is not None
+    assert leftover.workflow_status == "FAILED"
+
+
+def test_commit_workflow_row_logs_gone_when_row_was_deleted(
+    db_session, test_user, test_resume, java_job
+):
+    workflow = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+    workflow_id = workflow.id
+    db_session.query(AtsOptimizationWorkflow).filter(
+        AtsOptimizationWorkflow.id == workflow_id
+    ).delete(synchronize_session=False)
+    db_session.commit()
+
+    persisted = workflow_service._set_status(workflow, "FAILED", db_session, "gone")
+    assert persisted is False
+    assert db_session.query(AtsOptimizationWorkflow).filter_by(id=workflow_id).first() is None
+    # No PendingRollbackError on the next statement.
+    assert db_session.query(AtsOptimizationWorkflow).count() == 0
+
+
+def test_run_workflow_job_missing_workflow_does_not_raise(monkeypatch, db_session):
+    engine = db_session.get_bind()
+    test_session_local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    monkeypatch.setattr("app.database.SessionLocal", test_session_local)
+
+    run_workflow_job(999999)
+
+
+def test_execute_workflow_generation_failure_still_marks_failed(
+    db_session, test_user, test_resume, java_job
+):
+    workflow = start_or_get_workflow(db_session, user_id=test_user.id, job_id=java_job.id)
+    with patch.object(workflow_service, "generate_with_llm_or_fallback", side_effect=RuntimeError("boom")):
+        result = execute_workflow(db_session, workflow.id)
+    assert result.workflow_status == "FAILED"
+    assert workflow_to_dict(result)["major_step"] == 5
+    db_session.expire_all()
+    loaded = db_session.query(AtsOptimizationWorkflow).filter_by(id=workflow.id).one()
+    assert loaded.workflow_status == "FAILED"

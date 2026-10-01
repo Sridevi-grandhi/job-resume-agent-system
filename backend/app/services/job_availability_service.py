@@ -15,8 +15,10 @@ only, no embedded credentials) for the initial URL and every redirect hop.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -102,6 +104,89 @@ def _detect_generic_listing_phrase(text: str) -> str | None:
     return None
 
 
+def _title_tokens(title: str | None) -> set[str]:
+    return {word for word in re.findall(r"[a-z0-9+#.]+", (title or "").lower()) if len(word) > 1}
+
+
+def _titles_strongly_match(expected_title: str | None, structured_title: str | None) -> bool:
+    """Conservative title match for page-owned structured metadata.
+
+    This is intentionally evidence only, not a replacement for the shared
+    verifier's employer/title checks.  It is used only after that verifier
+    has already accepted the URL as a safe, employer/ATS specific-job page.
+    """
+    expected = _title_tokens(expected_title)
+    actual = _title_tokens(structured_title)
+    if not expected or not actual:
+        return False
+    overlap = len(expected & actual)
+    return overlap / len(expected) >= 0.75 and overlap / len(actual) >= 0.6
+
+
+def _canonical_page_url(value: str | None) -> str:
+    if not value:
+        return ""
+    parsed = urlsplit(str(value))
+    if not parsed.scheme or not parsed.hostname:
+        return ""
+    return f"{parsed.scheme.lower()}://{parsed.hostname.lower()}{parsed.path.rstrip('/') or '/'}"
+
+
+def _iter_json_ld_nodes(value):
+    if isinstance(value, dict):
+        yield value
+        for nested in value.values():
+            yield from _iter_json_ld_nodes(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _iter_json_ld_nodes(nested)
+
+
+def _is_job_posting(node: dict[str, Any]) -> bool:
+    kind = node.get("@type")
+    return kind == "JobPosting" or (isinstance(kind, list) and "JobPosting" in kind)
+
+
+def _jobposting_confirms_specific_page(body: str, expected_title: str | None, current_url: str) -> bool:
+    """Find a page-owned JobPosting that confirms this exact job detail URL.
+
+    A generic careers/search page can contain a list of jobs and even mention
+    the expected title.  Therefore a title match alone is insufficient: the
+    structured JobPosting must also name this canonical page URL or carry an
+    identifier visible in it.  Malformed/absent JSON-LD remains no evidence.
+    """
+    if not expected_title:
+        return False
+    current_canonical = _canonical_page_url(current_url)
+    if not current_canonical:
+        return False
+    scripts = re.findall(
+        r"<script\b[^>]*\btype\s*=\s*['\"]application/ld\+json['\"][^>]*>(.*?)</script\s*>",
+        body,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    for script in scripts:
+        try:
+            payload = json.loads(script.strip())
+        except (TypeError, ValueError):
+            continue
+        for node in _iter_json_ld_nodes(payload):
+            if not isinstance(node, dict) or not _is_job_posting(node):
+                continue
+            if not _titles_strongly_match(expected_title, node.get("title")):
+                continue
+            structured_url = _canonical_page_url(node.get("url"))
+            if structured_url and structured_url == current_canonical:
+                return True
+            identifier = node.get("identifier")
+            if isinstance(identifier, dict):
+                identifier = identifier.get("value") or identifier.get("name")
+            identifier = str(identifier or "").strip().lower()
+            if len(identifier) >= 4 and identifier in current_url.lower():
+                return True
+    return False
+
+
 def _bounded_body_text(response: requests.Response) -> str:
     """Reads at most MAX_BODY_BYTES of the response body for phrase
     detection — never a full large-asset download."""
@@ -120,7 +205,9 @@ def _bounded_body_text(response: requests.Response) -> str:
     return b"".join(chunks).decode("utf-8", errors="ignore")
 
 
-def check_url_availability(url: str | None, session: requests.Session | None = None) -> dict[str, Any]:
+def check_url_availability(
+    url: str | None, session: requests.Session | None = None, *, expected_title: str | None = None,
+) -> dict[str, Any]:
     """Returns {"status": "ACTIVE" | "EXPIRED" | "UNKNOWN", "reason": str,
     "final_url": str | None}. Never raises — every failure mode (unsafe URL,
     timeout, network error, unexpected exception) becomes UNKNOWN with a
@@ -181,12 +268,26 @@ def check_url_availability(url: str | None, session: requests.Session | None = N
                 # client-rendered "no results, browse all jobs" fallback).
                 # Never trusts a real employer's 200 blindly (see
                 # classify_url_specificity's docstring).
-                if classify_url_specificity(url) == "SPECIFIC_JOB":
+                original_specificity = classify_url_specificity(url)
+                if original_specificity == "SPECIFIC_JOB":
                     if current_url != url and classify_url_specificity(current_url) != "SPECIFIC_JOB":
                         return {"status": "UNKNOWN", "reason": "redirected_to_generic_page", "final_url": current_url}
                     generic_phrase = _detect_generic_listing_phrase(body)
                     if generic_phrase:
+                        # A generic-looking page is still not assumed active.
+                        # The one safe exception is a page-owned JobPosting
+                        # that confirms BOTH this exact detail URL and the
+                        # expected job title supplied by the shared verifier.
+                        if _jobposting_confirms_specific_page(body, expected_title, current_url):
+                            return {"status": "ACTIVE", "reason": "jobposting_title_and_url_match", "final_url": current_url}
                         return {"status": "UNKNOWN", "reason": f"generic_page_text:{generic_phrase}", "final_url": current_url}
+                elif original_specificity == "GENERIC_EMPLOYER_PAGE":
+                    # A careers homepage or listing/search URL may prove the
+                    # employer site is reachable, but cannot prove this
+                    # particular opportunity is open.  The action resolver
+                    # can still offer a safe employer-site fallback when one
+                    # has already been independently verified as direct.
+                    return {"status": "UNKNOWN", "reason": "generic_or_unspecific_url", "final_url": current_url}
                 return {"status": "ACTIVE", "reason": "http_200", "final_url": current_url}
             # Any other status we didn't special-case — conservative UNKNOWN
             # rather than a guess.
@@ -210,6 +311,20 @@ def check_url_availability(url: str | None, session: requests.Session | None = N
 def apply_result(discovered_job: Any, result: dict[str, Any]) -> None:
     """Mutates a DiscoveredJob row in place with a fresh check result — the
     caller is responsible for db.commit()."""
+    current = getattr(discovered_job, "application_url", None) or getattr(discovered_job, "direct_url", None)
+    final = result.get("final_url")
+    if final and final != current:
+        from app.services.job_enrichment_service import EnrichmentCandidateResult, _candidate_passes_verification
+        candidate = EnrichmentCandidateResult(final, matched_title=getattr(discovered_job, "title", None),
+                                              matched_company=getattr(discovered_job, "company", None))
+        passes, reason = _candidate_passes_verification(candidate, discovered_job, allow_generic=True)
+        if passes:
+            discovered_job.application_url = final
+            discovered_job.direct_url = final
+            current = final
+        else:
+            result = {**result, "status": "UNKNOWN", "reason": "final_" + reason}
     discovered_job.availability_status = result.get("status") or "UNKNOWN"
+    discovered_job.verified_destination_url = current
     discovered_job.availability_checked_at = datetime.now(timezone.utc)
     discovered_job.availability_reason = (result.get("reason") or "")[:300]

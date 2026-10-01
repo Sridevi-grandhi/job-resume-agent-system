@@ -196,12 +196,23 @@ def test_get_adapters_always_includes_jsearch_slot_regardless_of_api_key(db_sess
     assert by_name["jsearch"].is_configured is False
 
 
+def test_get_adapters_adds_configured_adzuna_without_replacing_jsearch(db_session, monkeypatch):
+    monkeypatch.setenv("ADZUNA_APP_ID", "test-id")
+    monkeypatch.setenv("ADZUNA_APP_KEY", "test-key")
+    by_name = {adapter.source_name: adapter for adapter in registry.get_adapters(db_session)}
+    assert by_name["jsearch"].source_type == "broad_provider"
+    assert by_name["adzuna"].source_type == "broad_provider"
+    assert by_name["adzuna"].preference_queries == by_name["jsearch"].preference_queries
+
+
 def test_get_broad_provider_adapter_builds_queries_from_preferences(db_session, test_preferences):
     adapter = registry.get_broad_provider_adapter(db_session)
     assert adapter is not None
     assert adapter.source_name == "jsearch"
-    assert len(adapter.preference_queries) == 1
+    assert len(adapter.preference_queries) == 2
     assert adapter.preference_queries[0]["job_title"] == test_preferences.job_title
+    assert adapter.preference_queries[1]["job_title"] == "Spring Boot Developer"
+    assert adapter.preference_queries[1]["location"] == test_preferences.location
 
 
 def test_get_broad_provider_adapter_returns_none_for_unknown_provider(db_session, monkeypatch):

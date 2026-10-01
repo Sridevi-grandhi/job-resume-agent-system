@@ -1,4 +1,5 @@
 import json
+import logging
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -26,6 +27,17 @@ router = APIRouter(
     prefix="/api/email",
     tags=["Email"]
 )
+logger = logging.getLogger(__name__)
+
+
+def _sync_gmail_auto_scan_jobs() -> None:
+    """Apply persisted eligibility without making settings/OAuth fail on a scheduler error."""
+    try:
+        from app.scheduler.gmail_auto_scan_scheduler import schedule_gmail_auto_scans
+
+        schedule_gmail_auto_scans()
+    except Exception as error:
+        logger.error("GMAIL_AUTO_SCAN_SCHEDULER_SYNC_FAILED reason=%s", type(error).__name__)
 
 
 def _get_user(user_id: int, db: Session) -> User:
@@ -50,16 +62,16 @@ def _log_event(db: Session, *, user_id: int, event_type: str, subject: str, body
 
 def _email_types_to_scan_payload(preference: EmailSummaryPreference | None) -> list[str]:
     """NULL/unset means "all enabled" — see EmailSummaryPreference.email_types_to_scan."""
-    if preference is None or not preference.email_types_to_scan:
+    if preference is None or preference.email_types_to_scan is None:
         return list(ALL_EMAIL_CATEGORIES)
     try:
         values = json.loads(preference.email_types_to_scan)
     except (TypeError, ValueError):
         return list(ALL_EMAIL_CATEGORIES)
-    if not isinstance(values, list) or not values:
+    if not isinstance(values, list):
         return list(ALL_EMAIL_CATEGORIES)
     enabled = [value for value in values if value in ALL_EMAIL_CATEGORIES]
-    return enabled or list(ALL_EMAIL_CATEGORIES)
+    return enabled
 
 
 def _email_summary_preferences_payload(preference: EmailSummaryPreference | None, user: User) -> dict:
@@ -72,6 +84,9 @@ def _email_summary_preferences_payload(preference: EmailSummaryPreference | None
         "effective_daily_summary_recipient": recipient or user.email,
         "gmail_scan_frequency": (preference.gmail_scan_frequency if preference else None) or "daily",
         "email_types_to_scan": _email_types_to_scan_payload(preference),
+        "job_alerts_enabled": preference.job_alerts_enabled if preference else True,
+        "application_updates_enabled": preference.application_updates_enabled if preference else True,
+        "interview_alerts_enabled": preference.interview_alerts_enabled if preference else True,
     }
 
 
@@ -79,7 +94,10 @@ class EmailSummaryPreferenceUpdate(BaseModel):
     daily_summary_delivery_enabled: StrictBool | None = None
     automatic_gmail_scan_enabled: StrictBool | None = None
     daily_summary_recipient: EmailStr | None = None
-    gmail_scan_frequency: Literal["daily", "every_12_hours", "every_6_hours"] | None = None
+    gmail_scan_frequency: Literal["every_1_hour", "every_6_hours", "every_12_hours", "daily"] | None = None
+    job_alerts_enabled: StrictBool = True
+    application_updates_enabled: StrictBool = True
+    interview_alerts_enabled: StrictBool = True
     email_types_to_scan: list[Literal[
         "job_opportunities", "recruiter_messages", "application_updates", "interview_invitations",
     ]] | None = None
@@ -96,7 +114,7 @@ def get_email_summary_preferences(user_id: int, db: Session = Depends(get_db)):
 def update_email_summary_preferences(
     user_id: int, request: EmailSummaryPreferenceUpdate, db: Session = Depends(get_db),
 ):
-    """Persist opt-ins only. Delivery/scans/scheduler are never invoked here."""
+    """Persist opt-ins and resync automatic jobs; never scan during the request."""
     user = _get_user(user_id, db)
     preference = db.query(EmailSummaryPreference).filter(EmailSummaryPreference.user_id == user_id).first()
     if preference is None:
@@ -116,12 +134,7 @@ def update_email_summary_preferences(
     # Applies a toggle/frequency change immediately rather than waiting for
     # the next backend restart. Never allowed to fail the settings save —
     # a scheduler hiccup here must not look like "your settings didn't save".
-    try:
-        from app.scheduler.gmail_auto_scan_scheduler import schedule_gmail_auto_scans
-
-        schedule_gmail_auto_scans()
-    except Exception:
-        pass
+    _sync_gmail_auto_scan_jobs()
 
     return _email_summary_preferences_payload(preference, user)
 
@@ -296,6 +309,7 @@ def gmail_callback(code: str = "", state: str = "", error: str = "", db: Session
         db, user_id=connection.user_id, event_type="gmail_connected",
         subject="Gmail connected", body=f"Connected as {connection.email_address}.",
     )
+    _sync_gmail_auto_scan_jobs()
     return RedirectResponse(url=f"{target}?gmail=connected")
 
 
@@ -303,6 +317,7 @@ def gmail_callback(code: str = "", state: str = "", error: str = "", db: Session
 def gmail_disconnect(user_id: int, db: Session = Depends(get_db)):
     _get_user(user_id, db)
     gmail_service.disconnect(db, user_id)
+    _sync_gmail_auto_scan_jobs()
     _log_event(db, user_id=user_id, event_type="gmail_disconnected", subject="Gmail disconnected", body="")
     return {"disconnected": True}
 

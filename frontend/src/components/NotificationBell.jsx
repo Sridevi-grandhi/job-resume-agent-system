@@ -43,15 +43,28 @@ function timeAgo(dateString) {
 }
 
 /** Real, existing data only — never a fabricated notification. */
-function buildNotifications({ jobEmailEvents, dailySummaryLog, readIds }) {
+const EVENT_NOTIFICATION_KIND = {
+  RECRUITER_OUTREACH: ["job_alerts_enabled", "Job alert"],
+  OTHER: ["job_alerts_enabled", "Job alert"],
+  INTERVIEW_INVITE: ["interview_alerts_enabled", "Interview invitation"],
+  APPLICATION_CONFIRMATION: ["application_updates_enabled", "Application update"],
+  APPLICATION_UPDATE: ["application_updates_enabled", "Application update"],
+  ASSESSMENT_REQUEST: ["application_updates_enabled", "Application update"],
+  OFFER: ["application_updates_enabled", "Application update"],
+  REJECTION: ["application_updates_enabled", "Application update"],
+};
+
+function buildNotifications({ jobEmailEvents, dailySummaryLog, readIds, preferences }) {
   const items = [];
 
   for (const event of jobEmailEvents || []) {
     if (event.resolution !== "NEEDS_CONFIRMATION") continue;
+    const [preferenceKey, title] = EVENT_NOTIFICATION_KIND[event.event_type] || EVENT_NOTIFICATION_KIND.APPLICATION_UPDATE;
+    if (preferences?.[preferenceKey] === false) continue;
     items.push({
       id: `application_update:${event.id}`,
-      type: "APPLICATION_UPDATE",
-      title: "Application update",
+      type: event.event_type,
+      title,
       message: event.subject || "An application-related email needs your review.",
       timestamp: event.received_at || event.created_at,
       target: "/emails",
@@ -74,7 +87,7 @@ function buildNotifications({ jobEmailEvents, dailySummaryLog, readIds }) {
   return items.map((item) => ({ ...item, unread: !item.alwaysRead && !readIds.has(item.id) }));
 }
 
-export default function NotificationBell() {
+export default function NotificationBell({ inSidebar = false, onNavigate, settingsAction = false }) {
   const app = useApp();
   const navigate = useNavigate();
   const userId = app.currentUser?.user_id;
@@ -90,6 +103,7 @@ export default function NotificationBell() {
   useEffect(() => {
     if (!userId) return;
     app.loadJobEmailEvents();
+    app.loadEmailSummaryPreferences();
     // Deliberately bypasses the shared loadEmailLogs() action: that 404s
     // (and would set app.messages.emails — which the Daily Summary tab
     // displays) whenever no summary has ever been generated, the common
@@ -124,8 +138,8 @@ export default function NotificationBell() {
   }, [open]);
 
   const notifications = useMemo(
-    () => buildNotifications({ jobEmailEvents: app.jobEmailEvents, dailySummaryLog, readIds }),
-    [app.jobEmailEvents, dailySummaryLog, readIds],
+    () => buildNotifications({ jobEmailEvents: app.jobEmailEvents, dailySummaryLog, readIds, preferences: app.emailSummaryPreferences }),
+    [app.jobEmailEvents, app.emailSummaryPreferences, dailySummaryLog, readIds],
   );
   const unreadCount = notifications.filter((item) => item.unread).length;
   const badgeText = unreadCount > 9 ? "9+" : String(unreadCount);
@@ -152,7 +166,10 @@ export default function NotificationBell() {
   const handleRowClick = (item) => {
     markRead(item.id);
     setOpen(false);
-    if (item.target) navigate(item.target);
+    if (item.target) {
+      navigate(item.target);
+      onNavigate?.();
+    }
   };
 
   const toggleOpen = () => setOpen((current) => !current);
@@ -164,22 +181,24 @@ export default function NotificationBell() {
   };
 
   return (
-    <div className="notification-wrap" ref={containerRef}>
+    <div className={`notification-wrap${inSidebar ? " sidebar-notification-wrap" : ""}${settingsAction ? " settings-notification-wrap" : ""}`} ref={containerRef}>
       <button
         type="button"
         ref={buttonRef}
-        className="notification"
-        aria-label="Notifications"
+        className={inSidebar ? "sidebar-profile-item sidebar-notification-trigger" : settingsAction ? "button secondary settings-notification-trigger" : "notification"}
+        aria-label={settingsAction ? "View Notifications" : "Notifications"}
         aria-haspopup="true"
         aria-expanded={open}
         onClick={toggleOpen}
         onKeyDown={handleButtonKeyDown}
       >
         <Icon name="bell" size={18} />
-        {unreadCount > 0 && <b>{badgeText}</b>}
+        {inSidebar && <span>Notifications</span>}
+        {settingsAction && <span>View Notifications</span>}
+        {unreadCount > 0 && <b className={inSidebar || settingsAction ? "sidebar-notification-badge" : undefined}>{badgeText}</b>}
       </button>
       {open && (
-        <div className="notification-dropdown" role="menu">
+        <div className={`notification-dropdown${inSidebar ? " sidebar-notification-dropdown" : ""}`} role="menu">
           <div className="notification-dropdown-header">
             <span>Notifications</span>
             {unreadCount > 0 && (

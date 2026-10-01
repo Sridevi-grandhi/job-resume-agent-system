@@ -31,11 +31,36 @@ from app.models.password_reset_model import PasswordResetToken  # noqa: F401
 
 
 @pytest.fixture(autouse=True)
+def _clear_employer_career_cache():
+    """Career metadata is process-local. Tests must not inherit another test's employer."""
+    from app.services.employer_career_service import clear_career_cache
+
+    clear_career_cache()
+    yield
+    clear_career_cache()
+
+
+@pytest.fixture(autouse=True)
 def _no_real_llm(monkeypatch):
     """Force the LLM off for every test unless a test explicitly re-enables +
     mocks it. Prevents accidental real API calls (rule: no real LLM in tests)."""
     monkeypatch.setenv("LLM_PROVIDER", "none")
     monkeypatch.setenv("LLM_API_KEY", "")
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _no_real_jsearch_lookup(monkeypatch):
+    """Force JSEARCH_API_KEY off for every test unless a test explicitly
+    re-enables + mocks app.job_sources.jsearch.url_safety.safe_get.
+
+    job_change_detection_service._attempt_jsearch_direct_lookup runs for ANY
+    provider-listing job persisted through process_source_jobs — not just
+    jsearch-adapter tests — so without this, a developer's real
+    JSEARCH_API_KEY in backend/.env (loaded via load_dotenv at import time)
+    would make a real outbound API call during Adzuna/Dice/JSearch discovery
+    tests anywhere in the suite."""
+    monkeypatch.delenv("JSEARCH_API_KEY", raising=False)
     yield
 
 
@@ -70,6 +95,9 @@ def client(test_engine, monkeypatch):
         db = TestingSessionLocal()
         try:
             yield db
+        except Exception:
+            db.rollback()
+            raise
         finally:
             db.close()
 

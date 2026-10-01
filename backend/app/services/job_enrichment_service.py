@@ -32,16 +32,19 @@ fails any gate is rejected — this module never invents or guesses a URL.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 from typing import Any, Callable
 
 from app.services import job_availability_service as availability
+from app.services.job_enrichment_context import record_event
 from app.services.job_normalization_service import (
     classify_url_domain,
     classify_url_specificity,
     is_safe_application_url,
     resolve_application_destination,
+    verified_employer_domain_alias,
 )
 
 
@@ -52,6 +55,8 @@ class EnrichmentQuery:
     title: str
     location: str = ""
     requisition_id: str | None = None
+    ats_hint: str | None = None
+    ats_board_token: str | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +74,7 @@ class EnrichmentCandidateResult:
     matched_company: str | None = None
     matched_location: str | None = None
     provider_name: str | None = None
+
     # Small, generic diagnostic context (e.g. which specific apply option a
     # multi-option result was picked from, the provider's own result id) —
     # never verification input, never persisted to the DB, never a raw API
@@ -84,6 +90,7 @@ class EnrichmentResult:
     availability_status: str | None = None
     availability_reason: str | None = None
     provider_name: str | None = None
+    diagnostics: list[dict] = field(default_factory=list)
 
 
 EnrichmentProvider = Callable[[EnrichmentQuery], "list[EnrichmentCandidateResult]"]
@@ -162,52 +169,102 @@ def _locations_compatible(job_location: str, candidate_location: str | None) -> 
     return job_location in candidate_location or candidate_location in job_location
 
 
-def _candidate_passes_verification(
-    candidate: EnrichmentCandidateResult, job: Any, *, employer_website: str | None = None,
-) -> tuple[bool, str]:
-    """Steps 4-5's match requirements: same employer identity AND strong
-    title match AND compatible location, never a generic page, never an
-    unsafe URL. Returns (passes, reason)."""
+def _ats_tenant(url: str) -> str | None:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    tenant = None
+    if host.endswith((".myworkdayjobs.com", ".selectminds.com")):
+        tenant = host.split(".")[0]
+    elif host in {"boards.greenhouse.io", "job-boards.greenhouse.io", "jobs.lever.co"}:
+        tenant = next(iter(parsed.path.strip("/").split("/")), "")
+    return tenant
+
+
+def _ats_tenant_matches(url: str, company: str) -> bool:
+    tenant = _ats_tenant(url)
+    return bool(tenant and _company_slug(tenant) == _company_slug(company))
+
+
+def _candidate_verification(
+    candidate: EnrichmentCandidateResult, job: Any, *, employer_website: str | None = None, allow_generic: bool = False,
+) -> tuple[bool, str, dict[str, str | None]]:
+    """Returns the unchanged verification verdict plus safe diagnostic facts."""
+    evidence: dict[str, str | None] = {
+        "domain": urlsplit(candidate.url).hostname or None,
+        "url_safety": "NOT_EVALUATED",
+        "employer_identity": "NOT_EVALUATED",
+        "employer_alias": None,
+        "title_match": "NOT_EVALUATED",
+        "specificity": "NOT_EVALUATED",
+    }
     if not is_safe_application_url(candidate.url):
-        return False, "unsafe_url"
+        evidence["url_safety"] = "FAILED"
+        return False, "unsafe_url", evidence
+    evidence["url_safety"] = "PASSED"
 
     get = job.get if isinstance(job, dict) else (lambda key: getattr(job, key, None))
     job_company = get("company") or ""
     job_title = get("title") or ""
     job_location = get("location") or ""
 
+    alias_used = verified_employer_domain_alias(candidate.url, job_company)
+    evidence["employer_alias"] = alias_used
     domain_class = classify_url_domain(candidate.url, employer_website=employer_website, employer_name=job_company)
     if domain_class == "employer":
-        # classify_url_domain's employer branch already required this
-        # candidate's domain to match the job's employer_website/name —
-        # that IS the employer-identity check for this branch.
-        pass
+        evidence["employer_identity"] = "VERIFIED_ALIAS" if alias_used else "EMPLOYER_DOMAIN"
     elif domain_class == "ats":
-        # An ATS board hosts many employers — the domain alone proves
-        # nothing about WHICH employer, so the provider must have told us.
-        if not _company_names_match(job_company, candidate.matched_company):
-            return False, "ats_candidate_missing_employer_confirmation"
+        if _ats_tenant(candidate.url) and not _ats_tenant_matches(candidate.url, job_company):
+            evidence["employer_identity"] = "ATS_TENANT_MISMATCH"
+            return False, "ats_tenant_company_mismatch", evidence
+        if not (_company_names_match(job_company, candidate.matched_company) or _ats_tenant_matches(candidate.url, job_company)):
+            evidence["employer_identity"] = "ATS_EMPLOYER_UNCONFIRMED"
+            return False, "ats_candidate_missing_employer_confirmation", evidence
+        evidence["employer_identity"] = "ATS_EMPLOYER_CONFIRMED"
     else:
-        return False, "not_employer_or_ats_domain"
+        evidence["employer_identity"] = "UNRECOGNIZED_DOMAIN"
+        return False, "not_employer_or_ats_domain", evidence
 
     specificity = classify_url_specificity(candidate.url)
-    if specificity != "SPECIFIC_JOB":
-        return False, "not_specific_job_page"
+    evidence["specificity"] = specificity
+    if specificity != "SPECIFIC_JOB" and not (allow_generic and specificity == "GENERIC_EMPLOYER_PAGE"):
+        return False, "not_specific_job_page", evidence
 
     if not _titles_match(job_title, candidate.matched_title):
-        return False, "title_mismatch"
+        evidence["title_match"] = "FAILED"
+        return False, "title_mismatch", evidence
+    evidence["title_match"] = "PASSED"
+
+    # A descriptive URL slug must not contradict the provider's title metadata.
+    slug = urlsplit(candidate.url).path.rstrip("/").split("/")[-1]
+    slug_words = set(re.findall(r"[a-z]+", slug.lower()))
+    if len(slug_words) >= 2 and slug_words & {"engineer", "developer", "manager", "analyst", "architect", "scientist"}:
+        if not _titles_match(job_title, " ".join(slug_words)):
+            evidence["title_match"] = "FAILED_URL_SLUG"
+            return False, "title_mismatch", evidence
 
     if candidate.matched_company and not _company_names_match(job_company, candidate.matched_company):
-        return False, "company_mismatch"
+        evidence["employer_identity"] = "CANDIDATE_COMPANY_MISMATCH"
+        return False, "company_mismatch", evidence
 
     if not _locations_compatible(job_location, candidate.matched_location):
-        return False, "location_mismatch"
+        return False, "location_mismatch", evidence
 
-    return True, "verified"
+    return True, "verified", evidence
+
+
+def _candidate_passes_verification(
+    candidate: EnrichmentCandidateResult, job: Any, *, employer_website: str | None = None, allow_generic: bool = False,
+) -> tuple[bool, str]:
+    """Compatibility wrapper for callers that need only the verdict."""
+    passed, reason, _evidence = _candidate_verification(
+        candidate, job, employer_website=employer_website, allow_generic=allow_generic,
+    )
+    return passed, reason
 
 
 def enrich_job(
     job: Any, *, provider: EnrichmentProvider | None = None, employer_website: str | None = None,
+    include_local: bool = True,
 ) -> EnrichmentResult:
     """Attempts to find a verified, exact direct employer/ATS destination
     for a job that currently only resolves to AGGREGATOR_LISTING. Never
@@ -224,35 +281,142 @@ def enrich_job(
         return EnrichmentResult(status="PROVIDER_UNAVAILABLE", reason="no_enrichment_provider_configured")
 
     destination = resolve_application_destination(job)
-    if destination["type"] != "AGGREGATOR_LISTING":
-        return EnrichmentResult(status="NOT_APPLICABLE", reason="already_has_a_direct_destination")
-
     get = job.get if isinstance(job, dict) else (lambda key: getattr(job, key, None))
-    query = EnrichmentQuery(company=get("company") or "", title=get("title") or "", location=get("location") or "")
+    if destination["type"] != "AGGREGATOR_LISTING" and (get("application_url") or get("direct_url")):
+        return EnrichmentResult(status="NOT_APPLICABLE", reason="already_has_a_direct_destination")
+    from app.services.provider_apply_resolver import (
+        collect_outbound_apply_urls,
+        detect_ats_from_job,
+        is_provider_listing_url,
+        outbound_application_candidate,
+    )
 
-    try:
-        raw_candidates = active_provider(query) or []
-    except Exception as error:  # noqa: BLE001 — a flaky external provider must never break the discovery pipeline
-        return EnrichmentResult(status="PROVIDER_ERROR", reason=f"provider_error:{type(error).__name__}")
+    ats_hint, ats_board_token = detect_ats_from_job(job)
+    query = EnrichmentQuery(
+        company=get("company") or "", title=get("title") or "", location=get("location") or "",
+        ats_hint=ats_hint, ats_board_token=ats_board_token,
+    )
 
-    for candidate in raw_candidates:
-        passes, reason = _candidate_passes_verification(candidate, job, employer_website=employer_website)
-        if not passes:
-            continue
-        availability_result = availability.check_url_availability(candidate.url)
-        if availability_result["status"] != "ACTIVE":
-            # Don't promote a job from "View Listing" to a direct
-            # destination we can't even confirm is currently open —
-            # strictly more conservative than a provider-supplied direct
-            # URL (see module docstring).
-            continue
-        return EnrichmentResult(
-            status="ENRICHED", reason="verified_exact_match", url=candidate.url,
-            availability_status=availability_result["status"], availability_reason=availability_result["reason"],
-            provider_name=candidate.provider_name,
+    outbound_urls = collect_outbound_apply_urls(job) if include_local else []
+    local_candidates = [
+        EnrichmentCandidateResult(
+            url=url, matched_title=get("title"),
+            matched_location=get("location"), provider_name="provider_apply_url",
         )
+        for url in outbound_urls
+    ]
+    diagnostics = []
+    raw_outbound_candidate = outbound_application_candidate(job) if include_local else None
+    if include_local and outbound_urls:
+        for url in outbound_urls:
+            diagnostics.append({"domain": urlsplit(url).hostname, "reason": "outbound_candidate_found"})
+            record_event("outbound_candidate_found")
+    elif include_local and raw_outbound_candidate:
+        # Keep the untrusted value out of the verifier when it fails the
+        # existing URL-safety precondition.  No raw URL is persisted.
+        diagnostics.append({"reason": "outbound_candidate_unsafe"})
+        record_event("outbound_candidate_unsafe")
+    elif include_local:
+        # The provider listing stays available as a fallback, but it is not a
+        # direct-application candidate.  This diagnostic is durable and safe
+        # (no raw URL) so coverage gaps are distinguishable from verifier
+        # failures.
+        diagnostics.append({"reason": "no_outbound_destination"})
+        record_event("no_outbound_destination")
+    fallback = None
+    seen = set()
+    # Local candidate first: never spend a provider request before verifying it.
+    for stage in ("local", "provider"):
+        if stage == "local":
+            candidates = local_candidates
+        else:
+            try:
+                candidates = (active_provider(query) or [])[:10]
+            except Exception as error:
+                diagnostics.append({"reason": "provider_error", "error_class": type(error).__name__})
+                return fallback or EnrichmentResult(status="PROVIDER_ERROR", reason=f"provider_error:{type(error).__name__}", diagnostics=diagnostics)
+        for candidate in candidates:
+            if candidate.url in seen:
+                continue
+            seen.add(candidate.url)
+            if is_provider_listing_url(candidate.url):
+                diagnostics.append({
+                    "domain": urlsplit(candidate.url).hostname,
+                    "reason": "provider_listing_only",
+                })
+                record_event("provider_listing_only")
+                continue
+            if stage == "local":
+                record_event("provider_candidate_attempts")
+            outcome = _verify_candidate(candidate, job, employer_website=employer_website)
+            diagnostics.extend(outcome.diagnostics)
+            if outcome.status == "ENRICHED":
+                diagnostics.append({"domain": urlsplit(outcome.url).hostname, "reason": "verified_direct"})
+                record_event("promoted_direct")
+                record_event((candidate.provider_name or "provider") + "_successes")
+                return replace(outcome, diagnostics=diagnostics)
+            if stage == "local":
+                diagnostics.append({"domain": urlsplit(candidate.url).hostname, "reason": "outbound_candidate_verification_failed"})
+                record_event("outbound_candidate_verification_failed")
+            if outcome.status == "GENERIC_EMPLOYER" or (outcome.status == "EXPIRED" and fallback is None):
+                fallback = outcome
+    if is_provider_listing_url(get("source_url")):
+        diagnostics.append({"reason": "provider_fallback_used"})
+        record_event("provider_fallback_used")
+    return replace(fallback, diagnostics=diagnostics) if fallback else EnrichmentResult(status="REJECTED", reason="no_candidate_passed_verification", diagnostics=diagnostics)
 
-    return EnrichmentResult(status="REJECTED", reason="no_candidate_passed_verification")
+
+def _verify_candidate(candidate, job, *, employer_website=None):
+    """One bounded verification path, including revalidation after safe redirects."""
+    diagnostics = []
+    def rejected(reason, status=None, evidence=None):
+        event = {
+            **(evidence or {}),
+            "domain": (evidence or {}).get("domain") or ((urlsplit(candidate.url).hostname or "") if is_safe_application_url(candidate.url) else None),
+            "reason": reason,
+            "availability": status,
+        }
+        diagnostics.append(event)
+        record_event("verification_rejected", **event)
+        return EnrichmentResult("REJECTED", reason, diagnostics=diagnostics)
+
+    passes, reason, evidence = _candidate_verification(candidate, job, employer_website=employer_website, allow_generic=True)
+    # Only known provider redirect/listing hosts may be resolved before identity
+    # validation. Each hop is SSRF-checked by the existing availability service.
+    host = urlsplit(candidate.url).hostname if is_safe_application_url(candidate.url) else None
+    redirect_candidate = candidate.provider_name == "provider_apply_url" and reason == "not_employer_or_ats_domain" and (
+        classify_url_domain(candidate.url) == "aggregator" or host == "ad.doubleclick.net")
+    if not passes and not redirect_candidate:
+        return rejected(reason, evidence=evidence)
+    get = job.get if isinstance(job, dict) else (lambda key: getattr(job, key, None))
+    checked = availability.check_url_availability(candidate.url, expected_title=get("title") or candidate.matched_title)
+    effective = checked.get("final_url") or candidate.url
+    final_candidate = replace(candidate, url=effective)
+    passes, reason, evidence = _candidate_verification(final_candidate, job, employer_website=employer_website, allow_generic=True)
+    if not passes:
+        return rejected("final_" + reason, checked["status"], evidence)
+    specificity = classify_url_specificity(effective)
+    state = checked["status"]
+    raw_reason = str(checked.get("reason") or "")
+    # Never copy arbitrary exception text/URLs into durable diagnostics.
+    base_reason = raw_reason.split(":", 1)[0]
+    safe_reason = base_reason if re.fullmatch(r"http_[0-9]{3}", base_reason) or base_reason in {
+        "timeout", "network_error", "unsafe_url", "redirect_without_location", "too_many_redirects",
+        "redirected_to_generic_page", "generic_page_text", "generic_or_unspecific_url", "page_text", "check_failed", "no_url",
+    } else "availability_result"
+    diagnostics.append({**evidence, "domain": urlsplit(effective).hostname, "reason": safe_reason,
+                        "availability": state, "specificity": specificity})
+    if state == "ACTIVE":
+        status = "ENRICHED" if specificity == "SPECIFIC_JOB" else "GENERIC_EMPLOYER"
+        if status == "GENERIC_EMPLOYER":
+            record_event("generic_employer_page")
+    elif state == "EXPIRED" and specificity == "SPECIFIC_JOB":
+        status = "EXPIRED"
+        record_event("expired")
+    else:
+        return rejected(safe_reason or "availability_unknown", state, evidence)
+    return EnrichmentResult(status, "verified_exact_match" if status == "ENRICHED" else status.lower(),
+                            effective, state, safe_reason, candidate.provider_name, diagnostics)
 
 
 def enrich_job_with_fallback(job: Any, *, employer_website: str | None = None) -> EnrichmentResult:
@@ -272,25 +436,40 @@ def enrich_job_with_fallback(job: Any, *, employer_website: str | None = None) -
     from app.services.greenhouse_lever_enrichment_provider import greenhouse_lever_provider
 
     result = enrich_job(job, provider=greenhouse_lever_provider, employer_website=employer_website)
-    if result.status == "ENRICHED":
+    if result.status in {"ENRICHED", "NOT_APPLICABLE"}:
         return result
 
     from app.services.broad_search_enrichment_provider import broad_provider_configured, broad_search_provider
 
     if not broad_provider_configured():
         return result
-    return enrich_job(job, provider=broad_search_provider, employer_website=employer_website)
+    broad_result = enrich_job(job, provider=broad_search_provider, employer_website=employer_website, include_local=False)
+    winner = broad_result if broad_result.status == "ENRICHED" or result.status not in {"GENERIC_EMPLOYER", "EXPIRED"} else result
+    return replace(winner, diagnostics=result.diagnostics + broad_result.diagnostics)
 
 
 def apply_enrichment_result(job: Any, result: EnrichmentResult) -> None:
-    """Mutates a DiscoveredJob row in place with a successful enrichment —
-    caller is responsible for db.commit(). No-op for anything but
-    status="ENRICHED" (never partially applies a rejected/unavailable
-    result)."""
-    if result.status != "ENRICHED" or not result.url:
+    """Apply verified destination state without downgrading a better destination.
+
+    The caller is responsible for db.commit(); rejected/unknown results are
+    never promoted.
+    """
+    if result.status not in {"ENRICHED", "GENERIC_EMPLOYER", "EXPIRED"} or not result.url:
         return
+    from app.services.job_normalization_service import resolve_apply_action
+    previous = resolve_apply_action(job)
+    if previous["action_label"] == "Apply" and result.status != "ENRICHED":
+        return
+    if (previous["action_label"] == "Open Employer Site"
+            and result.status == "EXPIRED" and previous["url"] != result.url):
+        return
+    if (str(previous.get("action_label") or "").startswith("View on ")
+            and result.status not in {"ENRICHED", "GENERIC_EMPLOYER"}):
+        if not (result.status == "EXPIRED" and previous["url"] == result.url):
+            return
     job.direct_url = result.url
     job.application_url = result.url
+    job.verified_destination_url = result.url
     job.direct_url_source = result.provider_name or "enrichment"
     job.availability_status = result.availability_status or "ACTIVE"
     job.availability_checked_at = datetime.now(timezone.utc)

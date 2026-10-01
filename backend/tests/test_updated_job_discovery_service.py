@@ -8,14 +8,16 @@ already in progress returns its status instead of starting a duplicate
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
 import app.database as database_module
 from sqlalchemy.orm import sessionmaker
 
 from app.job_sources.base import JobSourceAdapter, SourceHealth
+from app.job_sources.apify_dice import ApifyDiceAdapter
 from app.services import job_source_registry_service as registry_module
 from app.services import updated_job_discovery_service as discovery
-from app.services.job_normalization_service import build_normalized_job
+from app.services.job_normalization_service import build_normalized_job, present_updated_job_action, resolve_apply_action
 
 
 class FakeAdapter(JobSourceAdapter):
@@ -251,3 +253,302 @@ def test_poll_status_reports_running_flag(test_engine, monkeypatch):
     status = discovery.poll_status()
     assert status["running"] is False
     assert status["last_summary"]["total_new"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Untrusted provider apply URLs must be handled by the shared enrichment
+# pipeline after normal discovery persistence, never promoted by an adapter.
+# ---------------------------------------------------------------------------
+
+def _dice_job(**overrides):
+    raw = {
+        "id": "dice-1", "title": "Lead DevOps Engineer", "company": "EPAM Systems",
+        "city": "Austin", "state": "TX", "description": "Build Kubernetes and Terraform platform automation.",
+        "url": "https://www.dice.com/job-detail/dice-1", "applyType": "APPLY_TO_URL",
+        "applyUrl": "https://careers.epam.com/job/12345/lead-devops-engineer",
+    }
+    raw.update(overrides)
+    return ApifyDiceAdapter().normalize_job(raw)
+
+
+def _disable_external_enrichment(monkeypatch):
+    """All candidates in these integration tests are local fixtures."""
+    monkeypatch.setenv("JOB_ENRICHMENT_BROAD_PROVIDER", "none")
+    monkeypatch.delenv("JOB_ENRICHMENT_BROAD_API_KEY", raising=False)
+    import app.services.greenhouse_lever_enrichment_provider as greenhouse_lever
+    monkeypatch.setattr(greenhouse_lever, "greenhouse_lever_provider", lambda query: [])
+
+
+def _run_single_adapter_poll(test_engine, monkeypatch, adapter):
+    _use_test_database(test_engine, monkeypatch)
+    monkeypatch.setattr(registry_module, "get_adapters", lambda db: [adapter])
+    return discovery.run_poll_cycle(triggered_by="manual")
+
+
+def test_normal_poll_promotes_valid_dice_candidate_through_shared_enrichment(test_engine, monkeypatch):
+    _disable_external_enrichment(monkeypatch)
+    dice = FakeAdapter("apify_dice", jobs=[_dice_job()])
+    with patch(
+        "app.services.job_enrichment_service.availability.check_url_availability",
+        return_value={"status": "ACTIVE", "reason": "http_200", "final_url": None},
+    ):
+        summary = _run_single_adapter_poll(test_engine, monkeypatch, dice)
+
+    assert summary["sources"][0]["error"] is None
+    from app.database import SessionLocal
+    from app.models.discovered_job_model import DiscoveredJob
+    db = SessionLocal()
+    try:
+        row = db.query(DiscoveredJob).filter_by(source="apify_dice").one()
+        assert row.application_url == "https://careers.epam.com/job/12345/lead-devops-engineer"
+        assert row.direct_url == row.application_url
+        assert resolve_apply_action(row)["action_label"] == "Apply"
+    finally:
+        db.close()
+
+
+def test_normal_poll_rejects_mismatched_dice_candidate_and_keeps_listing(test_engine, monkeypatch):
+    _disable_external_enrichment(monkeypatch)
+    dice = FakeAdapter("apify_dice", jobs=[_dice_job(
+        company="Company A", applyUrl="https://company-b.wd1.myworkdayjobs.com/en-US/careers/job/12345",
+    )])
+    _run_single_adapter_poll(test_engine, monkeypatch, dice)
+
+    from app.database import SessionLocal
+    from app.models.discovered_job_model import DiscoveredJob
+    db = SessionLocal()
+    try:
+        row = db.query(DiscoveredJob).filter_by(source="apify_dice").one()
+        assert row.application_url is None and row.direct_url is None
+        assert row.unverified_application_url == "https://company-b.wd1.myworkdayjobs.com/en-US/careers/job/12345"
+        assert resolve_apply_action(row)["action_label"] == "View Listing"
+    finally:
+        db.close()
+
+
+def test_dice_apply_to_email_remains_listing_and_skips_enrichment(test_engine, monkeypatch):
+    dice = FakeAdapter("apify_dice", jobs=[_dice_job(applyType="APPLY_TO_EMAIL", applyUrl="mailto:jobs@example.com")])
+    with patch("app.services.job_change_detection_service.enrich_job_with_fallback") as enrich:
+        _run_single_adapter_poll(test_engine, monkeypatch, dice)
+    enrich.assert_not_called()
+
+
+def test_jsearch_candidate_and_adzuna_listing_both_reach_shared_enrichment(test_engine, monkeypatch):
+    jsearch = FakeAdapter("jsearch", jobs=[build_normalized_job(
+        source="jsearch", source_mode="live", source_job_id="j-1", company="Test Co", title="Engineer",
+        location="Remote", work_mode="Remote", job_type="Full-time", description="Detailed engineering role.",
+        direct_url="https://careers.testco.example/jobs/12345",
+    )])
+    adzuna = FakeAdapter("adzuna", jobs=[build_normalized_job(
+        source="adzuna", source_mode="live", source_job_id="a-1", company="Other Co", title="Engineer",
+        location="Remote", work_mode="Remote", job_type="Full-time", description="Detailed engineering role.",
+        source_url="https://www.adzuna.com/details/1",
+    )])
+    _use_test_database(test_engine, monkeypatch)
+    monkeypatch.setattr(registry_module, "get_adapters", lambda db: [jsearch, adzuna])
+    from app.services.job_enrichment_service import EnrichmentResult
+    with patch("app.services.job_change_detection_service.enrich_job_with_fallback", return_value=EnrichmentResult("REJECTED", "no_candidates")) as enrich:
+        summary = discovery.run_poll_cycle(triggered_by="manual")
+    assert summary["total_new"] == 2
+    assert enrich.call_count == 2
+
+
+def test_enrichment_error_is_isolated_and_keeps_discovered_job(test_engine, monkeypatch):
+    dice = FakeAdapter("apify_dice", jobs=[_dice_job()])
+    with patch("app.services.job_change_detection_service.enrich_job_with_fallback", side_effect=RuntimeError("enrichment unavailable")):
+        summary = _run_single_adapter_poll(test_engine, monkeypatch, dice)
+    assert summary["sources"][0]["error"] is None
+
+    from app.database import SessionLocal
+    from app.models.discovered_job_model import DiscoveredJob
+    db = SessionLocal()
+    try:
+        row = db.query(DiscoveredJob).filter_by(source="apify_dice").one()
+        assert row.application_url is None
+        assert resolve_apply_action(row)["action_label"] == "Open Employer Site"
+        assert resolve_apply_action(row)["url"] == "https://careers.epam.com/job/12345/lead-devops-engineer"
+    finally:
+        db.close()
+
+
+def test_aggregator_refresh_never_erases_a_previously_promoted_direct_url(test_engine, monkeypatch):
+    _disable_external_enrichment(monkeypatch)
+    first = FakeAdapter("apify_dice", jobs=[_dice_job()])
+    with patch(
+        "app.services.job_enrichment_service.availability.check_url_availability",
+        return_value={"status": "ACTIVE", "reason": "http_200", "final_url": None},
+    ):
+        _run_single_adapter_poll(test_engine, monkeypatch, first)
+
+    # A later listing refresh has no direct URL of its own and changes content.
+    # Even if optional enrichment is unavailable then, it cannot demote Apply.
+    refreshed = FakeAdapter("apify_dice", jobs=[_dice_job(description="Updated Kubernetes and Terraform role details.")])
+    with patch("app.services.job_change_detection_service.enrich_job_with_fallback", side_effect=RuntimeError("temporary outage")):
+        _run_single_adapter_poll(test_engine, monkeypatch, refreshed)
+
+    from app.database import SessionLocal
+    from app.models.discovered_job_model import DiscoveredJob
+    db = SessionLocal()
+    try:
+        row = db.query(DiscoveredJob).filter_by(source="apify_dice").one()
+        assert row.application_url == "https://careers.epam.com/job/12345/lead-devops-engineer"
+        assert row.direct_url == row.application_url
+        assert resolve_apply_action(row)["action_label"] == "Apply"
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# JSearch targeted lookup for provider-only listings — turns Dice/Adzuna/
+# LinkedIn-only jobs into a real "Apply on Company Site" where one exists,
+# without ever making an unbounded number of calls per cycle.
+# ---------------------------------------------------------------------------
+
+def _jsearch_lookup_response(status_code=200, jobs=None):
+    response = MagicMock(status_code=status_code)
+    response.json.return_value = {
+        "status": "OK", "request_id": "test", "parameters": {},
+        "data": {"jobs": jobs or [], "cursor": None},
+    }
+    return response
+
+
+def _jsearch_lookup_hit(employer_name, job_title, apply_link):
+    return {
+        "employer_name": employer_name, "job_title": job_title, "employer_website": None,
+        "job_apply_link": apply_link, "job_apply_is_direct": True, "apply_options": [],
+    }
+
+
+def _listing_only_job(source, source_job_id, company, title, source_url, **overrides):
+    return build_normalized_job(
+        source=source, source_mode="live", source_job_id=source_job_id,
+        company=company, title=title, location="Austin, TX", work_mode="Onsite", job_type="Full-time",
+        description="A sufficiently detailed job description for testing purposes here.",
+        source_url=source_url, **overrides,
+    )
+
+
+def test_jsearch_lookup_promotes_dice_email_only_listing_to_a_real_employer_url(test_engine, monkeypatch):
+    """A lookup hit writes a real employer URL into unverified_application_url,
+    immediately promoting the destination away from the provider listing —
+    "Open Career Page" until a later availability check confirms it ACTIVE
+    (same path every other freshly-found direct candidate takes), never
+    "Apply on Dice" anymore."""
+    _disable_external_enrichment(monkeypatch)
+    monkeypatch.setenv("JSEARCH_API_KEY", "test-key")
+    dice = FakeAdapter("apify_dice", jobs=[_listing_only_job(
+        "apify_dice", "d-1", "Acme Widgets", "Senior Java Developer",
+        "https://www.dice.com/job-detail/48213019", candidate_application_type="APPLY_TO_EMAIL",
+    )])
+    _use_test_database(test_engine, monkeypatch)
+    monkeypatch.setattr(registry_module, "get_adapters", lambda db: [dice])
+    hit = _jsearch_lookup_hit("Acme Widgets", "Senior Java Developer", "https://careers.acmewidgets.com/job/12345/senior-java-developer")
+    with patch("app.job_sources.jsearch.url_safety.safe_get", return_value=_jsearch_lookup_response(jobs=[hit])) as mocked:
+        discovery.run_poll_cycle(triggered_by="manual")
+    mocked.assert_called_once()
+
+    from app.database import SessionLocal
+    from app.models.discovered_job_model import DiscoveredJob
+    db = SessionLocal()
+    try:
+        row = db.query(DiscoveredJob).filter_by(source="apify_dice").one()
+        assert row.unverified_application_url == "https://careers.acmewidgets.com/job/12345/senior-java-developer"
+        action = present_updated_job_action(resolve_apply_action(row))
+        assert action["action_label"] == "Open Career Page"
+        assert action["url"] == "https://careers.acmewidgets.com/job/12345/senior-java-developer"
+    finally:
+        db.close()
+
+
+def test_jsearch_lookup_miss_keeps_the_provider_listing_label(test_engine, monkeypatch):
+    _disable_external_enrichment(monkeypatch)
+    monkeypatch.setenv("JSEARCH_API_KEY", "test-key")
+    adzuna = FakeAdapter("adzuna", jobs=[_listing_only_job(
+        "adzuna", "a-1", "Beta Corp", "Backend Engineer", "https://www.adzuna.com/details/1",
+    )])
+    _use_test_database(test_engine, monkeypatch)
+    monkeypatch.setattr(registry_module, "get_adapters", lambda db: [adzuna])
+    with patch("app.job_sources.jsearch.url_safety.safe_get", return_value=_jsearch_lookup_response(jobs=[])) as mocked:
+        discovery.run_poll_cycle(triggered_by="manual")
+    mocked.assert_called_once()
+
+    from app.database import SessionLocal
+    from app.models.discovered_job_model import DiscoveredJob
+    db = SessionLocal()
+    try:
+        row = db.query(DiscoveredJob).filter_by(source="adzuna").one()
+        assert row.unverified_application_url is None
+        action = present_updated_job_action(resolve_apply_action(row))
+        assert action["action_label"] == "Apply on Adzuna"
+    finally:
+        db.close()
+
+
+def test_jsearch_lookup_both_dice_and_adzuna_listings_are_attempted(test_engine, monkeypatch):
+    """Deliberately a SEPARATE call site from the greenhouse/lever/SerpAPI
+    enrichment pass — must still run for an APPLY_TO_EMAIL Dice row, which
+    that pass intentionally skips before ever calling enrichment."""
+    _disable_external_enrichment(monkeypatch)
+    monkeypatch.setenv("JSEARCH_API_KEY", "test-key")
+    dice_email_only = _listing_only_job(
+        "apify_dice", "d-2", "Acme Widgets", "Senior Java Developer",
+        "https://www.dice.com/job-detail/48213020", candidate_application_type="APPLY_TO_EMAIL",
+    )
+    adzuna_listing = _listing_only_job(
+        "adzuna", "a-2", "Beta Corp", "Backend Engineer", "https://www.adzuna.com/details/2",
+    )
+    _use_test_database(test_engine, monkeypatch)
+    monkeypatch.setattr(
+        registry_module, "get_adapters",
+        lambda db: [FakeAdapter("apify_dice", jobs=[dice_email_only]), FakeAdapter("adzuna", jobs=[adzuna_listing])],
+    )
+    with patch("app.job_sources.jsearch.url_safety.safe_get", return_value=_jsearch_lookup_response(jobs=[])) as mocked:
+        discovery.run_poll_cycle(triggered_by="manual")
+    assert mocked.call_count == 2
+
+
+def test_jsearch_lookup_per_cycle_cap_is_respected(test_engine, monkeypatch):
+    _disable_external_enrichment(monkeypatch)
+    monkeypatch.setenv("JSEARCH_API_KEY", "test-key")
+    monkeypatch.setenv("JSEARCH_LOOKUP_MAX_PER_CYCLE", "1")
+    jobs = [
+        _listing_only_job("adzuna", f"a-{i}", f"Company {i}", "Backend Engineer", f"https://www.adzuna.com/details/{i}")
+        for i in range(3)
+    ]
+    _use_test_database(test_engine, monkeypatch)
+    monkeypatch.setattr(registry_module, "get_adapters", lambda db: [FakeAdapter("adzuna", jobs=jobs)])
+    with patch("app.job_sources.jsearch.url_safety.safe_get", return_value=_jsearch_lookup_response(jobs=[])) as mocked:
+        discovery.run_poll_cycle(triggered_by="manual")
+    assert mocked.call_count == 1
+
+
+def test_jsearch_lookup_stops_entirely_on_rate_limit_within_the_same_cycle(test_engine, monkeypatch):
+    _disable_external_enrichment(monkeypatch)
+    monkeypatch.setenv("JSEARCH_API_KEY", "test-key")
+    monkeypatch.setenv("JSEARCH_LOOKUP_MAX_PER_CYCLE", "25")
+    jobs = [
+        _listing_only_job("adzuna", f"a-{i}", f"Company {i}", "Backend Engineer", f"https://www.adzuna.com/details/{i}")
+        for i in range(3)
+    ]
+    _use_test_database(test_engine, monkeypatch)
+    monkeypatch.setattr(registry_module, "get_adapters", lambda db: [FakeAdapter("adzuna", jobs=jobs)])
+    with patch("app.job_sources.jsearch.url_safety.safe_get", return_value=_jsearch_lookup_response(status_code=429)) as mocked:
+        discovery.run_poll_cycle(triggered_by="manual")
+    assert mocked.call_count == 1  # the 429 on job 1 stops the other 2 this cycle
+
+
+def test_jsearch_lookup_skips_a_job_already_attempted_within_7_days(test_engine, monkeypatch):
+    _disable_external_enrichment(monkeypatch)
+    monkeypatch.setenv("JSEARCH_API_KEY", "test-key")
+    job = _listing_only_job("adzuna", "a-cooldown", "Beta Corp", "Backend Engineer", "https://www.adzuna.com/details/9")
+    _use_test_database(test_engine, monkeypatch)
+    monkeypatch.setattr(registry_module, "get_adapters", lambda db: [FakeAdapter("adzuna", jobs=[job])])
+
+    with patch("app.job_sources.jsearch.url_safety.safe_get", return_value=_jsearch_lookup_response(jobs=[])) as mocked:
+        discovery.run_poll_cycle(triggered_by="manual")
+        discovery.run_poll_cycle(triggered_by="manual")
+    # Second cycle's own enrichment cooldown (6h) also skips re-touching
+    # enrichment_diagnostics, which is exactly what preserves the lookup
+    # marker between cycles — asserting the net effect: only 1 HTTP call.
+    assert mocked.call_count == 1

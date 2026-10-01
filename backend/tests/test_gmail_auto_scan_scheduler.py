@@ -6,6 +6,7 @@ but never actually starts it here (jobs are added/inspected directly)."""
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from unittest.mock import patch
 
 import pytest
@@ -18,7 +19,9 @@ import app.scheduler.gmail_auto_scan_scheduler as auto_scan_module
 from app.models.application_tracking_model import ApplicationTracking
 from app.models.email_connection_model import EmailConnection
 from app.models.email_summary_preference_model import EmailSummaryPreference
+from app.models.job_email_event_model import JobEmailEvent
 from app.services import gmail_service
+from app.services.email_provider import ProviderMessage
 
 
 @pytest.fixture(autouse=True)
@@ -35,7 +38,10 @@ def _use_test_session_local(db_session, monkeypatch):
 
 
 def _connected(db, user_id, **overrides):
-    defaults = dict(user_id=user_id, provider="gmail", status="CONNECTED", email_address="candidate@gmail.com")
+    defaults = dict(
+        user_id=user_id, provider="gmail", status="CONNECTED", email_address="candidate@gmail.com",
+        encrypted_access_token="test-token", encrypted_refresh_token="test-refresh-token",
+    )
     defaults.update(overrides)
     connection = EmailConnection(**defaults)
     db.add(connection)
@@ -170,11 +176,61 @@ def test_automatic_scan_never_touches_application_status(db_session, test_user, 
     assert application.status == "APPLIED"
 
 
+def test_automatic_scan_classifies_sample_emails_and_deduplicates_second_run(db_session, test_user):
+    _connected(db_session, test_user.id)
+    preference = _opted_in(db_session, test_user.id)
+    preference.email_types_to_scan = json.dumps(["job_opportunities", "application_updates", "interview_invitations"])
+    db_session.commit()
+    provider = MagicMock()
+    provider.access_token = "fake-token"
+    provider.list_recent_messages.return_value = [{"id": "sample-job-1"}, {"id": "sample-nonjob-1"}, {"id": "sample-recruiter-1"}]
+    messages = {
+        "sample-job-1": ProviderMessage(
+            message_id="sample-job-1", thread_id="thread-job", sender="recruiter@example.test",
+            subject="Interview Invitation – Python Developer",
+            body=("Hi Tanishka, Thank you for applying for the Python Developer position. "
+                  "We would like to schedule a technical interview for Tuesday at 2 PM CST. "
+                  "Please confirm your availability."),
+            snippet="Interview invitation", received_at=datetime.now(timezone.utc),
+        ),
+        "sample-nonjob-1": ProviderMessage(
+            message_id="sample-nonjob-1", thread_id="thread-nonjob", sender="shipping@example.test",
+            subject="Your package has shipped",
+            body="Your order has shipped and should arrive tomorrow.",
+            snippet="Your order has shipped", received_at=datetime.now(timezone.utc),
+        ),
+        "sample-recruiter-1": ProviderMessage(
+            message_id="sample-recruiter-1", thread_id="thread-recruiter", sender="recruiter@example.test",
+            subject="Exciting opportunity for you", body="I came across your profile. Are you open to new opportunities?",
+            snippet="Career opportunity", received_at=datetime.now(timezone.utc),
+        ),
+    }
+    provider.get_message.side_effect = messages.get
+    history = {
+        "historyId": "101",
+        "history": [{"messagesAdded": [{"message": {"id": message_id}} for message_id in messages]}],
+    }
+    with patch.object(auto_scan_module.job_email_scan_service.gmail_service, "get_provider_for_user", return_value=provider), \
+         patch.object(auto_scan_module.job_email_scan_service.gmail_service, "get_profile", return_value={"historyId": "100"}), \
+         patch.object(auto_scan_module.job_email_scan_service.gmail_service, "get_history", return_value=history):
+        assert auto_scan_module.run_automatic_scan_for_user(test_user.id) == "scanned"
+        assert auto_scan_module.run_automatic_scan_for_user(test_user.id) == "scanned"
+
+    events = db_session.query(JobEmailEvent).filter_by(user_id=test_user.id).all()
+    assert len(events) == 1
+    assert events[0].message_id == "sample-job-1"
+    assert events[0].event_type == "INTERVIEW_INVITE"
+    assert events[0].resolution == "NEEDS_CONFIRMATION"
+    assert provider.get_message.call_count == 6
+
+
 # ---------------------------------------------------------------------------
 # schedule_gmail_auto_scans — job (de)registration
 # ---------------------------------------------------------------------------
 
 def test_schedules_a_job_only_for_opted_in_users(db_session, test_user, second_user):
+    _connected(db_session, test_user.id)
+    _connected(db_session, second_user.id)
     _opted_in(db_session, test_user.id)
     _opted_in(db_session, second_user.id, automatic_gmail_scan_enabled=False)
 
@@ -184,7 +240,49 @@ def test_schedules_a_job_only_for_opted_in_users(db_session, test_user, second_u
     assert auto_scan_module.scheduler.get_job(f"gmail_auto_scan_user_{second_user.id}") is None
 
 
+@pytest.mark.parametrize("frequency,hours", [("daily", 24), ("every_1_hour", 1)])
+def test_newly_enabled_user_gets_prompt_first_run_even_after_recent_manual_scan(db_session, test_user, frequency, hours):
+    _connected(db_session, test_user.id, last_scanned_at=datetime.now(timezone.utc))
+    _opted_in(db_session, test_user.id, gmail_scan_frequency=frequency)
+    before = datetime.now(timezone.utc)
+
+    with patch.object(auto_scan_module.scheduler, "add_job", wraps=auto_scan_module.scheduler.add_job) as add_job:
+        auto_scan_module.schedule_gmail_auto_scans()
+
+    first_run = add_job.call_args.kwargs["next_run_time"]
+    assert before + auto_scan_module.FIRST_SCAN_DELAY <= first_run
+    assert first_run <= datetime.now(timezone.utc) + auto_scan_module.FIRST_SCAN_DELAY
+    assert add_job.call_args.kwargs["trigger"].interval == timedelta(hours=hours)
+
+
+def test_saving_unchanged_preferences_preserves_existing_job(db_session, test_user):
+    _connected(db_session, test_user.id)
+    _opted_in(db_session, test_user.id)
+    auto_scan_module.schedule_gmail_auto_scans()
+    original = auto_scan_module.scheduler.get_job(f"gmail_auto_scan_user_{test_user.id}")
+
+    with patch.object(auto_scan_module.scheduler, "add_job", wraps=auto_scan_module.scheduler.add_job) as add_job:
+        auto_scan_module.schedule_gmail_auto_scans()
+
+    add_job.assert_not_called()
+    assert auto_scan_module.scheduler.get_job(original.id) is original
+
+
+def test_missing_oauth_tokens_prevents_job_registration(db_session, test_user):
+    _connected(db_session, test_user.id, encrypted_refresh_token=None)
+    _opted_in(db_session, test_user.id)
+    auto_scan_module.schedule_gmail_auto_scans()
+    assert auto_scan_module.scheduler.get_job(f"gmail_auto_scan_user_{test_user.id}") is None
+
+
+def test_enabled_but_disconnected_user_is_not_scheduled(db_session, test_user):
+    _opted_in(db_session, test_user.id)
+    auto_scan_module.schedule_gmail_auto_scans()
+    assert auto_scan_module.scheduler.get_job(f"gmail_auto_scan_user_{test_user.id}") is None
+
+
 def test_opting_out_removes_the_previously_scheduled_job(db_session, test_user):
+    _connected(db_session, test_user.id)
     preference = _opted_in(db_session, test_user.id)
     auto_scan_module.schedule_gmail_auto_scans()
     assert auto_scan_module.scheduler.get_job(f"gmail_auto_scan_user_{test_user.id}") is not None
@@ -195,8 +293,9 @@ def test_opting_out_removes_the_previously_scheduled_job(db_session, test_user):
     assert auto_scan_module.scheduler.get_job(f"gmail_auto_scan_user_{test_user.id}") is None
 
 
-@pytest.mark.parametrize("frequency,hours", [("daily", 24), ("every_12_hours", 12), ("every_6_hours", 6)])
+@pytest.mark.parametrize("frequency,hours", [("every_1_hour", 1), ("every_6_hours", 6), ("every_12_hours", 12), ("daily", 24)])
 def test_job_interval_matches_configured_frequency(db_session, test_user, frequency, hours):
+    _connected(db_session, test_user.id)
     _opted_in(db_session, test_user.id, gmail_scan_frequency=frequency)
     auto_scan_module.schedule_gmail_auto_scans()
     job = auto_scan_module.scheduler.get_job(f"gmail_auto_scan_user_{test_user.id}")

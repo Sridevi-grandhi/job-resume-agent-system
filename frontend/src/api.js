@@ -94,6 +94,16 @@ export async function resetPassword({ token, new_password }) {
   return response.json();
 }
 
+export async function updateProfileName(userId, { name, current_password }) {
+  const response = await fetch(`${API_BASE_URL}/api/auth/profile/${userId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name, current_password }),
+  });
+  if (!response.ok) throw new Error(await getErrorMessage(response));
+  return response.json();
+}
+
 export async function saveUserPreferences(preferences) {
   const response = await fetch(`${API_BASE_URL}/api/preferences`, {
     method: "POST",
@@ -734,11 +744,11 @@ export async function refreshDiscoveredJobs(userId) {
   return response.json();
 }
 
-export async function saveDiscoveredJob(userId, discoveredJobId) {
+export async function saveDiscoveredJob(userId, discoveredJobId, { startWorkflow = true } = {}) {
   const response = await fetch(`${API_BASE_URL}/api/job-discovery/save/${userId}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ discovered_job_id: discoveredJobId }),
+    body: JSON.stringify({ discovered_job_id: discoveredJobId, start_workflow: startWorkflow }),
   });
   if (!response.ok) {
     throw new Error(await getErrorMessage(response));

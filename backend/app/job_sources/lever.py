@@ -123,7 +123,7 @@ class LeverAdapter(JobSourceAdapter):
             title=title,
             location=location,
             work_mode="Remote" if "remote" in str(location).lower() else "Not specified",
-            job_type=commitment or "Full-time",
+            job_type=commitment or "Not specified",
             description=description,
             skills=team or "",
             posted_at=posted_at,

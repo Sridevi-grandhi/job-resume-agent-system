@@ -1,6 +1,6 @@
 /* eslint-disable react-hooks/exhaustive-deps */
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { useApp } from "../context/AppContext";
 import { Page, Panel, Notice } from "../components/Page";
 import EmptyState from "../components/EmptyState";
@@ -14,11 +14,41 @@ import {
   improveResumeSnippet,
   saveEditedOptimizedResume,
 } from "../api";
+import {
+  ATS_ENTRY_MODE,
+  STEP5_WORKFLOW_STATUSES,
+  WIZARD_STEP,
+  applyStaleWizardStep,
+  atsResultJobId,
+  claimAtsWizardForUser,
+  clearFreshSelectedJobIntent,
+  clearStoredWizardStep,
+  consumeStartOptimizationIntent,
+  peekGuidedRestart,
+  peekFreshSelectedJobIntent,
+  peekStartOptimizationIntent,
+  generationSubstage,
+  isStep5WorkflowStatus,
+  majorStepFromWorkflow,
+  nextMonotonicStep,
+  readStoredWizardStep,
+  resolveInitialWizardStep,
+  stripAtsEntryMode,
+  writeGuidedRestart,
+  writeStoredWizardStep,
+} from "../utils/atsWizardState";
 
 function isGenerationFailureMessage(message) {
   const text = String(message || "");
   return /^(Failed|Validation failed)\b/i.test(text)
     || /evidence incomplete/i.test(text);
+}
+
+function formatUnsupportedClaim(message) {
+  const err = String(message || "");
+  const introduced = err.match(/Unsupported (.+?) introduced:\s*(.+)$/i);
+  if (introduced) return `Unsupported ${introduced[1]}: ${introduced[2]}`;
+  return "";
 }
 
 function buildAtsStatusBanner({
@@ -28,13 +58,17 @@ function buildAtsStatusBanner({
   missingSkillsGroups,
   canContinueToOptimization,
   isComplete,
+  isGenerating,
   result,
   disabledReason,
   originalScore,
   currentEditorScore,
 }) {
-  if (busy === "ats-requirements") return { text: "Analyzing job requirements…", tone: "info" };
-  if (busy === "ats-skills") return { text: "Updating skill evidence…", tone: "info" };
+  if (step >= 5 && (isGenerating || busy === "ats")) {
+    return { text: messages.ats || "Generating ATS Resume…", tone: "info" };
+  }
+  if (busy === "ats-requirements" && step < 5) return { text: "Analyzing job requirements…", tone: "info" };
+  if (busy === "ats-skills" && step < 5) return { text: "Updating skill evidence…", tone: "info" };
   if (busy === "ats" && step >= 5) {
     return { text: messages.ats || "Generating optimized resume…", tone: "info" };
   }
@@ -105,7 +139,7 @@ function buildAtsStatusBanner({
       return {
         text: /timed out waiting/i.test(String(messages.ats || ""))
           ? "Resume generation could not be completed. You can retry."
-          : (messages.ats || "Resume generation could not be completed. You can retry."),
+          : (messages.ats || "Validation failed. The generated resume contained unsupported information."),
         tone: "error",
       };
     }
@@ -139,6 +173,8 @@ function buildAtsStatusBanner({
     tone: "info",
   };
 }
+const INELIGIBLE_GENERATION_MESSAGE = "This resume is not sufficiently aligned with this role to generate a truthful optimized resume. Consider selecting another role or uploading a more relevant resume.";
+
 const genericSearchSources = new Set([
   "LinkedIn Jobs",
   "Indeed",
@@ -346,18 +382,22 @@ function listText(value) {
 function PipelineProgress({ status }) {
   const current = STEP_ORDER[status] ?? 0;
   const failed = status === "FAILED" || status === "VALIDATION_FAILED";
+  const substage = generationSubstage(status);
   return (
-    <ol className="ats-pipeline">
-      {PIPELINE_STEPS.map((step, index) => {
-        const done = !failed && current >= index;
-        const active = !failed && current === index && status !== "COMPLETED";
-        return (
-          <li key={step.key} className={`${done ? "done" : ""} ${active ? "active" : ""} ${failed && index === Math.max(current, 0) ? "failed" : ""}`}>
-            {step.label}
-          </li>
-        );
-      })}
-    </ol>
+    <div className="ats-step5-pipeline">
+      <p className="ats-improvement-note">Generation progress (Step 5){substage ? ` · ${substage.replace(/_/g, " ")}` : ""}</p>
+      <ol className="ats-pipeline">
+        {PIPELINE_STEPS.map((step, index) => {
+          const done = !failed && current >= index;
+          const active = !failed && current === index && status !== "COMPLETED";
+          return (
+            <li key={step.key} className={`${done ? "done" : ""} ${active ? "active" : ""} ${failed && index === Math.max(current, 0) ? "failed" : ""}`}>
+              {step.label}
+            </li>
+          );
+        })}
+      </ol>
+    </div>
   );
 }
 
@@ -372,6 +412,24 @@ function gapItemReason(item) {
     return "Preferred requirement — no supported evidence.";
   }
   return "Mandatory requirement — no supported evidence.";
+}
+
+function withWorkflowRemainingGaps(scoreView, result) {
+  const workflowGaps = result?.remaining_gaps;
+  if (!workflowGaps || (!workflowGaps.unsupported?.length && !workflowGaps.preferred_gaps?.length)) {
+    return scoreView;
+  }
+  return {
+    ...(scoreView || {}),
+    remaining_gaps: {
+      unsupported: workflowGaps.unsupported?.length
+        ? workflowGaps.unsupported
+        : (scoreView?.remaining_gaps?.unsupported || []),
+      preferred_gaps: workflowGaps.preferred_gaps?.length
+        ? workflowGaps.preferred_gaps
+        : (scoreView?.remaining_gaps?.preferred_gaps || []),
+    },
+  };
 }
 
 function gapItemsFromScoreView(scoreView, result) {
@@ -445,11 +503,11 @@ function RemainingGapsPanel({ items }) {
   );
 }
 
-function WizardSteps({ step, maxUnlockedStep, onSelect }) {
+function WizardSteps({ step, maxUnlockedStep, onSelect, lockToStep5 = false }) {
   return (
     <ol className="ats-wizard-steps">
       {WIZARD_STEPS.map((s) => {
-        const unlocked = s.id <= maxUnlockedStep;
+        const unlocked = lockToStep5 ? s.id === 5 : s.id <= maxUnlockedStep;
         const done = s.id < step;
         const active = s.id === step;
         return (
@@ -710,6 +768,8 @@ function SkillConfirmationCard({ skillInfo, draft, onChange, isPreferred, resume
 
 export default function AtsAnalyzerPage() {
   const { jobId: routeJobId } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
   const {
     currentUser,
     jobs,
@@ -734,9 +794,25 @@ export default function AtsAnalyzerPage() {
     busy,
     verifyLatestResume,
     loadPreferences,
+    loadSelectedJobs,
   } = useApp();
 
-  const [step, setStep] = useState(1);
+  const [step, setStep] = useState(() => {
+    const storedJobId = routeJobId
+      || (typeof sessionStorage !== "undefined" ? sessionStorage.getItem("atsSelectedJobId") : null);
+    claimAtsWizardForUser(currentUser?.user_id, storedJobId);
+    return resolveInitialWizardStep(storedJobId, location.state);
+  });
+  const [freshHandoffJobId, setFreshHandoffJobId] = useState(() => (
+    (location.state?.atsEntryMode === ATS_ENTRY_MODE.START_SELECTED_JOB
+      || peekFreshSelectedJobIntent(currentUser?.user_id, routeJobId)) ? String(routeJobId) : null
+  ));
+  const skipHistoricalLookupRef = useRef(Boolean(freshHandoffJobId));
+  const generationEpochRef = useRef(0);
+  const generateInFlightRef = useRef(false);
+  const [generateLocked, setGenerateLocked] = useState(false);
+  const rehydratedJobRef = useRef(null);
+  const latestResumeIdRef = useRef(null);
   const [authoritativeJob, setAuthoritativeJob] = useState(null);
   const [riskAcknowledged, setRiskAcknowledged] = useState(false);
   const [skillDrafts, setSkillDrafts] = useState({});
@@ -749,14 +825,20 @@ export default function AtsAnalyzerPage() {
   const [pendingRemove, setPendingRemove] = useState(null);
 
   useEffect(() => {
-    if (!routeJobId || !currentUser?.user_id) return;
-    setAtsSelectedJobId(String(routeJobId));
-    sessionStorage.setItem("atsSelectedJobId", String(routeJobId));
+    if (!currentUser?.user_id) return;
     verifyLatestResume();
     loadPreferences();
-    getJobDetail(currentUser.user_id, routeJobId)
-      .then(setAuthoritativeJob)
-      .catch(() => setAuthoritativeJob(null));
+    loadSelectedJobs();
+    if (routeJobId) {
+      setAtsSelectedJobId(String(routeJobId));
+      sessionStorage.setItem("atsSelectedJobId", String(routeJobId));
+      getJobDetail(currentUser.user_id, routeJobId)
+        .then(setAuthoritativeJob)
+        .catch(() => setAuthoritativeJob(null));
+      return;
+    }
+    const storedJob = sessionStorage.getItem("atsSelectedJobId");
+    if (storedJob) setAtsSelectedJobId(String(storedJob));
   }, [routeJobId, currentUser?.user_id]);
 
   const analyzableJobs = useMemo(() => {
@@ -791,16 +873,19 @@ export default function AtsAnalyzerPage() {
   }, [jobs, authoritativeJob]);
 
   const selectedJob =
-    analyzableJobs.find((job) => String(job.id) === String(atsSelectedJobId)) ||
+    analyzableJobs.find((job) => String(job.id) === String(routeJobId || atsSelectedJobId)) ||
     (!routeJobId ? analyzableJobs[0] : null) ||
     null;
+  const freshHandoff = Boolean(freshHandoffJobId && String(freshHandoffJobId) === String(routeJobId || selectedJob?.id));
 
   useEffect(() => {
-    if (selectedJob?.id) {
+    if (selectedJob?.id && !freshHandoff && !skipHistoricalLookupRef.current) {
       loadAtsResultForJob(selectedJob.id);
       loadSkillConfirmations(selectedJob.id);
+      loadMissingSkills(selectedJob.id, { forceRefresh: false });
     }
-  }, [selectedJob?.id]);
+    if (selectedJob?.id) sessionStorage.setItem("atsSelectedJobId", String(selectedJob.id));
+  }, [selectedJob?.id, freshHandoff]);
 
   // Reset wizard only on real job switches. Never wipe an in-progress Step 5 from
   // transient selection flicker (authoritative fetch / list refresh).
@@ -816,7 +901,11 @@ export default function AtsAnalyzerPage() {
     }
     if (String(nextId) === String(stepResetForJobId)) return;
     setStepResetForJobId(nextId);
-    setStep(1);
+    generationEpochRef.current += 1;
+    rehydratedJobRef.current = null;
+    clearStoredWizardStep(stepResetForJobId);
+    setStep(freshHandoff ? 2 : 1);
+    writeStoredWizardStep(nextId, freshHandoff ? 2 : 1);
     setConfirmationStage(1);
     setSkillDrafts({});
     setEligibility(null);
@@ -827,7 +916,7 @@ export default function AtsAnalyzerPage() {
     setStepTransitionError("");
     setPendingRemove(null);
     setAtsResult(null);
-  }, [selectedJob?.id, stepResetForJobId, setMissingSkillsGroups, setAtsResult]);
+  }, [selectedJob?.id, stepResetForJobId, freshHandoff, setMissingSkillsGroups, setAtsResult]);
 
   const disabledReason = !latestResume
     ? "Upload a resume before saving and optimizing jobs."
@@ -835,10 +924,19 @@ export default function AtsAnalyzerPage() {
       ? "Select or import one complete job description before running optimize-and-match."
       : "";
 
-  const result = atsResult;
-  const jobInfo = result?.job || selectedJob;
+  // A context result for a different job (e.g. the last job saved from
+  // Selected Jobs) must never drive this job's Step 5 scores, editor, or downloads.
+  const atsResultJobIdValue = atsResultJobId(atsResult);
+  const atsResultForSelectedJob = atsResult
+    && (atsResultJobIdValue == null || !selectedJob?.id || atsResultJobIdValue === String(selectedJob.id))
+    ? atsResult
+    : null;
+  const result = freshHandoff ? null : atsResultForSelectedJob;
+  const jobInfo = selectedJob && result?.job && String(result.job.id ?? result.job.job_id) === String(selectedJob.id)
+    ? { ...selectedJob, ...result.job }
+    : (selectedJob || result?.job);
   const status = result?.workflow_status;
-  const isGenerating = busy === "ats" || (
+  const isGenerating = (!freshHandoff && busy === "ats") || (
     activeAtsWorkflowId
     && result?.workflow_id
     && Number(result.workflow_id) === Number(activeAtsWorkflowId)
@@ -847,13 +945,104 @@ export default function AtsAnalyzerPage() {
   const resultMatchesActiveWorkflow = !activeAtsWorkflowId
     || !result?.workflow_id
     || Number(result.workflow_id) === Number(activeAtsWorkflowId);
-  const displayResult = (isGenerating && previousAtsResult) ? previousAtsResult : result;
+  const previousResultForSelectedJob = previousAtsResult
+    && (atsResultJobId(previousAtsResult) == null || !selectedJob?.id || atsResultJobId(previousAtsResult) === String(selectedJob.id))
+    ? previousAtsResult
+    : null;
+  const displayResult = (isGenerating && previousResultForSelectedJob) ? previousResultForSelectedJob : result;
   const originalScore = displayResult?.original_match_percentage ?? displayResult?.original_match_score ?? displayResult?.original_analysis?.match_percentage;
   const workflowOptimizedScore = displayResult?.optimized_match_percentage ?? displayResult?.optimized_match_score ?? displayResult?.optimized_analysis?.match_percentage;
   const unsupported = displayResult?.unsupported_keywords_not_added || [];
   const generatedPlain = displayResult?.generated_resume?.plain_text || displayResult?.generated_resume_plain || displayResult?.generated_resume;
   const generatedPreview = displayResult?.generated_resume?.formatted_preview || displayResult?.generated_resume_preview_markdown || generatedPlain;
   const canRetry = ["FAILED", "VALIDATION_FAILED"].includes(status);
+
+  useEffect(() => {
+    if (selectedJob?.id) writeStoredWizardStep(selectedJob.id, step);
+  }, [selectedJob?.id, step]);
+
+  useEffect(() => {
+    const jobId = selectedJob?.id;
+    if (!jobId) return;
+    if (freshHandoff) {
+      if (rehydratedJobRef.current !== jobId) {
+        rehydratedJobRef.current = jobId;
+        setStep(readStoredWizardStep(jobId) || WIZARD_STEP.ANALYZE_REQUIREMENTS);
+      }
+      if (location.state?.atsEntryMode === ATS_ENTRY_MODE.START_SELECTED_JOB) {
+        navigate(location.pathname, { replace: true, state: stripAtsEntryMode(location.state) });
+      }
+      return;
+    }
+    const generatingNow = Boolean(
+      isGenerating
+      || (
+        isStep5WorkflowStatus(status, { generating: isGenerating })
+        && ["ANALYZING_ORIGINAL", "GENERATING_RESUME", "VALIDATING_RESUME", "ANALYZING_OPTIMIZED", "PENDING"].includes(String(status || "").toUpperCase())
+      ),
+    );
+    if (generatingNow) {
+      setStep((current) => nextMonotonicStep(current, 5));
+      return;
+    }
+
+    // Selected Jobs "Optimize and Compare Scores" must open Step 1 even when a
+    // completed Step-5 workflow already exists. Consume the one-time intent so
+    // a later refresh restores the persisted step instead of forcing Step 1.
+    const startOptimization = peekStartOptimizationIntent(jobId, location.state);
+    if (startOptimization) {
+      consumeStartOptimizationIntent(jobId);
+      writeGuidedRestart(jobId);
+      setStep(WIZARD_STEP.SELECT_JOB);
+      writeStoredWizardStep(jobId, WIZARD_STEP.SELECT_JOB);
+      rehydratedJobRef.current = jobId;
+      if (location.state?.atsEntryMode === ATS_ENTRY_MODE.START_OPTIMIZATION) {
+        navigate(location.pathname, {
+          replace: true,
+          state: stripAtsEntryMode(location.state),
+        });
+      }
+      return;
+    }
+
+    // Guided restart (after intent is consumed): keep the persisted step.
+    // Do not jump to Step 5 merely because an older completed result exists.
+    if (peekGuidedRestart(jobId)) {
+      if (rehydratedJobRef.current === jobId) return;
+      rehydratedJobRef.current = jobId;
+      setStep(readStoredWizardStep(jobId) || WIZARD_STEP.SELECT_JOB);
+      return;
+    }
+
+    if (rehydratedJobRef.current === jobId) return;
+    rehydratedJobRef.current = jobId;
+    const stored = readStoredWizardStep(jobId) || 1;
+    const completed = status === "COMPLETED" && Boolean(result?.optimized_resume_id || generatedPlain);
+    const failedOnStep5 = ["FAILED", "VALIDATION_FAILED"].includes(String(status || "")) && stored >= 5;
+    const derived = majorStepFromWorkflow(status, {
+      generating: generatingNow,
+      hasGeneratedResume: completed,
+    });
+    const incoming = completed || failedOnStep5 ? 5 : (derived && stored >= 5 ? derived : stored);
+    setStep(nextMonotonicStep(stored, incoming));
+  }, [selectedJob?.id, status, isGenerating, result?.optimized_resume_id, generatedPlain, location.state, location.pathname, navigate, freshHandoff]);
+
+  useEffect(() => {
+    const nextId = latestResume?.id ?? latestResume?.resume_id ?? null;
+    const prev = latestResumeIdRef.current;
+    latestResumeIdRef.current = nextId;
+    if (prev == null || nextId == null || String(prev) === String(nextId) || !selectedJob?.id) return;
+    generationEpochRef.current += 1;
+    setStep(2);
+    writeStoredWizardStep(selectedJob.id, 2);
+    setMissingSkillsGroups(null);
+    setEligibility(null);
+    setEditableResume(null);
+    setEditResult(null);
+    setWorkspaceDocument(null);
+    setAtsResult(null);
+    setStepTransitionError("");
+  }, [latestResume?.id, latestResume?.resume_id, selectedJob?.id, setMissingSkillsGroups, setAtsResult]);
   const isComplete = status === "COMPLETED" && resultMatchesActiveWorkflow && !isGenerating;
   const currentEditorScore = editResult?.edited_score ?? editableResume?.edited_score ?? (isComplete ? workflowOptimizedScore : null);
   const liveScoreView = editResult?.score || editableResume?.score || null;
@@ -884,21 +1073,18 @@ export default function AtsAnalyzerPage() {
   const llmGenerationSucceeded = Boolean(
     generationMetadata.llm_used || generationMetadata.generation_method === "llm"
   );
+  const correctionApplied = Boolean(generationMetadata.truthfulness_correction_applied);
   const generationLabel = isGenerating
     ? "Generating with AI…"
-    : workflowStatusForLabel === "VALIDATION_FAILED" && llmGenerationSucceeded
-      ? "AI generation completed, but final resume validation failed."
+    : workflowStatusForLabel === "VALIDATION_FAILED"
+      ? "AI draft could not pass validation."
+      : workflowStatusForLabel === "COMPLETED" && generationMetadata.fallback_reason === "timeout"
+      ? "Optimized locally · AI generation took too long"
+      : workflowStatusForLabel === "COMPLETED" && (correctionApplied || generationMetadata.fallback_used)
+      ? "Safely adjusted using verified resume evidence"
       : workflowStatusForLabel === "COMPLETED" && llmGenerationSucceeded && validationPassedForLabel
       ? `AI Optimized · ${generationMetadata.llm_model || generationMetadata.generation_model || "LLM"}`
-      : generationMetadata.fallback_used
-        ? generationMetadata.fallback_reason === "timeout"
-          ? "Optimized locally · AI generation took too long"
-          : "Optimized locally · AI response could not be safely applied"
-        : generationMetadata.generation_method === "deterministic_fallback"
-          ? "Optimized locally · AI response could not be safely applied"
-          : workflowStatusForLabel === "COMPLETED" && generationMetadata.generation_method === "deterministic_fallback"
-            ? "Optimized locally · AI response could not be safely applied"
-            : null;
+      : null;
   const fallbackReason = null;
 
   const verifiedSkills = missingSkillsGroups?.verified_resume_skills || [];
@@ -971,21 +1157,21 @@ export default function AtsAnalyzerPage() {
     || result?.optimized_analysis?.score_view
     || null;
   const authoritativeRemainingGaps = useMemo(() => {
-    if (isComplete && (optimizedScoreView || result?.optimized_analysis)) {
+    if (isComplete && (optimizedScoreView || result?.optimized_analysis || result?.remaining_gaps)) {
       const analysis = result?.optimized_analysis;
-      const view = optimizedScoreView || (analysis ? {
+      const view = withWorkflowRemainingGaps(optimizedScoreView, result) || (analysis ? {
         mandatory_requirements: analysis.mandatory_requirements || {
           covered: Math.max(0, (analysis.mandatory_unit_count || (analysis.required_skills || []).length)
             - (analysis.missing_mandatory_skills || []).length),
           total: analysis.mandatory_unit_count || (analysis.required_skills || []).length,
           missing: analysis.missing_mandatory_skills || [],
         },
-        remaining_gaps: analysis.remaining_gaps || {
+        remaining_gaps: analysis.remaining_gaps || result?.remaining_gaps || {
           unsupported: analysis.missing_mandatory_skills || [],
           preferred_gaps: analysis.missing_preferred_skills || [],
         },
         missing_mandatory_skills: analysis.missing_mandatory_skills || [],
-      } : null);
+      } : { remaining_gaps: result?.remaining_gaps });
       return gapItemsFromScoreView(view, result);
     }
     return currentUnresolvedRequired;
@@ -995,6 +1181,19 @@ export default function AtsAnalyzerPage() {
   const analysisFailed = missingSkillsGroups?.analysis_status === "REQUIREMENT_EXTRACTION_FAILED"
     || missingSkillsGroups?.analysis_status === "ANALYSIS_CONSISTENCY_FAILED";
   const canContinueToOptimization = Boolean(missingSkillsGroups && !analysisFailed);
+  // Canonical backend eligibility (score threshold + role alignment). Only the
+  // check for THIS job counts; generation stays unavailable when it says no.
+  const selectedJobEligibility = eligibility
+    && (eligibility.job_id == null || !selectedJob?.id || String(eligibility.job_id) === String(selectedJob.id))
+    ? eligibility
+    : null;
+  const generationIneligible = selectedJobEligibility?.optimization_allowed === false;
+  const ineligibleMessage = generationIneligible
+    ? [
+      INELIGIBLE_GENERATION_MESSAGE,
+      selectedJobEligibility.eligibility_reason || selectedJobEligibility.reason || "",
+    ].filter(Boolean).join(" ")
+    : "";
   const generationWarningMessage = missingSkillsGroups?.generation_warning_message
     || (currentUnresolvedRequired.length
       ? `${currentUnresolvedRequired.map((item) => item.skill).filter(Boolean).join(", ")} ${
@@ -1112,7 +1311,11 @@ export default function AtsAnalyzerPage() {
   };
 
   const maxUnlockedStep = useMemo(() => {
-    if (isComplete || ["VALIDATING_RESUME", "VALIDATION_FAILED", "ANALYZING_OPTIMIZED", "GENERATING_RESUME"].includes(status)) {
+    if (
+      isGenerating
+      || isComplete
+      || STEP5_WORKFLOW_STATUSES.has(String(status || "").toUpperCase())
+    ) {
       return 5;
     }
     if (canContinueToOptimization) return 5;
@@ -1121,7 +1324,7 @@ export default function AtsAnalyzerPage() {
     if (missingSkillsGroups) return 4;
     if (selectedJob) return 2;
     return 1;
-  }, [selectedJob, missingSkillsGroups, canContinueToOptimization, status, isComplete]);
+  }, [selectedJob, missingSkillsGroups, canContinueToOptimization, status, isComplete, isGenerating]);
 
   useEffect(() => {
     if (!isComplete || !result?.optimized_resume_id || !selectedJob?.id || !currentUser?.user_id) return;
@@ -1143,8 +1346,24 @@ export default function AtsAnalyzerPage() {
       .catch(() => null);
   }, [isComplete, result?.optimized_resume_id, selectedJob?.id, currentUser?.user_id]);
 
+  // Restored Step 5 (reload / deep link) has no cached eligibility: load the
+  // canonical check so Generate is gated before the user clicks it.
+  useEffect(() => {
+    if (step !== WIZARD_STEP.GENERATE || isComplete || isGenerating) return;
+    if (!selectedJob?.id || !currentUser?.user_id || selectedJobEligibility) return;
+    let cancelled = false;
+    Promise.resolve(getOptimizationEligibility(currentUser.user_id, selectedJob.id))
+      .then((check) => { if (!cancelled && check) setEligibility(check); })
+      .catch(() => null);
+    return () => { cancelled = true; };
+  }, [step, isComplete, isGenerating, selectedJob?.id, currentUser?.user_id, Boolean(selectedJobEligibility)]);
+
   const analyzeRequirementsAndEligibility = async () => {
+    const epoch = generationEpochRef.current;
+    if (stepRef.current >= 5 || isGenerating) return;
     const groups = await loadMissingSkills(selectedJob.id);
+    if (epoch !== generationEpochRef.current) return;
+    if (stepRef.current >= 5 || isGenerating) return;
     if (!groups) return;
     if (groups.analysis_status === "REQUIREMENT_EXTRACTION_FAILED" || groups.analysis_status === "ANALYSIS_CONSISTENCY_FAILED") {
       setEligibility({
@@ -1159,20 +1378,26 @@ export default function AtsAnalyzerPage() {
       return;
     }
     const check = await getOptimizationEligibility(currentUser.user_id, selectedJob.id);
+    if (epoch !== generationEpochRef.current || stepRef.current >= 5 || isGenerating) return;
     setEligibility(check);
     if (check?.analysis_status === "REQUIREMENT_EXTRACTION_FAILED") {
       return;
     }
     // Drop stale FAILED / INELIGIBLE workflow banners when CURRENT analysis succeeds.
     setAtsResult((current) => {
-      if (!current) return current;
+      if (!current || stepRef.current >= 5) return current;
       const status = String(current.workflow_status || "");
       const stale = status.startsWith("INELIGIBLE")
         || status === "FAILED"
         || status === "VALIDATION_FAILED";
       return stale ? null : current;
     });
-    setStep(3);
+    setStep((current) => applyStaleWizardStep({
+      currentStep: current,
+      incomingStep: 3,
+      incomingGeneration: epoch,
+      activeGeneration: generationEpochRef.current,
+    }));
   };
 
   const enterOptimizationStep = (event) => {
@@ -1217,7 +1442,11 @@ export default function AtsAnalyzerPage() {
   };
 
   const runGenerateOptimizedResume = async () => {
-    if (busy === "ats" || busy === "ats-skills") return;
+    if (stepRef.current !== WIZARD_STEP.GENERATE) {
+      setStepTransitionError("Generate Optimized Resume is available on Step 5.");
+      return;
+    }
+    if (generateInFlightRef.current || busy === "ats" || busy === "ats-skills") return;
     if (!selectedJob?.id) {
       setStepTransitionError("Could not generate: no job is selected.");
       return;
@@ -1230,11 +1459,31 @@ export default function AtsAnalyzerPage() {
       );
       return;
     }
+    if (generationIneligible) {
+      setStepTransitionError(ineligibleMessage);
+      return;
+    }
+    generateInFlightRef.current = true;
+    setGenerateLocked(true);
+    generationEpochRef.current += 1;
+    setStep(5);
     setStepTransitionError("");
     // Synchronously occupy the ATS busy channel so rapid double-clicks cannot
     // start a second generate before React re-renders.
-    if (busy) return;
+    if (busy && busy !== "ats") {
+      generateInFlightRef.current = false;
+      setGenerateLocked(false);
+      return;
+    }
     try {
+      const check = await getOptimizationEligibility(currentUser.user_id, selectedJob.id).catch(() => null);
+      if (check) setEligibility(check);
+      if (check?.optimization_allowed === false) {
+        setStepTransitionError(
+          [INELIGIBLE_GENERATION_MESSAGE, check.eligibility_reason || check.reason || ""].filter(Boolean).join(" "),
+        );
+        return;
+      }
       const readiness = await loadSkillConfirmations(selectedJob.id);
       if (busy === "ats") return;
       const systemBlockers = (readiness?.blocking_reasons || []).filter(
@@ -1248,28 +1497,36 @@ export default function AtsAnalyzerPage() {
         );
         return;
       }
+      clearFreshSelectedJobIntent(currentUser.user_id, selectedJob.id);
+      setFreshHandoffJobId(null);
+      const generated = await analyzeAndOptimize(selectedJob.id, true);
+      if (generated?.workflow_status === "COMPLETED" && generated?.optimized_resume_id) {
+        setStep(5);
+        setStepTransitionError("");
+      } else if (generated && generated.workflow_status && generated.workflow_status !== "COMPLETED") {
+        const err = String(generated.error_message || "");
+        setStep(5);
+        // Stale evidence-incomplete failures must not look like hard errors after this product change.
+        if (/evidence incomplete/i.test(err)) {
+          setStepTransitionError("");
+        } else {
+          const introduced = err.match(/^Unsupported (.+) introduced: (.+)$/i);
+          setStepTransitionError(
+            introduced
+              ? `Unsupported ${introduced[1]}: ${introduced[2]}`
+              : (generated.error_message
+                || `Could not generate: workflow status ${generated.workflow_status}.`),
+          );
+        }
+      }
     } catch (error) {
       console.error("Generate readiness check failed:", error);
       setStepTransitionError(
         `Could not generate: ${error?.message || "evidence readiness check failed."}`,
       );
-      return;
-    }
-    const generated = await analyzeAndOptimize(selectedJob.id, true);
-    if (generated?.workflow_status === "COMPLETED" && generated?.optimized_resume_id) {
-      setStep(5);
-      setStepTransitionError("");
-    } else if (generated && generated.workflow_status && generated.workflow_status !== "COMPLETED") {
-      const err = String(generated.error_message || "");
-      // Stale evidence-incomplete failures must not look like hard errors after this product change.
-      if (/evidence incomplete/i.test(err)) {
-        setStepTransitionError("");
-      } else {
-        setStepTransitionError(
-          generated.error_message
-          || `Could not generate: workflow status ${generated.workflow_status}.`,
-        );
-      }
+    } finally {
+      generateInFlightRef.current = false;
+      setGenerateLocked(false);
     }
   };
 
@@ -1329,6 +1586,7 @@ export default function AtsAnalyzerPage() {
     missingSkillsGroups,
     canContinueToOptimization,
     isComplete,
+    isGenerating,
     result,
     disabledReason,
     originalScore,
@@ -1350,7 +1608,11 @@ export default function AtsAnalyzerPage() {
           <button
             className="button secondary"
             disabled={busy === "ats"}
-            onClick={() => retryAtsWorkflow(result.workflow_id)}
+            onClick={() => {
+              generationEpochRef.current += 1;
+              setStep(5);
+              retryAtsWorkflow(result.workflow_id);
+            }}
           >
             Retry
           </button>
@@ -1361,7 +1623,15 @@ export default function AtsAnalyzerPage() {
         {statusBanner.text}
       </Notice>
 
-      <WizardSteps step={step} maxUnlockedStep={maxUnlockedStep} onSelect={setStep} />
+      <WizardSteps
+        step={step}
+        maxUnlockedStep={maxUnlockedStep}
+        lockToStep5={isGenerating}
+        onSelect={(next) => {
+          if (isGenerating && next < 5) return;
+          setStep(next);
+        }}
+      />
 
       {step === 1 && (
         <Panel title="Step 1 · Select Job">
@@ -1370,7 +1640,11 @@ export default function AtsAnalyzerPage() {
               Select job
               <select
                 value={selectedJob ? String(selectedJob.id) : ""}
-                onChange={(e) => setAtsSelectedJobId(e.target.value)}
+                onChange={(e) => {
+                  const value = e.target.value;
+                  setAtsSelectedJobId(value);
+                  if (value) sessionStorage.setItem("atsSelectedJobId", value);
+                }}
               >
                 {!analyzableJobs.length && <option value="">No analyzable jobs</option>}
                 {analyzableJobs.map((job) => (
@@ -1811,11 +2085,13 @@ export default function AtsAnalyzerPage() {
                 <button
                   type="button"
                   className="button primary"
-                  disabled={Boolean(disabledReason) || busy === "ats" || busy === "ats-skills" || !canContinueToOptimization}
+                  disabled={Boolean(disabledReason) || busy === "ats" || busy === "ats-skills" || generateLocked || !canContinueToOptimization || generationIneligible}
                   title={
-                    !canContinueToOptimization
-                      ? (disabledReason || "Analyze a job with a valid resume first.")
-                      : ""
+                    generationIneligible
+                      ? ineligibleMessage
+                      : !canContinueToOptimization
+                        ? (disabledReason || "Analyze a job with a valid resume first.")
+                        : ""
                   }
                   onClick={runGenerateOptimizedResume}
                 >
@@ -1825,8 +2101,25 @@ export default function AtsAnalyzerPage() {
             )}
           </header>
 
-          {stepTransitionError && (
-            <p className="ats-required-warning" role="alert">{stepTransitionError}</p>
+          {(() => {
+            const detail = formatUnsupportedClaim(stepTransitionError)
+              || (status === "VALIDATION_FAILED" ? formatUnsupportedClaim(result?.error_message) : "")
+              || (status === "VALIDATION_FAILED" ? "" : stepTransitionError);
+            if (!detail || detail === statusBanner.text) return null;
+            return <p className="ats-required-warning" role="alert">{detail}</p>;
+          })()}
+          {generationIneligible && !isComplete && !isGenerating && ineligibleMessage !== stepTransitionError && (
+            <section
+              className={selectedJobEligibility.role_alignment === "MISMATCH" ? "ats-major-warning" : "ats-threshold-warning"}
+              role="alert"
+              data-testid="ats-generation-ineligible"
+            >
+              <h3>Optimized resume generation is unavailable</h3>
+              <p>{ineligibleMessage}</p>
+              {selectedJobEligibility.original_score != null && (
+                <p>Current Resume Match: <b>{selectedJobEligibility.original_score}%</b> · Role alignment: <b>{selectedJobEligibility.role_alignment || selectedJobEligibility.eligibility_tier || "—"}</b></p>
+              )}
+            </section>
           )}
           {isGenerating && (
             <p className="ats-generation-indicator">Generating with AI…</p>
@@ -1839,12 +2132,12 @@ export default function AtsAnalyzerPage() {
                 : ""}
             </p>
           )}
-          {canContinueToOptimization && (
+          {(canContinueToOptimization || isComplete) && (
             <RemainingGapsPanel
               items={isComplete ? authoritativeRemainingGaps : currentUnresolvedRequired}
             />
           )}
-          {!canContinueToOptimization && (
+          {!canContinueToOptimization && !isComplete && (
             <p className="ats-required-warning">
               {disabledReason || "Upload a resume and analyze a job before generating."}
             </p>
@@ -1890,16 +2183,17 @@ export default function AtsAnalyzerPage() {
                   initialText={editableResume?.final_text || generatedPlain || generatedPreview || ""}
                   originalScore={originalScore}
                   initialCurrentScore={currentEditorScore}
-                  initialScore={liveScoreView || optimizedScoreView || null}
+                  initialScore={withWorkflowRemainingGaps(liveScoreView || optimizedScoreView, result) || null}
                   improvementReport={improvementReport}
                   resultMeta={{
                     content_changed: contentChanged,
                     confirmed_skills_used: confirmedSkillsUsed,
                     unsupported_keywords_not_added: unsupported,
                   }}
-                  gapsUnsupported={gapItemsFromScoreView(liveScoreView || optimizedScoreView, result).map((item) => item.skill)}
+                  gapsUnsupported={gapItemsFromScoreView(withWorkflowRemainingGaps(liveScoreView || optimizedScoreView, result), result).map((item) => item.skill)}
                   gapsPreferred={
-                    (optimizedScoreView?.remaining_gaps?.preferred_gaps
+                    (result?.remaining_gaps?.preferred_gaps
+                      || optimizedScoreView?.remaining_gaps?.preferred_gaps
                       || optimizedScoreView?.preferred_requirements?.missing
                       || result?.optimized_analysis?.missing_preferred_skills
                       || [])

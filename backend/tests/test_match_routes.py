@@ -65,3 +65,63 @@ def test_generic_search_jobs_never_produce_a_match_score(client, test_user, test
     job_ids = {m["job_id"] for m in response.json()["matches"]}
     assert generic_search_job.id not in job_ids
     assert java_job.id in job_ids
+
+
+def test_get_matches_uses_latest_original_not_historical_high(client, test_user, test_resume, java_job, db_session):
+    """Dashboard Best Match must not pick a stale 100% from an older resume."""
+    from app.models.match_model import MatchScore
+    from app.models.resume_model import Resume
+
+    stale_resume = Resume(
+        user_id=test_user.id,
+        original_file_name="stale.txt",
+        stored_file_path="/tmp/stale.txt",
+        file_type="txt",
+        parsed_text="stale resume",
+    )
+    db_session.add(stale_resume)
+    db_session.commit()
+    db_session.refresh(stale_resume)
+
+    db_session.add(MatchScore(
+        user_id=test_user.id, resume_id=stale_resume.id, job_id=java_job.id,
+        match_percentage=100, resume_version="original",
+    ))
+    db_session.add(MatchScore(
+        user_id=test_user.id, resume_id=test_resume.id, job_id=java_job.id,
+        match_percentage=35, resume_version="original",
+    ))
+    db_session.commit()
+
+    body = client.get(f"/api/match/{test_user.id}").json()
+    assert len(body) == 1
+    assert body[0]["job_id"] == java_job.id
+    assert body[0]["match_percentage"] == 35
+    assert body[0]["resume_id"] == test_resume.id
+    assert body[0]["resume_version"] == "original"
+
+    selected = client.get(f"/api/jobs/selected/{test_user.id}").json()
+    assert selected[0]["original_match_percentage"] == 35
+
+
+def test_get_matches_excludes_optimized_ats_score(client, test_user, test_resume, java_job, db_session):
+    from app.models.match_model import MatchScore
+
+    db_session.add(MatchScore(
+        user_id=test_user.id, resume_id=test_resume.id, job_id=java_job.id,
+        match_percentage=73, resume_version="original",
+    ))
+    db_session.add(MatchScore(
+        user_id=test_user.id, resume_id=test_resume.id, job_id=java_job.id,
+        match_percentage=75, resume_version="optimized",
+    ))
+    db_session.commit()
+
+    body = client.get(f"/api/match/{test_user.id}").json()
+    assert len(body) == 1
+    assert body[0]["match_percentage"] == 73
+    assert body[0]["resume_version"] == "original"
+
+    selected = client.get(f"/api/jobs/selected/{test_user.id}").json()
+    assert selected[0]["original_match_percentage"] == 73
+    assert selected[0]["optimized_match_percentage"] == 75

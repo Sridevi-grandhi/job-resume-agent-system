@@ -18,6 +18,7 @@ NORMALIZED_JOB_FIELDS = (
     "company", "company_logo_url", "title", "location", "work_mode", "job_type",
     "description", "requirements", "skills",
     "posted_at", "direct_url", "source_url", "application_url",
+    "unverified_application_url", "candidate_application_type",
 )
 
 
@@ -58,6 +59,9 @@ def build_normalized_job(
     direct_url: str | None = None,
     source_url: str | None = None,
     application_url: str | None = None,
+    unverified_application_url: str | None = None,
+    candidate_application_type: str | None = None,
+    career_page_url: str | None = None,
 ) -> dict[str, Any] | None:
     title = _clean(title)
     company = _clean(company)
@@ -76,7 +80,7 @@ def build_normalized_job(
         "title": title,
         "location": _clean(location) or "Not specified",
         "work_mode": _clean(work_mode) or "Not specified",
-        "job_type": _clean(job_type) or "Full-time",
+        "job_type": _clean(job_type) or "Not specified",
         "description": description,
         "requirements": _clean(requirements),
         "skills": _clean(skills),
@@ -84,6 +88,9 @@ def build_normalized_job(
         "direct_url": _clean(direct_url) or None,
         "source_url": _clean(source_url) or None,
         "application_url": _clean(application_url) or _clean(direct_url) or None,
+        "unverified_application_url": _clean(unverified_application_url) or None,
+        "candidate_application_type": _clean(candidate_application_type) or None,
+        "career_page_url": _clean(career_page_url) or None,
     }
 
 
@@ -139,6 +146,7 @@ _ATS_HOSTED_DOMAINS = {
     "icims.com", "taleo.net", "smartrecruiters.com", "ashbyhq.com",
     "workable.com", "bamboohr.com", "jobvite.com", "successfactors.com",
     "brassring.com", "recruiting.paylocity.com",
+    "selectminds.com", "oraclecloud.com",
 }
 
 
@@ -177,7 +185,7 @@ _AGGREGATOR_DOMAINS = {
     "lensa.com", "trabajo.org", "glassdoor.com", "monster.com", "careerbuilder.com",
     "simplyhired.com", "careerjet.com", "jobrapido.com", "adzuna.com", "jora.com",
     "talent.com", "snagajob.com", "flexjobs.com", "weworkremotely.com",
-    "jobg8.com", "appcast.io", "neuvoo.com",
+    "jobg8.com", "appcast.io", "neuvoo.com", "google.com", "remotive.com",
 }
 
 # Remainder text allowed after a matched employer-name/domain prefix for the
@@ -195,6 +203,19 @@ _LEGAL_SUFFIX_WORDS = {
     "ltd", "limited", "llp", "plc", "group", "holdings",
 }
 _NAME_STOPWORDS = {"the", "and", "of", "for"}
+
+# Explicit, reviewed employer-domain relationships that cannot be inferred
+# safely from a company name alone.  The key is the canonical company token
+# string produced by _employer_name_tokens and each value is a registrable
+# domain owned by that employer or its recruiting brand.  Keep this registry
+# deliberately small: an entry is positive identity evidence, not a fuzzy
+# matching hint.  In particular, unknown recruiter, redirect, and *.app
+# domains must never become employer domains merely because a provider labels
+# them as an apply URL.
+#
+# There are intentionally no production entries until a relationship can be
+# supported by durable, reviewable employer evidence.
+_VERIFIED_EMPLOYER_DOMAIN_ALIASES: dict[str, frozenset[str]] = {}
 
 
 def _domain_label(registrable_domain: str) -> str:
@@ -229,6 +250,31 @@ def _employer_website_matches(candidate_registrable: str, employer_registrable: 
 def _employer_name_tokens(name: str | None) -> list[str]:
     words = re.findall(r"[a-z0-9]+", (name or "").lower())
     return [word for word in words if word not in _LEGAL_SUFFIX_WORDS and word not in _NAME_STOPWORDS]
+
+
+def _canonical_employer_alias_key(name: str | None) -> str:
+    """Stable key for the reviewed alias registry.
+
+    Legal suffixes and punctuation are normalized, but this deliberately
+    performs no brand/family guessing.  A different brand can match only when
+    its exact registrable domain appears in _VERIFIED_EMPLOYER_DOMAIN_ALIASES.
+    """
+    return "".join(_employer_name_tokens(name))
+
+
+def verified_employer_domain_alias(url: str | None, employer_name: str | None) -> str | None:
+    """Returns the reviewed employer-domain alias used for ``url``, if any.
+
+    Returning the domain (rather than a boolean) lets verification diagnostics
+    state that an explicit alias was used without persisting the raw URL.
+    Known aggregators and ATS hosts are excluded first; their independent
+    classification rules must remain authoritative.
+    """
+    candidate = _registrable_domain(url)
+    if not candidate or candidate in _AGGREGATOR_DOMAINS or _is_ats_hosted_url(url):
+        return None
+    aliases = _VERIFIED_EMPLOYER_DOMAIN_ALIASES.get(_canonical_employer_alias_key(employer_name))
+    return candidate if aliases and candidate in aliases else None
 
 
 def _employer_name_matches_domain(candidate_registrable: str, employer_name: str | None) -> bool:
@@ -290,6 +336,8 @@ def classify_url_domain(
         return "ats"
     employer_domain = _registrable_domain(employer_website) if employer_website else ""
     if employer_domain and _employer_website_matches(candidate, employer_domain):
+        return "employer"
+    if verified_employer_domain_alias(url, employer_name):
         return "employer"
     if employer_name and _employer_name_matches_domain(candidate, employer_name):
         return "employer"
@@ -464,6 +512,152 @@ def classify_url_specificity(url: str | None) -> str:
     return "UNKNOWN"
 
 
+def _url_host(url: str | None) -> str:
+    if not url:
+        return ""
+    try:
+        from urllib.parse import urlsplit
+
+        return (urlsplit(str(url).strip()).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
+
+
+def _is_https(url: str | None) -> bool:
+    try:
+        from urllib.parse import urlsplit
+
+        return urlsplit(str(url or "").strip()).scheme.lower() == "https"
+    except ValueError:
+        return False
+
+
+def _is_known_provider_host(url: str | None) -> bool:
+    """Job-board and discovery-provider hosts. An exact posting on one of
+    these can be an application fallback. An unrecognized domain cannot."""
+    host = _url_host(url)
+    if not host:
+        return False
+    registrable = _registrable_domain(url) if url else ""
+    return host in _AGGREGATOR_DOMAINS or registrable in _AGGREGATOR_DOMAINS
+
+
+def _is_email_destination(url: str | None, application_type: str | None = None) -> bool:
+    if (application_type or "").strip().upper() == "APPLY_TO_EMAIL":
+        return True
+    return str(url or "").strip().lower().startswith("mailto:")
+
+
+def destination_quality(url: str | None) -> int:
+    """Higher is a better user destination. Used when merging duplicates so
+    a later generic listing cannot replace an exact provider or employer URL."""
+    if not url or not is_safe_application_url(url) or _is_email_destination(url):
+        return 0
+    specificity = classify_url_specificity(url)
+    domain = classify_url_domain(url)
+    if domain in {"employer", "ats"} and specificity == "SPECIFIC_JOB":
+        return 50
+    if domain in {"employer", "ats"}:
+        return 30
+    if _is_known_provider_host(url) and specificity == "SPECIFIC_JOB" and _is_https(url):
+        return 40
+    if _is_known_provider_host(url):
+        return 10
+    return 5
+
+
+def incoming_destination_wins(incoming: str | None, existing: str | None) -> bool:
+    """A duplicate may replace a stored URL only when it is at least as
+    specific and safe. A later generic listing never downgrades an exact
+    provider or employer destination. An equally specific new URL is kept
+    so verification can still run."""
+    if not incoming or incoming == existing:
+        return False
+    incoming_quality = destination_quality(incoming)
+    if incoming_quality <= 0:
+        return False
+    return incoming_quality >= destination_quality(existing)
+
+
+def _redirect_left_provider(job: Any) -> bool:
+    """True when a provider candidate was followed and the final hop was an
+    unsafe target or a non-provider host that failed identity checks.
+    Staying on the provider's own exact listing is not a failure."""
+    import json
+
+    get = job.get if isinstance(job, dict) else (lambda key: getattr(job, key, None))
+    raw = get("enrichment_diagnostics")
+    if not raw:
+        return False
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    candidates = payload.get("candidates") if isinstance(payload, dict) else None
+    if not isinstance(candidates, list):
+        return False
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        reason = str(item.get("reason") or "")
+        if not reason.startswith("final_"):
+            continue
+        if "unsafe" in reason:
+            return True
+        domain = str(item.get("domain") or "")
+        if domain and not _is_known_provider_host(f"https://{domain}/"):
+            return True
+    return False
+
+
+def _provider_exact_job_url(job: Any) -> str | None:
+    """Best safe, job-specific provider/aggregator URL already stored on
+    this record. Employer domains are intentionally excluded — those stay
+    on the strict verified-direct path."""
+    get = job.get if isinstance(job, dict) else (lambda key: getattr(job, key, None))
+    email_only = _is_email_destination(None, get("candidate_application_type"))
+    blocked_unverified = _redirect_left_provider(job) or email_only
+    fields = ("unverified_application_url", "source_url", "application_url", "direct_url")
+    best: tuple[int, str] | None = None
+    for field in fields:
+        if field == "unverified_application_url" and blocked_unverified:
+            continue
+        url = get(field)
+        if _is_email_destination(url):
+            continue
+        if not url or not _is_https(url) or not is_safe_application_url(url):
+            continue
+        if not _is_known_provider_host(url):
+            continue
+        if classify_url_specificity(url) != "SPECIFIC_JOB":
+            continue
+        quality = destination_quality(url)
+        if best is None or quality > best[0]:
+            best = (quality, url)
+    return best[1] if best else None
+
+
+def _provider_apply_action(job: Any, url: str, availability_status: str) -> dict[str, Any]:
+    from app.services.provider_apply_resolver import provider_fallback_label
+
+    get = job.get if isinstance(job, dict) else (lambda key: getattr(job, key, None))
+    source = str(get("source") or "").strip().lower() or "provider"
+    label = provider_fallback_label(job, url)
+    return {
+        "url": url,
+        "type": "PROVIDER_JOB_APPLY",
+        "is_direct": False,
+        "availability_status": availability_status,
+        "destination_specificity": "SPECIFIC_JOB",
+        "action_label": label,
+        "can_apply": True,
+        "secondary_action": None,
+        "destination_tier": "PROVIDER_JOB_APPLY",
+        "destination_reason": "provider_job_apply",
+        "destination_source": source,
+    }
+
+
 def resolve_application_destination(job: Any) -> dict[str, Any]:
     """The ONE authoritative Apply-destination resolver. Priority order:
     application_url (explicit apply link) -> direct_url (canonical original
@@ -486,13 +680,34 @@ def resolve_application_destination(job: Any) -> dict[str, Any]:
     source = str(get("source") or "").strip().lower()
     source_is_ats = source in _ATS_HOSTED_SOURCES
 
+    listing_candidate = None
     for field in ("application_url", "direct_url"):
         candidate = get(field)
         if candidate and is_safe_application_url(candidate):
+            if classify_url_domain(candidate) == "aggregator":
+                listing_candidate = candidate
+                continue
             tier_type = "DIRECT_ATS" if (source_is_ats or _is_ats_hosted_url(candidate)) else "DIRECT_EMPLOYER"
             return {"url": candidate, "type": tier_type, "is_direct": True}
 
-    source_url = get("source_url")
+    from app.services.employer_career_service import official_career_url
+    from app.services.provider_apply_resolver import is_safe_employer_or_ats_destination
+
+    unverified = get("unverified_application_url")
+    identity = is_safe_employer_or_ats_destination(unverified, job)
+    if identity and classify_url_specificity(unverified) != "GENERIC_EMPLOYER_PAGE":
+        return {
+            "url": unverified,
+            "type": "DIRECT_ATS" if identity == "ats" else "DIRECT_EMPLOYER",
+            "is_direct": True,
+        }
+
+    career = official_career_url(job)
+    if career:
+        career_type = "DIRECT_ATS" if _is_ats_hosted_url(career) else "DIRECT_EMPLOYER"
+        return {"url": career, "type": career_type, "is_direct": True}
+
+    source_url = get("source_url") or listing_candidate
     if source_url and is_safe_application_url(source_url):
         return {"url": source_url, "type": "AGGREGATOR_LISTING", "is_direct": False}
     return {"url": None, "type": None, "is_direct": False}
@@ -532,7 +747,7 @@ def resolve_apply_action(job: Any) -> dict[str, Any]:
       - can_apply: True ONLY for a verified SPECIFIC_JOB + ACTIVE destination
         (or an aggregator listing, which was never claiming "Apply" in the
         first place — View Listing is still a legitimate navigable action).
-      - secondary_action: {"label": "View Source Listing", "url": ...} | None
+      - secondary_action: {"label": "View Source", "url": ...} | None
         — for a DIRECT_EMPLOYER/DIRECT_ATS job, source_url is where this
         posting was ORIGINALLY discovered (often an aggregator). If the
         employer/ATS destination itself is blocked for the user (a 403,
@@ -546,25 +761,48 @@ def resolve_apply_action(job: Any) -> dict[str, Any]:
     destination = resolve_application_destination(job)
     get = job.get if isinstance(job, dict) else (lambda key: getattr(job, key, None))
     availability_status = get("availability_status") or "UNKNOWN"
+    verified_url = get("verified_destination_url")
+    if verified_url and verified_url != destination["url"]:
+        availability_status = "UNKNOWN"
 
     if destination["url"] is None:
+        provider_url = _provider_exact_job_url(job)
+        if provider_url:
+            return _provider_apply_action(job, provider_url, availability_status)
         return {
             **destination, "availability_status": availability_status,
-            "destination_specificity": "UNKNOWN", "action_label": "Apply", "can_apply": False,
-            "secondary_action": None,
+            "destination_specificity": "UNKNOWN", "action_label": "Unavailable", "can_apply": False,
+            "secondary_action": None, "destination_tier": "NONE", "destination_reason": "no_usable_url",
+            "destination_source": str(get("source") or ""),
         }
 
     if destination["type"] == "AGGREGATOR_LISTING":
+        provider_url = _provider_exact_job_url(job)
+        if provider_url and availability_status == "EXPIRED" and provider_url == (verified_url or destination["url"]):
+            return {
+                "url": provider_url, "type": "PROVIDER_JOB_APPLY", "is_direct": False,
+                "availability_status": availability_status,
+                "destination_specificity": "SPECIFIC_JOB", "action_label": "Job Closed", "can_apply": False,
+                "secondary_action": None, "destination_tier": "CLOSED", "destination_reason": "closed",
+                "destination_source": str(get("source") or ""),
+            }
+        if provider_url:
+            return _provider_apply_action(job, provider_url, availability_status)
+        specificity = classify_url_specificity(destination["url"])
+        reason = "generic_listing" if specificity == "GENERIC_EMPLOYER_PAGE" else "exact_aggregator_listing"
+        if specificity != "SPECIFIC_JOB":
+            reason = "generic_listing" if specificity != "UNKNOWN" else "generic_url"
         return {
             **destination, "availability_status": availability_status,
-            "destination_specificity": "UNKNOWN", "action_label": "View Listing", "can_apply": True,
-            "secondary_action": None,
+            "destination_specificity": specificity, "action_label": "View Listing", "can_apply": True,
+            "secondary_action": None, "destination_tier": "GENERIC_LISTING", "destination_reason": reason,
+            "destination_source": str(get("source") or ""),
         }
 
     source_url = get("source_url")
     secondary_action = None
     if source_url and source_url != destination["url"] and is_safe_application_url(source_url):
-        secondary_action = {"label": "View Source Listing", "url": source_url}
+        secondary_action = {"label": "View Source", "url": source_url}
 
     specificity = classify_url_specificity(destination["url"])
     base = {
@@ -574,18 +812,52 @@ def resolve_apply_action(job: Any) -> dict[str, Any]:
 
     if specificity == "SPECIFIC_JOB":
         if availability_status == "EXPIRED":
-            return {**base, "action_label": "Job Closed", "can_apply": False}
+            return {**base, "action_label": "Job Closed", "can_apply": False,
+                    "destination_tier": "CLOSED", "destination_reason": "closed",
+                    "destination_source": str(get("source") or "")}
         if availability_status == "ACTIVE":
-            return {**base, "action_label": "Apply", "can_apply": True}
-        # SPECIFIC_JOB but availability unverified — safe fallback, never
-        # claim a verified Apply, but still a real destination to open.
-        return {**base, "action_label": "Open Employer Site", "can_apply": False}
+            return {**base, "action_label": "Apply", "can_apply": True,
+                    "destination_tier": "VERIFIED_DIRECT", "destination_reason": "verified_direct",
+                    "destination_source": str(get("source") or destination["type"] or "")}
+        return {**base, "action_label": "Open Employer Site", "can_apply": False,
+                "destination_tier": "EMPLOYER_CAREERS", "destination_reason": "verification_failed",
+                "destination_source": str(get("source") or "")}
 
-    # GENERIC_EMPLOYER_PAGE or UNKNOWN specificity — never a verified Apply
-    # regardless of availability (a generic page returning 200 proves the
-    # SITE is up, not that a specific posting is), but still a real
-    # destination worth sending the user to.
-    return {**base, "action_label": "Open Employer Site", "can_apply": False}
+    return {**base, "action_label": "Open Employer Site", "can_apply": False,
+            "destination_tier": "EMPLOYER_CAREERS", "destination_reason": "employer_careers",
+            "destination_source": str(get("source") or "")}
+
+
+def present_updated_job_action(action: dict[str, Any]) -> dict[str, Any]:
+    """User-facing Updated Job Search labels. Internal resolution labels stay
+    available to enrichment; this is what the job card and Details render.
+
+    Deliberately honest about WHERE "Apply" goes rather than collapsing every
+    non-employer destination into one generic "View Source":
+      - verified employer/ATS posting -> "Apply on Company Site"
+      - real but unconfirmed-specific employer page -> "Open Career Page"
+      - provider/aggregator listing (Dice, Adzuna, LinkedIn, ...) -> "Apply
+        on {Provider}", named via provider_display_name so the user knows
+        exactly which site they're leaving to. Never "View Source" — a job
+        board listing is still something the user can act on, just not a
+        confirmed employer destination.
+      - "Job Closed"/"Unavailable" are untouched.
+    """
+    label = str(action.get("action_label") or "")
+    if label == "Apply":
+        shown = "Apply on Company Site"
+    elif label == "Open Employer Site":
+        shown = "Open Career Page"
+    elif label == "View Listing" or label.startswith("View on "):
+        from app.services.provider_apply_resolver import provider_display_name
+
+        provider = provider_display_name({"source": action.get("destination_source")}, action.get("url"))
+        shown = f"Apply on {provider}"
+    else:
+        shown = label
+    if shown == label:
+        return action
+    return {**action, "action_label": shown}
 
 
 def resolve_application_url(job: Any) -> str | None:
@@ -599,11 +871,13 @@ def compute_fingerprint(job: dict[str, Any]) -> str:
     """Stable fallback identity when a source has no source_job_id.
 
     Prefers the canonical direct_url; otherwise falls back to a normalized
-    title+company+location tuple. Never uses title alone.
+    title+company+location tuple. Never uses title alone. The fallback is
+    deliberately source-neutral so the same aggregator-only job returned by
+    JSearch and Adzuna converges to one persisted posting.
     """
     basis = _clean(job.get("direct_url"))
     if not basis:
-        key = f"{job['source']}|{job['title'].strip().lower()}|{job['company'].strip().lower()}|{job.get('location', '').strip().lower()}"
+        key = f"{job['title'].strip().lower()}|{job['company'].strip().lower()}|{job.get('location', '').strip().lower()}"
         basis = key
     return hashlib.sha256(basis.encode("utf-8", errors="ignore")).hexdigest()
 

@@ -1,3 +1,23 @@
-import {useApp} from "../context/AppContext";
-import NotificationBell from "./NotificationBell";
-export default function Topbar({onMenu}){const {currentUser}=useApp(); const name=currentUser?.name||currentUser?.email?.split("@")[0]||"there"; return <header className="topbar"><button className="mobile-menu" onClick={onMenu}>☰</button><div><h1>Welcome back, {name} <span>👋</span></h1><p>Track jobs, optimize resumes and boost your career with AI.</p></div><div className="top-actions"><NotificationBell /><span className="top-avatar">{name[0].toUpperCase()}</span></div></header>}
+import { useApp } from "../context/AppContext";
+import { userDisplayName } from "../utils/userDisplay";
+
+export default function Topbar({ onMenu, showWelcome = true }) {
+  const { currentUser } = useApp();
+  const name = userDisplayName(currentUser);
+  if (!showWelcome) {
+    return (
+      <header className="module-mobile-topbar">
+        <button className="mobile-menu" type="button" aria-label="Open navigation" onClick={onMenu}>☰</button>
+      </header>
+    );
+  }
+  return (
+    <header className="topbar">
+      <button className="mobile-menu" onClick={onMenu}>☰</button>
+      <div className="topbar-copy">
+        <h1>Welcome back, {name} <span>👋</span></h1>
+        <p>Track jobs, optimize resumes and boost your career with AI.</p>
+      </div>
+    </header>
+  );
+}

@@ -19,7 +19,10 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import HTTPException
+from sqlalchemy import inspect as sa_inspect
+from sqlalchemy.exc import PendingRollbackError, SQLAlchemyError
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.exc import ObjectDeletedError, StaleDataError
 
 from app.models.ats_optimization_workflow_model import AtsOptimizationWorkflow
 from app.models.job_model import Job
@@ -37,6 +40,7 @@ from app.services.keyword_injection_service import plan_keyword_injection
 from app.services.llm_client import generation_timeout_config, llm_config
 from app.services.resume_improvement_report_service import build_improvement_report
 from app.services.resume_structure_parser import parse_resume_structure
+from app.services.resume_generator import apply_truthfulness_corrections, sanitize_invented_metrics
 from app.services.requirement_extraction_service import extract_job_requirement_analysis, group_canonical_score_evidence
 from app.services.skill_confirmation_service import (
     build_canonical_supported_evidence,
@@ -75,6 +79,55 @@ RUNNING_WORKFLOW_STATUSES = {
     "VALIDATING_RESUME",
     "ANALYZING_OPTIMIZED",
 }
+
+# User-facing wizard Step 5. Internal generate substages must never map to
+# wizard Step 2 (requirement analysis is a separate API).
+STEP5_WORKFLOW_STATUSES = {
+    "ANALYZING_ORIGINAL",
+    "GENERATING_RESUME",
+    "VALIDATING_RESUME",
+    "ANALYZING_OPTIMIZED",
+    "COMPLETED",
+    "VALIDATION_FAILED",
+    "FAILED",
+    "INELIGIBLE_LOW_SCORE",
+    "INELIGIBLE_ROLE_ALIGNMENT",
+}
+
+GENERATION_SUBSTAGES = {
+    "PENDING": "generating_resume",
+    "ANALYZING_ORIGINAL": "calculating_original_score",
+    "GENERATING_RESUME": "generating_resume",
+    "VALIDATING_RESUME": "validating_resume",
+    "ANALYZING_OPTIMIZED": "calculating_optimized_score",
+    "COMPLETED": "completed",
+    "VALIDATION_FAILED": "failed",
+    "FAILED": "failed",
+}
+
+
+def major_step_for_workflow(workflow: AtsOptimizationWorkflow | None, status: str | None = None) -> int | None:
+    """Return the user-facing wizard step implied by a generation workflow.
+
+    Steps 1–4 are owned by the frontend until generate starts. ANALYZING_ORIGINAL
+    is original-resume scoring inside Step 5, not wizard Step 2.
+    """
+    if workflow is None and not status:
+        return None
+    resolved = (status or (getattr(workflow, "workflow_status", None) or "")).upper()
+    if workflow is not None and (
+        getattr(workflow, "optimized_resume_id", None)
+        or getattr(workflow, "generated_resume_plain_text", None)
+    ):
+        return 5
+    if resolved in STEP5_WORKFLOW_STATUSES:
+        return 5
+    return None
+
+
+def generation_substage_for_status(status: str | None) -> str | None:
+    key = (status or "").upper()
+    return GENERATION_SUBSTAGES.get(key)
 
 # Only a fallback_reason that will fail identically on every subsequent
 # attempt (bad/missing model or provider config) should stop later
@@ -234,13 +287,67 @@ def _workflow_age_seconds(workflow: AtsOptimizationWorkflow) -> float:
     return max(0.0, (_now() - stamp).total_seconds())
 
 
+def _rollback_session(db: Session, *, workflow_id: int | None = None) -> None:
+    try:
+        db.rollback()
+    except Exception:
+        logger.exception("ATS_SESSION_ROLLBACK_FAILED workflow_id=%s", workflow_id)
+        raise
+
+
+def _workflow_pk(workflow: AtsOptimizationWorkflow) -> int | None:
+    identity = sa_inspect(workflow).identity
+    if identity:
+        return int(identity[0])
+    return None
+
+
+def _rollback_if_failed_transaction(db: Session, *, workflow_id: int | None = None) -> None:
+    trans = db.get_transaction()
+    if trans is not None and not trans.is_active:
+        _rollback_session(db, workflow_id=workflow_id)
+
+
+def _commit_workflow_row(db: Session, workflow: AtsOptimizationWorkflow, *, action: str) -> bool:
+    """Persist a workflow mutation. False means another session already deleted the row."""
+    workflow_id = _workflow_pk(workflow)
+    try:
+        db.add(workflow)
+        db.commit()
+        db.refresh(workflow)
+        return True
+    except (StaleDataError, ObjectDeletedError, PendingRollbackError):
+        _rollback_session(db, workflow_id=workflow_id)
+        remaining = (
+            db.query(AtsOptimizationWorkflow)
+            .filter(AtsOptimizationWorkflow.id == workflow_id)
+            .first()
+            if workflow_id is not None
+            else None
+        )
+        if remaining is None:
+            logger.warning(
+                "ATS_WORKFLOW_ROW_GONE workflow_id=%s action=%s",
+                workflow_id,
+                action,
+            )
+            return False
+        logger.exception(
+            "ATS_WORKFLOW_STALE_DATA workflow_id=%s action=%s",
+            workflow_id,
+            action,
+        )
+        raise
+    except Exception:
+        _rollback_session(db, workflow_id=workflow_id)
+        raise
+
+
 def _touch_workflow_activity(workflow: AtsOptimizationWorkflow, db: Session | None = None) -> None:
     workflow.last_activity_at = _now()
     workflow.updated_at = _now()
     if db is not None:
-        db.add(workflow)
-        db.commit()
-        db.refresh(workflow)
+        _commit_workflow_row(db, workflow, action="touch_activity")
 
 
 @dataclass
@@ -276,16 +383,40 @@ def _loads(value: str | None, default=None):
         return default
 
 
-def _set_status(workflow: AtsOptimizationWorkflow, status: str, db: Session, error: str | None = None):
-    workflow.workflow_status = status
-    workflow.last_activity_at = _now()
-    workflow.updated_at = _now()
-    if error:
-        workflow.error_message = error[:500]
-    db.add(workflow)
-    db.commit()
-    db.refresh(workflow)
-    logger.info("WORKFLOW_STATUS_UPDATED workflow_id=%s status=%s", workflow.id, status)
+def _set_status(workflow: AtsOptimizationWorkflow, status: str, db: Session, error: str | None = None) -> bool:
+    workflow_id = _workflow_pk(workflow)
+    try:
+        workflow.workflow_status = status
+        workflow.last_activity_at = _now()
+        workflow.updated_at = _now()
+        if error:
+            workflow.error_message = error[:500]
+        persisted = _commit_workflow_row(db, workflow, action=f"set_status:{status}")
+    except (StaleDataError, ObjectDeletedError, PendingRollbackError):
+        _rollback_session(db, workflow_id=workflow_id)
+        remaining = (
+            db.query(AtsOptimizationWorkflow)
+            .filter(AtsOptimizationWorkflow.id == workflow_id)
+            .first()
+            if workflow_id is not None
+            else None
+        )
+        if remaining is None:
+            logger.warning(
+                "ATS_WORKFLOW_ROW_GONE workflow_id=%s action=%s",
+                workflow_id,
+                f"set_status:{status}",
+            )
+            return False
+        logger.exception(
+            "ATS_WORKFLOW_STALE_DATA workflow_id=%s action=%s",
+            workflow_id,
+            f"set_status:{status}",
+        )
+        raise
+    if persisted:
+        logger.info("WORKFLOW_STATUS_UPDATED workflow_id=%s status=%s", workflow.id, status)
+    return persisted
 
 
 def recover_orphaned_workflows(db: Session) -> int:
@@ -323,9 +454,7 @@ def _mark_workflow_superseded(
     workflow.error_message = reason[:500]
     workflow.last_activity_at = _now()
     workflow.updated_at = _now()
-    db.add(workflow)
-    db.commit()
-    db.refresh(workflow)
+    _commit_workflow_row(db, workflow, action="mark_superseded")
 
 
 def _is_workflow_actively_running(workflow: AtsOptimizationWorkflow, stale_limit: float) -> bool:
@@ -459,6 +588,7 @@ def workflow_to_dict(workflow: AtsOptimizationWorkflow, job: Job | None = None) 
                 "schema_validation_passed",
                 "json_repair_used",
                 "schema_repair_retry_used",
+                "truthfulness_correction_applied",
             )
             if key in diagnostics
         })
@@ -479,6 +609,10 @@ def workflow_to_dict(workflow: AtsOptimizationWorkflow, job: Job | None = None) 
         "workflow_status": workflow.workflow_status,
         "status": workflow.workflow_status,
         "current_step": workflow.workflow_status,
+        "major_step": major_step_for_workflow(workflow),
+        "user_workflow_step": major_step_for_workflow(workflow),
+        "generation_substage": generation_substage_for_status(workflow.workflow_status),
+        "last_activity_at": str(workflow.last_activity_at) if getattr(workflow, "last_activity_at", None) else None,
         "poll_interval_ms": poll["poll_interval_ms"],
         "poll_timeout_seconds": poll["poll_timeout_seconds"],
         "original_match_score": workflow.original_match_score,
@@ -819,7 +953,8 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
     job = db.query(Job).filter(Job.id == workflow.job_id, Job.user_id == workflow.user_id).first()
     resume = db.query(Resume).filter(Resume.id == workflow.resume_id, Resume.user_id == workflow.user_id).first()
     if not job or not resume:
-        _set_status(workflow, "FAILED", db, "Job or resume missing")
+        if not _set_status(workflow, "FAILED", db, "Job or resume missing"):
+            raise HTTPException(status_code=404, detail="Workflow not found")
         return workflow
 
     try:
@@ -886,7 +1021,8 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
         )
 
         # Original score uses ONLY the uploaded resume and the job — never user confirmations.
-        _set_status(workflow, "ANALYZING_ORIGINAL", db)
+        if not _set_status(workflow, "ANALYZING_ORIGINAL", db):
+            raise HTTPException(status_code=404, detail="Workflow not found")
         original = canonical_original
         workflow.original_match_score = original["match_percentage"]
         eligibility = role_aware_optimization_eligibility(workflow.original_match_score, original.get("role_alignment"))
@@ -1053,6 +1189,52 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
             )
             return plain_text, markdown_text, {"client": client_val, "final": final_val}
 
+        def _apply_local_truthfulness_correction(candidate: dict, current_plain: str):
+            evidence_baseline = "\n".join(
+                part for part in [
+                    resume_text or "",
+                    "\n".join(
+                        str(
+                            (item or {}).get("usage_description")
+                            or (item or {}).get("work_completed")
+                            or (item or {}).get("description")
+                            or ""
+                        )
+                        for item in (generation_evidence or {}).values()
+                    ),
+                ] if part
+            )
+            terms = list(dict.fromkeys(
+                str(item).strip()
+                for item in list(unsupported_requirements or [])
+                if str(item).strip()
+            ))
+            corrected, removed = apply_truthfulness_corrections(
+                current_plain,
+                original_text=resume_text,
+                unsupported_terms=terms,
+                confirmed_evidence_text=evidence_baseline,
+            )
+            if not removed:
+                return candidate, current_plain, None, False
+            logger.warning(
+                "TRUTHFULNESS_CORRECTION_APPLIED workflow_id=%s removed_or_rewritten=%s",
+                workflow.id,
+                removed,
+            )
+            updated = {**candidate, "plain_text": corrected, "truthfulness_correction_applied": True}
+            meta = dict(updated.get("generation_metadata") or {})
+            meta["truthfulness_correction_applied"] = True
+            updated["generation_metadata"] = meta
+            new_plain, new_markdown, new_checks = _run_validation(updated)
+            if new_checks["final"].get("status") != "failed":
+                logger.info(
+                    "TRUTHFULNESS_REVALIDATION_PASSED workflow_id=%s removed_or_rewritten=%s",
+                    workflow.id,
+                    removed,
+                )
+            return updated, new_plain, new_checks, True
+
         MAX_OPTIMIZATION_PASSES = 2
         generated = None
         plain = ""
@@ -1132,6 +1314,16 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
             client_validation = checks["client"]
             generated = candidate
 
+            if final_validation.get("status") == "failed":
+                generated, plain, checks, _applied = _apply_local_truthfulness_correction(generated, plain)
+                if checks is not None:
+                    final_validation = checks["final"]
+                    client_validation = checks["client"]
+                    markdown = bold_important_keywords(
+                        plain,
+                        injection_plan.get("keywordsInjected") or injection_plan.get("supportedKeywords") or [],
+                    )
+
             if final_validation.get("status") == "failed" and pass_index == 0:
                 structural_markers = (
                     "Protected field",
@@ -1203,6 +1395,16 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
                     generated = repaired
 
             if final_validation.get("status") == "failed":
+                generated, plain, checks, _applied = _apply_local_truthfulness_correction(generated, plain)
+                if checks is not None:
+                    final_validation = checks["final"]
+                    client_validation = checks["client"]
+                    markdown = bold_important_keywords(
+                        plain,
+                        injection_plan.get("keywordsInjected") or injection_plan.get("supportedKeywords") or [],
+                    )
+
+            if final_validation.get("status") == "failed":
                 break
 
             optimized_hash = hashlib.sha256((plain or "").strip().encode("utf-8")).hexdigest()
@@ -1268,6 +1470,8 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
         workflow.fallback_reason = generated.get("fallback_reason")
         workflow.generation_duration_ms = generated.get("generation_duration_ms")
         meta = generated.get("generation_metadata") or {}
+        if generated.get("truthfulness_correction_applied"):
+            meta = {**meta, "truthfulness_correction_applied": True}
         workflow.generation_diagnostics_json = _dumps({
             key: meta.get(key)
             for key in (
@@ -1276,6 +1480,7 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
                 "schema_validation_passed",
                 "json_repair_used",
                 "schema_repair_retry_used",
+                "truthfulness_correction_applied",
             )
             if meta.get(key) is not None
         }) if meta else None
@@ -1357,8 +1562,16 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
         ))
         optimized["confirmed_skills_incorporated"] = optimized["confirmed_skills_used"]
         optimized["unsupported_keywords"] = list(optimized.get("missing_mandatory_skills") or [])
-        optimized["remaining_gaps"] = optimized.get("remaining_gaps") or {
-            "unsupported": optimized["unsupported_keywords"],
+        gap_unsupported = list(optimized.get("unsupported_keywords") or [])
+        for term in unsupported_requirements or []:
+            label = str(term or "").strip()
+            if not label or contains_keyword(plain or "", label):
+                continue
+            if any(normalize_keyword(existing) == normalize_keyword(label) for existing in gap_unsupported):
+                continue
+            gap_unsupported.append(label)
+        optimized["remaining_gaps"] = {
+            "unsupported": gap_unsupported,
             "preferred_gaps": optimized.get("missing_preferred_skills") or [],
         }
         optimized["score_view"] = build_score_view(optimized)
@@ -1410,7 +1623,12 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
             output_path=getattr(optimized_resume, "generated_file_path", None),
         )
         optimized_resume.generated_resume_text = plain
-        optimized_resume.final_resume_text = plain
+        # A regeneration (retry, or an automatic re-run triggered by a job/
+        # evidence change) must never silently clobber final_resume_text
+        # once the user has saved real edits to it — only the informational
+        # "generated" snapshot above keeps refreshing in that case.
+        if not optimized_resume.user_modified:
+            optimized_resume.final_resume_text = plain
         optimized_resume.generated_resume_json = _dumps({"structure": structure, "template_mapping": template_mapping(resume.stored_file_path, resume.file_type)})
         optimized_resume.original_score = original["match_percentage"]
         optimized_resume.generated_score = optimized["match_percentage"]
@@ -1456,6 +1674,13 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
         logger.info("WORKFLOW_STATUS_UPDATED workflow_id=%s status=COMPLETED", workflow.id)
 
         logger.info(
+            "WORKFLOW_COMPLETED workflow_id=%s optimized_resume_id=%s original=%s optimized=%s",
+            workflow.id,
+            optimized_resume.id,
+            workflow.original_match_score,
+            workflow.optimized_match_score,
+        )
+        logger.info(
             "GENERATION_COMPLETE workflow_id=%s user_id=%s job_id=%s original=%s optimized=%s improvement=%s mode=%s",
             workflow.id,
             workflow.user_id,
@@ -1473,11 +1698,61 @@ def execute_workflow(db: Session, workflow_id: int) -> AtsOptimizationWorkflow:
         )
         return workflow
 
-    except Exception as error:
-        logger.exception("ATS workflow failed id=%s", workflow_id)
-        _set_status(workflow, "FAILED", db, "Resume generation could not be completed.")
+    except HTTPException:
+        _rollback_if_failed_transaction(db, workflow_id=workflow_id)
+        raise
+    except SQLAlchemyError as error:
+        logger.exception("ATS workflow database error id=%s error=%s", workflow_id, type(error).__name__)
+        _rollback_session(db, workflow_id=workflow_id)
+        current = (
+            db.query(AtsOptimizationWorkflow)
+            .filter(AtsOptimizationWorkflow.id == workflow_id)
+            .first()
+        )
+        if current is None:
+            logger.warning(
+                "ATS_WORKFLOW_ABANDONED workflow_id=%s reason=row_missing_after_failure error=%s",
+                workflow_id,
+                type(error).__name__,
+            )
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        if current.workflow_status == "COMPLETED":
+            logger.warning(
+                "ATS_WORKFLOW_FAILED_AFTER_COMPLETION_IGNORED workflow_id=%s error=%s",
+                workflow_id,
+                type(error).__name__,
+            )
+            return current
+        if not _set_status(current, "FAILED", db, "Resume generation could not be completed."):
+            raise HTTPException(status_code=404, detail="Workflow not found")
         logger.info("GENERATION_COMPLETE workflow_id=%s status=FAILED reason=%s", workflow_id, type(error).__name__)
-        return workflow
+        return current
+    except Exception as error:
+        logger.exception("ATS workflow failed id=%s error=%s", workflow_id, type(error).__name__)
+        current = (
+            db.query(AtsOptimizationWorkflow)
+            .filter(AtsOptimizationWorkflow.id == workflow_id)
+            .first()
+        )
+        if current is None:
+            _rollback_if_failed_transaction(db, workflow_id=workflow_id)
+            logger.warning(
+                "ATS_WORKFLOW_ABANDONED workflow_id=%s reason=row_missing_after_failure error=%s",
+                workflow_id,
+                type(error).__name__,
+            )
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        if current.workflow_status == "COMPLETED":
+            logger.warning(
+                "ATS_WORKFLOW_FAILED_AFTER_COMPLETION_IGNORED workflow_id=%s error=%s",
+                workflow_id,
+                type(error).__name__,
+            )
+            return current
+        if not _set_status(current, "FAILED", db, "Resume generation could not be completed."):
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        logger.info("GENERATION_COMPLETE workflow_id=%s status=FAILED reason=%s", workflow_id, type(error).__name__)
+        return current
 
 
 def run_workflow_job(workflow_id: int) -> None:
@@ -1488,6 +1763,19 @@ def run_workflow_job(workflow_id: int) -> None:
     db = SessionLocal()
     try:
         execute_workflow(db, workflow_id)
+    except HTTPException as exc:
+        _rollback_session(db, workflow_id=workflow_id)
+        if exc.status_code == 404:
+            logger.warning("ATS_BACKGROUND_WORKFLOW_GONE workflow_id=%s", workflow_id)
+        else:
+            logger.exception(
+                "ATS_BACKGROUND_TASK_HTTP_ERROR workflow_id=%s status=%s",
+                workflow_id,
+                exc.status_code,
+            )
+    except Exception:
+        _rollback_session(db, workflow_id=workflow_id)
+        logger.exception("ATS_BACKGROUND_TASK_FAILED workflow_id=%s", workflow_id)
     finally:
         db.close()
 
@@ -1558,8 +1846,17 @@ def start_workflow_for_saved_job(
         background_tasks.add_task(run_workflow_job, workflow.id)
     elif workflow.workflow_status == "PENDING":
         # Synchronous fallback when no background tasks object is provided
-        execute_workflow(db, workflow.id)
-        db.refresh(workflow)
+        try:
+            execute_workflow(db, workflow.id)
+        except HTTPException:
+            _rollback_session(db, workflow_id=workflow.id)
+        current = (
+            db.query(AtsOptimizationWorkflow)
+            .filter(AtsOptimizationWorkflow.id == workflow.id)
+            .first()
+        )
+        if current is not None:
+            workflow = current
 
     return {
         "job_saved": True,

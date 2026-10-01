@@ -10,7 +10,11 @@ import re
 import uuid
 from typing import Any
 
-from app.services.resume_structure_parser import parse_resume_structure
+from app.services.resume_structure_parser import (
+    _parse_employment_blocks,
+    _parse_project_blocks,
+    parse_resume_structure,
+)
 
 
 def _id(prefix: str = "n") -> str:
@@ -125,10 +129,6 @@ def plain_text_to_document(
         header["links"] = list(parsed.get("links") or [])
 
     sections: list[dict[str, Any]] = []
-    employments = list(parsed.get("employments") or [])
-    projects = list(parsed.get("projects") or [])
-    emp_index = 0
-    proj_index = 0
 
     for section in parsed.get("sections") or []:
         heading = section.get("heading") or "Section"
@@ -145,19 +145,25 @@ def plain_text_to_document(
             node["skills"] = _split_skills(content)
             node["content"] = content.strip()
         elif stype == "experience":
-            items = []
-            # Prefer structured employments when available for this section.
-            while emp_index < len(employments):
-                emp = employments[emp_index]
-                emp_index += 1
-                items.append({
+            # Parsed directly from THIS section's own content — never a shared
+            # cross-section counter. A resume with more than one experience-shaped
+            # heading (e.g. "Professional Experience" and a separate "Freelance
+            # Work" block) used to drain one flat, pre-aggregated employments list
+            # via a single running index, so an earlier section could silently
+            # steal entries that belonged to a later one, starving it into the
+            # empty-items fallback below even though its own text had real
+            # employer content.
+            items = [
+                {
                     "id": _id("e"),
                     "company": emp.get("company") or "",
                     "title": emp.get("title") or "",
                     "location": "",
                     "dates": emp.get("dates") or "",
                     "bullets": [{"id": _id("b"), "text": b} for b in (emp.get("bullets") or []) if b],
-                })
+                }
+                for emp in _parse_employment_blocks(content)
+            ]
             if not items:
                 # Fallback: treat whole content as one role block
                 items.append({
@@ -170,17 +176,16 @@ def plain_text_to_document(
                 })
             node["items"] = items
         elif stype == "projects":
-            items = []
-            while proj_index < len(projects):
-                proj = projects[proj_index]
-                proj_index += 1
-                items.append({
+            items = [
+                {
                     "id": _id("p"),
                     "name": proj.get("name") or "",
                     "dates": proj.get("dates") or "",
                     "description": proj.get("description") or "",
                     "bullets": [{"id": _id("b"), "text": b} for b in (proj.get("bullets") or []) if b],
-                })
+                }
+                for proj in _parse_project_blocks(content)
+            ]
             if not items:
                 items.append({
                     "id": _id("p"),

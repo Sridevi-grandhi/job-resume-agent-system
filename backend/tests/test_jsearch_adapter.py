@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import requests
 
-from app.job_sources.jsearch import JSearchAdapter, _build_query_string, _pick_apply_urls
+from app.job_sources.jsearch import JSearchAdapter, _build_query_string, _pick_apply_urls, lookup_direct_apply
 from app.models.discovered_job_model import DiscoveredJob
 from app.services import job_change_detection_service as change_detection
 from app.services.job_normalization_service import NORMALIZED_JOB_FIELDS, resolve_application_destination
@@ -451,11 +451,11 @@ def test_apply_resolution_unsafe_url_rejected_falls_through():
         ],
     }
     result = _resolve(raw)
-    # The unsafe direct option is skipped entirely (never returned as a
-    # candidate); the only remaining safe candidate is the listing.
-    assert result["url"] == "https://www.indeed.com/viewjob?jk=safe1"
-    assert result["type"] == "AGGREGATOR_LISTING"
-    assert result["is_direct"] is False
+    # The unsafe direct option is skipped. The provider-supplied employer
+    # website is the official career destination, ahead of the Indeed listing.
+    assert result["url"] == "https://www.capitalone.com"
+    assert result["type"] == "DIRECT_EMPLOYER"
+    assert result["is_direct"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -676,3 +676,104 @@ def test_health_check_does_not_make_its_own_network_call(monkeypatch):
     with patch("app.job_sources.jsearch.url_safety.safe_get") as mocked:
         adapter.health_check()
     mocked.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# lookup_direct_apply — targeted single-request lookup for a job another
+# provider (Dice, Adzuna, ...) only ever supplied as a listing.
+# ---------------------------------------------------------------------------
+
+def test_lookup_direct_apply_hit_with_matching_employer_and_title(monkeypatch):
+    monkeypatch.setenv("JSEARCH_API_KEY", "test-key")
+    payload = _real_payload([{
+        **REAL_STYLE_JOB, "employer_name": "Acme Widgets", "job_title": "Senior Java Developer",
+        "job_apply_link": "https://careers.acmewidgets.com/job/12345/senior-java-developer",
+        "job_apply_is_direct": True, "apply_options": [],
+    }])
+    with patch("app.job_sources.jsearch.url_safety.safe_get", return_value=_response(200, payload)) as mocked:
+        result = lookup_direct_apply("Senior Java Developer", "Acme Widgets", "Austin, TX")
+    assert result == {"url": "https://careers.acmewidgets.com/job/12345/senior-java-developer", "rate_limited": False}
+    mocked.assert_called_once()
+    params = mocked.call_args.kwargs["params"]
+    assert params["query"] == "Senior Java Developer Acme Widgets Austin, TX"
+    assert "cursor" not in params
+
+
+def test_lookup_direct_apply_miss_when_no_result_employer_matches(monkeypatch):
+    monkeypatch.setenv("JSEARCH_API_KEY", "test-key")
+    payload = _real_payload([{
+        **REAL_STYLE_JOB, "employer_name": "Totally Different Corp", "job_title": "Senior Java Developer",
+        "job_apply_link": "https://careers.totallydifferent.com/job/1",
+        "job_apply_is_direct": True, "apply_options": [],
+    }])
+    with patch("app.job_sources.jsearch.url_safety.safe_get", return_value=_response(200, payload)):
+        result = lookup_direct_apply("Senior Java Developer", "Acme Widgets", "Austin, TX")
+    assert result == {"url": None, "rate_limited": False}
+
+
+def test_lookup_direct_apply_miss_when_title_does_not_match_even_with_employer_match(monkeypatch):
+    monkeypatch.setenv("JSEARCH_API_KEY", "test-key")
+    payload = _real_payload([{
+        **REAL_STYLE_JOB, "employer_name": "Acme Widgets", "job_title": "Marketing Manager",
+        "job_apply_link": "https://careers.acmewidgets.com/job/999/marketing-manager",
+        "job_apply_is_direct": True, "apply_options": [],
+    }])
+    with patch("app.job_sources.jsearch.url_safety.safe_get", return_value=_response(200, payload)):
+        result = lookup_direct_apply("Senior Java Developer", "Acme Widgets", "Austin, TX")
+    assert result == {"url": None, "rate_limited": False}
+
+
+def test_lookup_direct_apply_picks_greenhouse_over_linkedin_in_apply_options(monkeypatch):
+    monkeypatch.setenv("JSEARCH_API_KEY", "test-key")
+    payload = _real_payload([{
+        **REAL_STYLE_JOB, "employer_name": "Acme Widgets", "job_title": "Senior Java Developer",
+        "employer_website": None,
+        "job_apply_link": "https://www.linkedin.com/jobs/view/12345",
+        "job_apply_is_direct": False,
+        "apply_options": [
+            {"publisher": "LinkedIn", "apply_link": "https://www.linkedin.com/jobs/view/12345", "is_direct": False},
+            {"publisher": "Acme Widgets", "apply_link": "https://boards.greenhouse.io/acmewidgets/jobs/12345", "is_direct": False},
+        ],
+    }])
+    with patch("app.job_sources.jsearch.url_safety.safe_get", return_value=_response(200, payload)):
+        result = lookup_direct_apply("Senior Java Developer", "Acme Widgets", "Austin, TX")
+    assert result == {"url": "https://boards.greenhouse.io/acmewidgets/jobs/12345", "rate_limited": False}
+
+
+def test_lookup_direct_apply_rejects_company_mismatch_even_if_url_is_a_real_ats(monkeypatch):
+    """An ATS-hosted URL whose tenant token doesn't match the company we
+    asked about is never trusted — company mismatch, not just domain
+    classification, gates the result."""
+    monkeypatch.setenv("JSEARCH_API_KEY", "test-key")
+    payload = _real_payload([{
+        **REAL_STYLE_JOB, "employer_name": "Acme Widgets", "job_title": "Senior Java Developer",
+        "employer_website": None,
+        "job_apply_link": "https://boards.greenhouse.io/some-other-company/jobs/12345",
+        "job_apply_is_direct": True, "apply_options": [],
+    }])
+    with patch("app.job_sources.jsearch.url_safety.safe_get", return_value=_response(200, payload)):
+        result = lookup_direct_apply("Senior Java Developer", "Acme Widgets", "Austin, TX")
+    assert result == {"url": None, "rate_limited": False}
+
+
+def test_lookup_direct_apply_stops_on_429_without_retry(monkeypatch):
+    monkeypatch.setenv("JSEARCH_API_KEY", "test-key")
+    with patch("app.job_sources.jsearch.url_safety.safe_get", return_value=_response(429)) as mocked:
+        result = lookup_direct_apply("Senior Java Developer", "Acme Widgets", "Austin, TX")
+    assert result == {"url": None, "rate_limited": True}
+    mocked.assert_called_once()
+
+
+def test_lookup_direct_apply_not_configured_makes_no_http_call(monkeypatch):
+    monkeypatch.delenv("JSEARCH_API_KEY", raising=False)
+    with patch("app.job_sources.jsearch.url_safety.safe_get") as mocked:
+        result = lookup_direct_apply("Senior Java Developer", "Acme Widgets", "Austin, TX")
+    assert result == {"url": None, "rate_limited": False}
+    mocked.assert_not_called()
+
+
+def test_lookup_direct_apply_no_match_in_results_is_a_safe_miss(monkeypatch):
+    monkeypatch.setenv("JSEARCH_API_KEY", "test-key")
+    with patch("app.job_sources.jsearch.url_safety.safe_get", return_value=_response(200, _real_payload([]))):
+        result = lookup_direct_apply("Senior Java Developer", "Acme Widgets", "Austin, TX")
+    assert result == {"url": None, "rate_limited": False}

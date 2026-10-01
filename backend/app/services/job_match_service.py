@@ -1,31 +1,32 @@
-"""Stage 2 (deterministic, authoritative score) + Stage 3 (optional LLM
-explanation) resume-to-job matching engine, plus per-user match caching.
+"""Updated Job Search baseline adapter/cache, using the existing ATS scorer.
 
-The numeric match_score always comes from deterministic_match() — same
-resume text + same job content always produces the same score, every time.
-An LLM, when configured via JOB_MATCH_LLM_PROVIDER, only refines
-fitting_skills/missing_skills/verdict/role_alignment; any score field it
-returns is ignored (advisory only — never authoritative).
+Role-search relevance stays in job_relevance_filter. Numeric resume/JD scores
+come from the same original-resume calculation as Selected Jobs/ATS, never
+from preferences, optimized drafts, confirmations or LLM explanations.
 """
 
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
 from datetime import datetime, timezone
 from typing import Any
+from types import SimpleNamespace
 
 from sqlalchemy.orm import Session
 
 from app.models.job_match_model import JobMatch
 from app.services.llm_client import LLMClient
 from app.services.technology_catalog import TECHNOLOGY_SYNONYMS
+from app.services import ats_scoring
+from app.services.job_eligibility import job_is_analyzable
 
 logger = logging.getLogger(__name__)
 
-MATCHER_VERSION = "job-match-deterministic-v1"
+MATCHER_VERSION = "ats-baseline-v2"
 
 # Longest names first so e.g. "Spring Boot" matches before "Spring".
 _CANONICAL_SKILLS = sorted({*TECHNOLOGY_SYNONYMS.values()}, key=len, reverse=True)
@@ -87,23 +88,21 @@ def _role_alignment_from_score(score: int) -> str:
 
 
 def deterministic_match(*, job_title: str, job_description: str, job_skills_csv: str, resume_text: str) -> dict[str, Any]:
-    job_skills = extract_job_skills(job_skills_csv, job_description)
-    resume_skills_lower = {s.lower() for s in extract_resume_skills(resume_text)}
-
-    fitting = [s for s in job_skills if s.lower() in resume_skills_lower]
-    missing = [s for s in job_skills if s.lower() not in resume_skills_lower]
-
-    coverage_pct = (100.0 * len(fitting) / len(job_skills)) if job_skills else 0.0
-    title_pct = _title_overlap_pct(job_title, resume_text)
-    score = round(0.8 * coverage_pct + 0.2 * title_pct) if job_skills else round(title_pct)
-    score = max(0, min(100, score))
-
+    # These are exactly the scoring inputs Save copies into the Selected Job.
+    # Do not append provider-only metadata or pass optimization evidence.
+    result = ats_scoring.calculate_weighted_ats_score(resume_text, SimpleNamespace(
+        title=job_title, description=job_description, skills_required=job_skills_csv,
+    ))
+    alignment = result.get("role_alignment")
     return {
-        "match_score": score,
-        "fitting_skills": fitting[:12],
-        "missing_skills": missing[:8],
-        "role_alignment": _role_alignment_from_score(score),
-        "job_skill_count": len(job_skills),
+        "match_score": result["match_percentage"],
+        "fitting_skills": result.get("matched_keywords", [])[:12],
+        "missing_skills": result.get("missing_keywords", [])[:8],
+        "role_alignment": "STRONG" if alignment in {"EXACT", "STRONG_RELATED"} else "MISMATCH" if alignment == "MISMATCH" else "PARTIAL",
+        "job_skill_count": len(set(result.get("required_skills", []) + result.get("preferred_skills", []))),
+        "confidence": result.get("confidence", "LOW"),
+        "mandatory_coverage": result.get("mandatory_requirements", {}),
+        "preferred_coverage": result.get("preferred_requirements", {}),
     }
 
 
@@ -247,10 +246,21 @@ def _strip_tz(value):
     return value.replace(tzinfo=None) if getattr(value, "tzinfo", None) else value
 
 
-def _is_stale(existing: JobMatch, resume_id: int, discovered_job) -> bool:
+def _cache_version(user_id, resume_id, resume_text, discovered_job) -> str:
+    # Fit the existing VARCHAR(30): no migration or persistence-model change.
+    # Content identity catches edits under the same resume/job IDs and also
+    # retires every legacy 80/20 cache row and future canonical score versions.
+    payload = [MATCHER_VERSION, ats_scoring.ANALYSIS_VERSION, user_id, resume_id,
+               resume_text, discovered_job.id, discovered_job.title,
+               discovered_job.description, discovered_job.skills or "",
+               discovered_job.requirements or ""]
+    return "atsb2:" + hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()[:24]
+
+
+def _is_stale(existing: JobMatch, resume_id: int, discovered_job, version: str) -> bool:
     if existing.resume_id != resume_id:
         return True
-    if existing.matcher_version != MATCHER_VERSION:
+    if existing.matcher_version != version:
         return True
     reference = _strip_tz(discovered_job.updated_detected_at) or _strip_tz(discovered_job.first_seen_at)
     calculated = _strip_tz(existing.calculated_at)
@@ -271,6 +281,15 @@ def get_or_compute_match(
     every Stage-1-relevant job never fans out into dozens of LLM calls."""
     if not resume_id or not (resume_text or "").strip():
         return None
+    # Reuse Selected Jobs' existing incomplete-JD rule without invoking Save
+    # or an optimization workflow. Unknown stays unscored, not title-only 100.
+    eligible, _ = job_is_analyzable(SimpleNamespace(
+        id=discovered_job.id, user_id=user_id, title=discovered_job.title,
+        company=discovered_job.company, description=discovered_job.description,
+        source="User Selected Job",
+    ), require_url=False)
+    if not eligible:
+        return None
 
     existing = (
         db.query(JobMatch)
@@ -278,16 +297,26 @@ def get_or_compute_match(
         .order_by(JobMatch.id.desc())
         .first()
     )
-    if existing and not force and not _is_stale(existing, resume_id, discovered_job):
+    version = _cache_version(user_id, resume_id, resume_text, discovered_job)
+    cache_valid = existing is not None and not _is_stale(existing, resume_id, discovered_job, version)
+    if cache_valid and not force:
         return existing
 
     logger.info("USER_JOB_MATCH_STARTED user_id=%s discovered_job_id=%s", user_id, discovered_job.id)
     try:
-        deterministic = deterministic_match(
-            job_title=discovered_job.title,
-            job_description=discovered_job.description,
-            job_skills_csv=discovered_job.skills or "",
-            resume_text=resume_text,
+        # Stage 3 may force an explanation upgrade; do not run the expensive
+        # canonical score a second time for identical inputs on the same page.
+        deterministic = {
+            "match_score": existing.match_score,
+            "fitting_skills": json.loads(existing.fitting_skills or "[]"),
+            "missing_skills": json.loads(existing.missing_skills or "[]"),
+            "role_alignment": existing.role_alignment,
+            "confidence": existing.confidence,
+            "mandatory_coverage": json.loads(existing.mandatory_coverage or "{}"),
+            "preferred_coverage": json.loads(existing.preferred_coverage or "{}"),
+        } if cache_valid else deterministic_match(
+            job_title=discovered_job.title, job_description=discovered_job.description,
+            job_skills_csv=discovered_job.skills or "", resume_text=resume_text,
         )
         explanation = llm_explain(
             resume_text=resume_text,
@@ -299,9 +328,8 @@ def get_or_compute_match(
         )
     except Exception:
         logger.exception("USER_JOB_MATCH_FAILED user_id=%s discovered_job_id=%s", user_id, discovered_job.id)
-        return existing
-
-    confidence = "HIGH" if deterministic["job_skill_count"] >= 4 else "LOW"
+        # Never leak a prior resume/JD/version's cached score after a failure.
+        return existing if cache_valid else None
 
     row = existing or JobMatch(user_id=user_id, discovered_job_id=discovered_job.id)
     if existing is None:
@@ -312,8 +340,10 @@ def get_or_compute_match(
     row.missing_skills = json.dumps(explanation["missing_skills"])
     row.verdict = explanation["verdict"]
     row.role_alignment = explanation["role_alignment"]
-    row.confidence = confidence
-    row.matcher_version = MATCHER_VERSION
+    row.confidence = deterministic["confidence"]
+    row.mandatory_coverage = json.dumps(deterministic["mandatory_coverage"])
+    row.preferred_coverage = json.dumps(deterministic["preferred_coverage"])
+    row.matcher_version = version
     row.llm_used = bool(explanation["llm_used"])
     row.llm_provider = explanation["llm_provider"]
     row.calculated_at = datetime.now(timezone.utc)

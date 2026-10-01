@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -31,6 +32,7 @@ from app.services import job_source_registry_service as registry
 from app.services.ats_optimization_workflow_service import start_workflow_for_saved_job
 from app.services.job_normalization_service import (
     classify_url_specificity,
+    present_updated_job_action,
     resolve_apply_action,
     resolve_application_destination,
 )
@@ -43,15 +45,22 @@ def _apply_event_status(action_label: str) -> str:
     """Maps the resolved action to the JobApplyEvent.status/response "status"
     value — deliberately NOT always "APPLY_STARTED". Reuses the existing
     JobApplyEvent table/free-text status column rather than inventing a new
-    event type: "Open Employer Site" and "View Listing" clicks are real,
+    event type: "Open Career Page" and "Apply on {Provider}" clicks are real,
     trackable navigations, but neither one means the user applied, so
     recording them as APPLY_STARTED would be a false signal anywhere this
-    table is read (e.g. application-history views)."""
-    if action_label == "Apply":
+    table is read (e.g. application-history views). Only the exact
+    "Apply on Company Site" label (a verified employer/ATS destination)
+    counts as APPLY_STARTED."""
+    action_label = action_label or ""
+    if action_label in {"Apply", "Apply on Company Site"}:
         return "APPLY_STARTED"
-    if action_label == "View Listing":
+    if (
+        action_label in {"View Listing", "View Source"}
+        or action_label.startswith("View on ")
+        or (action_label.startswith("Apply on ") and action_label != "Apply on Company Site")
+    ):
         return "LISTING_OPENED"
-    return "EMPLOYER_SITE_OPENED"  # "Open Employer Site" — a real destination, not a verified apply
+    return "EMPLOYER_SITE_OPENED"
 
 MAX_JOBS_RETURNED = 60
 STAGE1_TOP_N = 40
@@ -69,7 +78,9 @@ def _latest_resume(user_id: int, db: Session) -> Resume | None:
     return (
         db.query(Resume)
         .filter(Resume.user_id == user_id)
-        .order_by(Resume.uploaded_at.desc())
+        # Match Selected Jobs / its ATS workflow's current original upload,
+        # including deterministic selection when upload timestamps tie.
+        .order_by(Resume.id.desc())
         .first()
     )
 
@@ -103,7 +114,9 @@ def _job_payload(job: DiscoveredJob, match_dict: dict | None, has_resume: bool) 
     Apply-vs-Job-Closed-vs-View-Listing itself. `availability_*` reflect
     whether that specific destination was last verified still open — a
     separate question from destination type (see DiscoveredJob model)."""
-    action = resolve_apply_action(job)
+    action = present_updated_job_action(resolve_apply_action(job))
+    from app.job_sources.career_sources.persistence import metadata
+    career = metadata(job)
     return {
         "discovered_job_id": job.id,
         "title": job.title,
@@ -120,11 +133,14 @@ def _job_payload(job: DiscoveredJob, match_dict: dict | None, has_resume: bool) 
         "apply_destination_type": action["type"],
         "is_direct_apply": action["is_direct"],
         "destination_specificity": action["destination_specificity"],
-        "availability_status": job.availability_status,
+        "availability_status": action["availability_status"],
         "availability_checked_at": job.availability_checked_at.isoformat() if job.availability_checked_at else None,
         "availability_reason": job.availability_reason,
         "action_label": action["action_label"],
         "can_apply": action["can_apply"],
+        "destination_tier": action.get("destination_tier"),
+        "destination_reason": action.get("destination_reason"),
+        "destination_source": action.get("destination_source"),
         "secondary_action": action["secondary_action"],
         "status": job.status,
         "first_seen_at": job.first_seen_at.isoformat() if job.first_seen_at else None,
@@ -136,6 +152,17 @@ def _job_payload(job: DiscoveredJob, match_dict: dict | None, has_resume: bool) 
         # Internal/diagnostic only — see module docstring above.
         "source": job.source,
         "source_mode": job.source_mode,
+        "source_platform": career.get("source_platform"),
+        "source_kind": "company_direct" if career else job.source,
+        "source_label": "Official Company Career Page" if career else None,
+        "official_job_url": career.get("listing_url"),
+        "salary_min": career.get("salary_min"),
+        "salary_max": career.get("salary_max"),
+        "salary_currency": career.get("salary_currency"),
+        "salary_interval": career.get("salary_interval"),
+        "preferred_skills": career.get("preferred_skills"),
+        "department": career.get("department"),
+        "compensation": career.get("compensation"),
     }
 
 
@@ -147,7 +174,7 @@ def _visible_jobs_query(db: Session):
     UPDATED_JOB_DEMO_MODE is on — never a mock-sourced posting. The row
     itself is never deleted by this filter — it stays in the DB (e.g. for
     JobApplyEvent history), just excluded from this listing."""
-    query = db.query(DiscoveredJob).filter(DiscoveredJob.status != "CLOSED")
+    query = db.query(DiscoveredJob).filter(DiscoveredJob.status.notin_(["CLOSED", "INACTIVE"]))
     query = query.filter(DiscoveredJob.availability_status != "EXPIRED")
     if not registry.demo_mode_enabled():
         query = query.filter(DiscoveredJob.source_mode != "mock")
@@ -212,7 +239,13 @@ def get_discovered_jobs(
     if source:
         query = query.filter(DiscoveredJob.source == source)
     if employment_type:
-        query = query.filter(DiscoveredJob.job_type.ilike(f"%{employment_type}%"))
+        compact = "".join(ch for ch in employment_type.lower() if ch.isalpha())
+        spaced = employment_type.replace("-", " ").strip()
+        query = query.filter(or_(
+            DiscoveredJob.job_type.ilike(f"%{employment_type}%"),
+            DiscoveredJob.job_type.ilike(f"%{spaced}%"),
+            DiscoveredJob.job_type.ilike(f"%{compact}%"),
+        ))
     if date_detected == "24h":
         query = query.filter(DiscoveredJob.first_seen_at >= datetime.now(timezone.utc) - timedelta(hours=24))
     elif date_detected == "7d":
@@ -223,6 +256,7 @@ def get_discovered_jobs(
         job_relevance_filter.filter_relevant_jobs(candidates, preference, top_n=STAGE1_TOP_N)
         if preference else candidates[:STAGE1_TOP_N]
     )
+    candidates = job_relevance_filter.dedupe_visible_jobs(candidates)
 
     scored: list[tuple[DiscoveredJob, object]] = []
     for job in candidates:
@@ -261,19 +295,29 @@ def get_discovered_jobs(
         payload.sort(key=lambda item: (item["match"]["match_score"] if item["match"] else -1), reverse=True)
 
     payload = payload[:MAX_JOBS_RETURNED]
+    preference_summary = None
+    if preference:
+        preference_summary = {
+            "job_title": preference.job_title,
+            "location": preference.location,
+            "work_mode": preference.work_mode,
+            "job_type": preference.job_type,
+            "skills": preference.skills,
+        }
     return {
         "jobs": payload,
         "summary": _summary(db, payload),
         "sources": registry.list_sources_status(db),
         "has_resume": bool(resume),
         "has_preferences": bool(preference),
+        "preference_summary": preference_summary,
     }
 
 
 @router.post("/refresh/{user_id}")
 def refresh_discovered_jobs(user_id: int, db: Session = Depends(get_db)):
     _get_user(user_id, db)
-    return run_poll_cycle(triggered_by="manual")
+    return run_poll_cycle(triggered_by="manual", user_id=user_id)
 
 
 @router.get("/status")
@@ -302,6 +346,7 @@ def get_sources(db: Session = Depends(get_db)):
 
 class SaveDiscoveredJobRequest(BaseModel):
     discovered_job_id: int
+    start_workflow: bool = True
 
 
 @router.post("/save/{user_id}")
@@ -347,14 +392,17 @@ def save_discovered_job(
         description=discovered.description,
         skills_required=discovered.skills or "",
         source="User Selected Job",
-        job_url=discovered.direct_url,
+        job_url=discovered.direct_url or (discovered.source_url if discovered.career_metadata else None),
     )
     db.add(new_job)
     db.commit()
     db.refresh(new_job)
 
-    workflow_info = start_workflow_for_saved_job(
-        db, user_id=user_id, job_id=new_job.id, background_tasks=background_tasks,
+    workflow_info = (
+        start_workflow_for_saved_job(
+            db, user_id=user_id, job_id=new_job.id, background_tasks=background_tasks,
+        )
+        if request.start_workflow else {}
     )
 
     return {
@@ -400,17 +448,17 @@ def record_apply_click(user_id: int, request: ApplyRequest, db: Session = Depend
 
     Returns one of:
       - {"status": "APPLY_STARTED", "application_url": <url>, "action_label":
-        "Apply", "can_apply": true, ...} — a verified SPECIFIC_JOB + ACTIVE
-        destination.
+        "Apply on Company Site", "can_apply": true, ...} — a verified
+        SPECIFIC_JOB + ACTIVE destination.
       - {"status": "EMPLOYER_SITE_OPENED", "application_url": <url>,
-        "action_label": "Open Employer Site", "can_apply": false, ...} — a
+        "action_label": "Open Career Page", "can_apply": false, ...} — a
         real DIRECT_EMPLOYER/DIRECT_ATS destination that isn't a verified
         Apply (a generic careers/search page, unproven specificity, or
         unverified availability) — Step 6's "safe fallback": still safe to
         navigate, just never recorded as if the user applied.
       - {"status": "LISTING_OPENED", "application_url": <url>,
-        "action_label": "View Listing", "can_apply": true, ...} — an
-        aggregator listing URL.
+        "action_label": "Apply on {Provider}", "can_apply": true, ...} — a
+        provider/aggregator listing URL (Dice, Adzuna, LinkedIn, ...).
       - {"status": "JOB_EXPIRED", "application_url": null, "action_label":
         "Job Closed", ...} — a specific posting confirmed gone; the
         frontend must not open a dead URL and should switch the card to
@@ -432,7 +480,7 @@ def record_apply_click(user_id: int, request: ApplyRequest, db: Session = Depend
             availability.apply_result(discovered, result)
             db.commit()
 
-    action = resolve_apply_action(discovered)
+    action = present_updated_job_action(resolve_apply_action(discovered))
 
     if action["action_label"] == "Job Closed":
         return {

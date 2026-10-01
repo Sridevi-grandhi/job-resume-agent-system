@@ -45,6 +45,9 @@ class DiscoveredJob(Base):
     direct_url = Column(Text, nullable=True)
     source_url = Column(Text, nullable=True)
     application_url = Column(Text, nullable=True)
+    # Provider-supplied candidate only; never an Apply destination until the
+    # shared enrichment verifier promotes it.
+    unverified_application_url = Column(Text, nullable=True)
     # Provenance of direct_url/application_url — "provider" (supplied
     # directly by the discovery source, e.g. JSearch's own apply_options) or
     # "enrichment" (found afterward by job_enrichment_service for a job that
@@ -52,7 +55,14 @@ class DiscoveredJob(Base):
     # any row never touched by enrichment. Exists purely for honest
     # diagnostics/coverage reporting — never changes Apply-vs-View-Listing
     # logic itself (resolve_application_destination doesn't read this).
-    direct_url_source = Column(String(20), nullable=True)
+    direct_url_source = Column(String(80), nullable=True)
+    candidate_application_type = Column(String(40), nullable=True)
+    source_provenance = Column(Text, nullable=True)
+    verified_destination_url = Column(Text, nullable=True)
+    enrichment_checked_at = Column(DateTime(timezone=True), nullable=True)
+    enrichment_input_hash = Column(String(64), nullable=True)
+    enrichment_status = Column(String(40), nullable=True)
+    enrichment_diagnostics = Column(Text, nullable=True)  # JSON codes/domains, never raw URLs
 
     # Deliberately separate from `status` (ACTIVE/INACTIVE/CLOSED — whether the
     # SOURCE still returns this posting at all) and from destination TYPE
@@ -64,6 +74,12 @@ class DiscoveredJob(Base):
     availability_status = Column(String(20), nullable=False, default="UNKNOWN")  # ACTIVE | EXPIRED | UNKNOWN
     availability_checked_at = Column(DateTime(timezone=True), nullable=True)
     availability_reason = Column(String(300), nullable=True)
+    # Official employer site learned from provider metadata or a prior job
+    # for the same company. Never a Dice/Adzuna/LinkedIn listing.
+    career_page_url = Column(Text, nullable=True)
+    # Optional official collector metadata (platform, salary, department,
+    # preferred skills, external ID). Existing core job fields stay canonical.
+    career_metadata = Column(Text, nullable=True)
 
     status = Column(String(20), nullable=False, default="ACTIVE")  # ACTIVE | INACTIVE | CLOSED
     missed_poll_count = Column(Integer, nullable=False, default=0)
